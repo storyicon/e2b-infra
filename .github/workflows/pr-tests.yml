@@ -22,10 +22,12 @@ permissions:
 jobs:
   run-tests:
     name: Run unit test shards
+    # Firecracker tests require the upstream repository's dedicated KVM runner.
+    # Forks still run every portable shard on GitHub-hosted runners.
     if: ${{ inputs.run-tests == true }}
     # Shards that only need Docker run on Blacksmith. The orchestrator shard
     # stays on infra-tests: it needs modprobe nbd and /dev/kvm (smoketest).
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ github.repository == 'e2b-dev/infra' && matrix.runner || 'ubuntu-24.04' }}
     env:
       GIN_MODE: test
       # Parallel `go test ./...` binaries derive the same Ryuk session id
@@ -84,7 +86,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Explain fork orchestrator test coverage
+        if: ${{ github.repository != 'e2b-dev/infra' && matrix.package == 'packages/orchestrator' }}
+        run: echo "orchestrator runtime tests require the upstream KVM runner; cross-compilation still runs on forks"
+
       - name: Run unit tests
+        if: ${{ github.repository == 'e2b-dev/infra' || matrix.package != 'packages/orchestrator' }}
         uses: ./.github/actions/unit-tests
         with:
           package: ${{ matrix.package }}
