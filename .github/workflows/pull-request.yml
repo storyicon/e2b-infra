@@ -78,7 +78,10 @@ jobs:
             openapi-inputs:
               - 'spec/openapi*.yml'
               - 'packages/envd/spec/envd.yaml'
-              - '.github/**'
+              # Only validation-specific CI changes affect OpenAPI linting.
+              # Unrelated test/lint workflow edits must not expose baseline
+              # spec failures as regressions in those changes.
+              - '.github/workflows/validate-openapi.yml'
               - '.tool-versions'
 
       # dorny/paths-filter can't express "packages but not CHANGELOG" (it OR's
