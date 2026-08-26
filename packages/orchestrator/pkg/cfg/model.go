@@ -3,6 +3,7 @@
 package cfg
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -167,10 +168,10 @@ func Parse() (Config, error) {
 
 	config.BuilderConfig = bc
 	if config.MaxSandboxesPerNode < 0 {
-		return config, fmt.Errorf("MAX_SANDBOXES_PER_NODE cannot be negative")
+		return config, errors.New("MAX_SANDBOXES_PER_NODE cannot be negative")
 	}
 	if config.MaxStartingInstancesPerNode < 0 {
-		return config, fmt.Errorf("MAX_STARTING_INSTANCES_PER_NODE cannot be negative")
+		return config, errors.New("MAX_STARTING_INSTANCES_PER_NODE cannot be negative")
 	}
 
 	if err = config.BuilderConfig.NetworkConfig.Validate(); err != nil {
