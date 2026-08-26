@@ -43,6 +43,11 @@ jobs:
             test_path: ./...
             sudo: false
             runner: blacksmith-4vcpu-ubuntu-2404
+          - package: packages/capacity-controller
+            flag: unit-capacity-controller
+            test_path: ./...
+            sudo: false
+            runner: blacksmith-4vcpu-ubuntu-2404
           - package: packages/client-proxy
             flag: unit-client-proxy
             test_path: ./...

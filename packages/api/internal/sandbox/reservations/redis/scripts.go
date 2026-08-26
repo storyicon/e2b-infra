@@ -75,6 +75,21 @@ var (
 		return 1
 	`)
 
+	// heartbeatScript refreshes an existing reservation lease without ever
+	// recreating one that has already been finished, released, or expired.
+	// KEYS[1] = pending zset key
+	// ARGV[1] = sandboxID
+	// ARGV[2] = current Unix timestamp (seconds, float)
+	//
+	// Returns 1 when the reservation still exists and was refreshed, otherwise 0.
+	heartbeatScript = redis.NewScript(`
+		if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+			return 0
+		end
+		redis.call('ZADD', KEYS[1], 'XX', ARGV[2], ARGV[1])
+		return 1
+	`)
+
 	// releaseScript removes a sandbox from the pending zset and deletes the result key.
 	// KEYS[1] = pending zset key
 	// KEYS[2] = result key

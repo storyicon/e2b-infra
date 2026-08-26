@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,10 +22,14 @@ const (
 	// PubSub wakeup arrives
 	fallbackPollInterval = 1 * time.Second
 
-	// staleTTL is the maximum age of a pending entry before it is considered stale
-	// and cleaned up. This handles the case where an API instance crashes mid-creation.
-	// 90 seconds is well beyond any realistic sandbox creation time.
+	// staleTTL is the maximum age of a pending entry without an owner heartbeat
+	// before it is considered stale and cleaned up. This handles an API instance
+	// crashing mid-creation without limiting legitimate capacity waits.
 	staleTTL = 90 * time.Second
+
+	// reservationHeartbeatInterval keeps an active owner's reservation younger
+	// than staleTTL while a start waits for infrastructure capacity.
+	reservationHeartbeatInterval = staleTTL / 3
 )
 
 var _ sandboxtypes.ReservationStorage = (*ReservationStorage)(nil)
@@ -36,14 +41,16 @@ type Notifier interface {
 }
 
 type ReservationStorage struct {
-	redisClient redis.UniversalClient
-	notifier    Notifier
+	redisClient       redis.UniversalClient
+	notifier          Notifier
+	heartbeatInterval time.Duration
 }
 
 func NewReservationStorage(redisClient redis.UniversalClient, notifier Notifier) *ReservationStorage {
 	return &ReservationStorage{
-		redisClient: redisClient,
-		notifier:    notifier,
+		redisClient:       redisClient,
+		notifier:          notifier,
+		heartbeatInterval: reservationHeartbeatInterval,
 	}
 }
 
@@ -66,7 +73,16 @@ func (s *ReservationStorage) Reserve(ctx context.Context, teamID uuid.UUID, sand
 
 	switch result {
 	case reserveResultReserved:
-		return s.createFinishStart(ctx, teamID, sandboxID), nil, nil
+		stopHeartbeat := s.startReservationHeartbeat(ctx, teamID, sandboxID)
+		finishStart := s.createFinishStart(ctx, teamID, sandboxID)
+
+		return func(sbx sandboxtypes.Sandbox, startErr error) {
+			// Wait until the owner heartbeat has stopped before removing the lease.
+			// This ensures an old owner cannot refresh a later reservation that
+			// reuses the same sandbox ID.
+			stopHeartbeat()
+			finishStart(sbx, startErr)
+		}, nil, nil
 
 	case reserveResultAlreadyInStorage:
 		return nil, nil, sandboxtypes.ErrAlreadyExists
@@ -79,6 +95,60 @@ func (s *ReservationStorage) Reserve(ctx context.Context, teamID uuid.UUID, sand
 
 	default:
 		return nil, nil, fmt.Errorf("unexpected reserve script result: %d", result)
+	}
+}
+
+// startReservationHeartbeat refreshes an active owner's lease until creation
+// finishes or the owner context is cancelled. The Redis script is deliberately
+// update-only: a heartbeat can never resurrect a reservation removed by a
+// finish, release, or stale cleanup.
+func (s *ReservationStorage) startReservationHeartbeat(ctx context.Context, teamID uuid.UUID, sandboxID string) func() {
+	heartbeatCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		ticker := time.NewTicker(s.heartbeatInterval)
+		defer ticker.Stop()
+
+		pendingSetKey := getPendingSetKey(teamID.String())
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case now := <-ticker.C:
+				refreshed, err := heartbeatScript.Run(
+					heartbeatCtx,
+					s.redisClient,
+					[]string{pendingSetKey},
+					sandboxID,
+					float64(now.Unix()),
+				).Int()
+				if err != nil {
+					if heartbeatCtx.Err() == nil {
+						logger.L().Error(ctx, "failed to refresh sandbox reservation heartbeat",
+							zap.Error(err),
+							logger.WithSandboxID(sandboxID),
+						)
+					}
+
+					continue
+				}
+				if refreshed == 0 {
+					return
+				}
+			}
+		}
+	}()
+
+	var stopOnce sync.Once
+
+	return func() {
+		stopOnce.Do(func() {
+			cancel()
+			<-done
+		})
 	}
 }
 

@@ -118,6 +118,21 @@ module "api" {
   db_migrator_env_vars     = var.api_db_migrator_env_vars
 }
 
+data "aws_s3_object" "capacity_controller" {
+  count  = var.capacity_autoscaler_enabled ? 1 : 0
+  bucket = var.fc_env_pipeline_bucket_name
+  key    = "capacity-controller"
+}
+
+module "capacity_controller" {
+  source = "../../modules/job-capacity-controller"
+  count  = var.capacity_autoscaler_enabled ? 1 : 0
+
+  node_pool       = var.api_node_pool
+  artifact_source = "s3::https://${var.fc_env_pipeline_bucket_name}.s3.${var.aws_region}.amazonaws.com/capacity-controller?etag=${data.aws_s3_object.capacity_controller[0].etag}"
+  job_env_vars    = var.capacity_controller_env_vars
+}
+
 data "aws_s3_object" "orchestrator" {
   bucket = var.fc_env_pipeline_bucket_name
   key    = "orchestrator"

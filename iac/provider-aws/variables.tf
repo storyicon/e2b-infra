@@ -126,6 +126,160 @@ variable "client_cluster_size" {
   default = 1
 }
 
+variable "client_cluster_min_size" {
+  type        = number
+  description = "Minimum number of sandbox client nodes; defaults to client_cluster_size"
+  default     = null
+  nullable    = true
+}
+
+variable "client_cluster_max_size" {
+  type        = number
+  description = "Maximum number of sandbox client nodes; defaults to client_cluster_size"
+  default     = null
+  nullable    = true
+}
+
+variable "capacity_autoscaler_enabled" {
+  type        = bool
+  description = "Deploy the AWS scale-out-only sandbox capacity controller"
+  default     = false
+
+  validation {
+    condition = !var.capacity_autoscaler_enabled || contains([
+      "legacy-failure-ledger:legacy-failure-ledger",
+      "dual-write:legacy-failure-ledger",
+      "dual-write:start-intent-v1",
+      "start-intent-v1:start-intent-v1",
+    ], "${var.capacity_api_demand_mode}:${var.capacity_controller_demand_mode}")
+    error_message = "capacity API/controller demand modes must form a safe explicit migration pair."
+  }
+
+  validation {
+    condition = !var.capacity_autoscaler_enabled || var.capacity_api_demand_mode == "legacy-failure-ledger" || (
+      var.capacity_api_pool_vcpu != null && var.capacity_api_pool_memory_mib != null
+    )
+    error_message = "capacity_api_pool_vcpu and capacity_api_pool_memory_mib are required for dual-write or start-intent-v1."
+  }
+}
+
+variable "capacity_controller_cluster_id" {
+  type        = string
+  description = "E2B cluster whose pending sandbox demand drives the AWS capacity controller"
+  default     = "00000000-0000-0000-0000-000000000000"
+}
+
+variable "capacity_controller_slots_per_node" {
+  type        = number
+  description = "Safe sandbox capacity assigned to each client node"
+  default     = 20
+
+  validation {
+    condition     = var.capacity_controller_slots_per_node > 0
+    error_message = "capacity_controller_slots_per_node must be positive."
+  }
+}
+
+variable "capacity_controller_max_starting_per_node" {
+  type        = number
+  description = "Maximum concurrent sandbox starts per client node; defaults to the node capacity"
+  default     = null
+
+  validation {
+    condition     = var.capacity_controller_max_starting_per_node == null ? true : var.capacity_controller_max_starting_per_node > 0
+    error_message = "capacity_controller_max_starting_per_node must be positive when set."
+  }
+}
+
+variable "capacity_controller_reconcile_interval" {
+  type        = string
+  description = "Interval between capacity controller reconciliations"
+  default     = "1s"
+}
+
+variable "capacity_api_demand_mode" {
+  type        = string
+  description = "Explicit API capacity demand write mode"
+  default     = "legacy-failure-ledger"
+
+  validation {
+    condition = contains([
+      "legacy-failure-ledger",
+      "dual-write",
+      "start-intent-v1",
+    ], var.capacity_api_demand_mode)
+    error_message = "capacity_api_demand_mode must be legacy-failure-ledger, dual-write, or start-intent-v1."
+  }
+}
+
+variable "capacity_controller_demand_mode" {
+  type        = string
+  description = "Explicit capacity controller read mode"
+  default     = "legacy-failure-ledger"
+
+  validation {
+    condition = contains([
+      "legacy-failure-ledger",
+      "start-intent-v1",
+    ], var.capacity_controller_demand_mode)
+    error_message = "capacity_controller_demand_mode must be legacy-failure-ledger or start-intent-v1."
+  }
+}
+
+variable "capacity_api_wait_timeout" {
+  type        = string
+  description = "Maximum time Sandbox.create waits for autoscaled capacity when the capacity controller is enabled"
+  default     = "120s"
+}
+
+variable "capacity_api_retry_interval" {
+  type        = string
+  description = "Interval between server-side placement retries while waiting for autoscaled capacity"
+  default     = "500ms"
+}
+
+variable "capacity_api_pool_vcpu" {
+  type        = number
+  description = "Exact vCPU request accepted by the single autoscaled sandbox pool"
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.capacity_api_pool_vcpu == null ? true : var.capacity_api_pool_vcpu > 0
+    error_message = "capacity_api_pool_vcpu must be positive when set."
+  }
+}
+
+variable "capacity_api_pool_memory_mib" {
+  type        = number
+  description = "Exact memory request in MiB accepted by the single autoscaled sandbox pool"
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.capacity_api_pool_memory_mib == null ? true : var.capacity_api_pool_memory_mib > 0
+    error_message = "capacity_api_pool_memory_mib must be positive when set."
+  }
+}
+
+variable "capacity_ingress_idle_timeout_seconds" {
+  type        = number
+  description = "ALB idle timeout used while the capacity autoscaler is enabled; keep above the API capacity wait budget"
+  default     = 180
+
+  validation {
+    condition     = var.capacity_ingress_idle_timeout_seconds >= 61 && var.capacity_ingress_idle_timeout_seconds <= 4000
+    error_message = "capacity_ingress_idle_timeout_seconds must be between 61 and 4000 seconds."
+  }
+}
+
+variable "capacity_controller_env_vars" {
+  type        = map(string)
+  description = "Additional environment variables for the sandbox capacity controller"
+  default     = {}
+  sensitive   = true
+}
+
 variable "client_server_machine_type" {
   type    = string
   default = "m8i.4xlarge"

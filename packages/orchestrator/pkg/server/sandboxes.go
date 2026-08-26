@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -194,14 +195,16 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		}
 	}
 
-	maxRunningSandboxesPerNode := s.featureFlags.IntFlag(ctx, featureflags.MaxSandboxesPerNode)
-
-	runningSandboxes := s.sandboxFactory.Sandboxes.Count()
-	if runningSandboxes >= maxRunningSandboxesPerNode {
+	maxRunningSandboxesPerNode := resolveNodeLimit(
+		s.config.MaxSandboxesPerNode,
+		s.featureFlags.IntFlag(ctx, featureflags.MaxSandboxesPerNode),
+	)
+	if !reserveSandboxStart(&s.sandboxStartsInFlight, s.sandboxFactory.Sandboxes.Count, maxRunningSandboxesPerNode) {
 		telemetry.ReportEvent(ctx, "max number of running sandboxes reached")
 
 		return nil, status.Errorf(codes.ResourceExhausted, "max number of running sandboxes on node reached (%d), please retry", maxRunningSandboxesPerNode)
 	}
+	defer s.sandboxStartsInFlight.Add(-1)
 
 	// Check if we've reached the max number of starting instances on this node
 	if req.GetSandbox().GetSnapshot() {
@@ -409,6 +412,26 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		// value whenever the flag moves.
 		ResolvedFirecrackerVersion: resolvedFCVersion,
 	}, nil
+}
+
+// reserveSandboxStart atomically accounts for creates that passed admission
+// but are not visible in the running sandbox map yet. A successful create is
+// added to that map before its in-flight reservation is released, so the sum
+// never opens a transient slot above the configured node limit.
+func reserveSandboxStart(inFlight *atomic.Int64, runningCount func() int, limit int) bool {
+	if limit <= 0 {
+		return false
+	}
+
+	for {
+		current := inFlight.Load()
+		if int64(runningCount())+current >= int64(limit) {
+			return false
+		}
+		if inFlight.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
 }
 
 func createVolumeMountModelsFromAPI(volumeMounts []*orchestrator.SandboxVolumeMount) ([]sandbox.VolumeMountConfig, error) {

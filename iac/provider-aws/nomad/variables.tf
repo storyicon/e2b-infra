@@ -186,6 +186,18 @@ variable "api_repository_name" {
   type = string
 }
 
+# Capacity Controller
+variable "capacity_autoscaler_enabled" {
+  type    = bool
+  default = false
+}
+
+variable "capacity_controller_env_vars" {
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}
+
 variable "db_migrator_repository_name" {
   type = string
 }

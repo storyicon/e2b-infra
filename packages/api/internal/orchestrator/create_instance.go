@@ -21,6 +21,7 @@ import (
 	"github.com/e2b-dev/infra/packages/db/pkg/builds"
 	"github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/db/queries"
+	"github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand/startintent"
 	"github.com/e2b-dev/infra/packages/shared/pkg/clusters"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/fcversion"
@@ -188,6 +189,8 @@ func (o *Orchestrator) CreateSandbox(
 ) (sbx sandbox.Sandbox, apiErr *api.APIError) {
 	ctx, childSpan := tracer.Start(ctx, "create-sandbox")
 	defer childSpan.End()
+	telemetry.ReportEvent(ctx, "Sandbox create request received")
+	o.recordStartIntentLifecycle(ctx, "api_received", "success")
 
 	// Calculate total concurrent instances including addons
 	totalConcurrentInstances := team.Limits.SandboxConcurrency
@@ -254,7 +257,8 @@ func (o *Orchestrator) CreateSandbox(
 		return sbx, nil
 	}
 
-	telemetry.ReportEvent(ctx, "Reserved sandbox for team")
+	telemetry.ReportEvent(ctx, "Sandbox reservation owner")
+	o.recordStartIntentLifecycle(ctx, "reservation_owner", "success")
 	defer func() {
 		// Don't change this handling
 		// https://go.dev/play/p/4oy02s7BDMc
@@ -380,11 +384,68 @@ func (o *Orchestrator) CreateSandbox(
 	}
 
 	nodeClusterID := clusters.WithClusterFallback(team.ClusterID)
-	clusterNodes := o.GetClusterNodes(nodeClusterID)
-
 	allLabels, labelFilteringEnabled := o.generateRequiredNodeLabels(ctx, sandboxID, team, sbxData)
+	intent := startintent.Intent{
+		ClusterID:     nodeClusterID.String(),
+		SandboxID:     sandboxID,
+		OwnerToken:    executionID,
+		VCPU:          sbxData.Build.Vcpu,
+		MemoryMiB:     sbxData.Build.RamMb,
+		Compatibility: startIntentCompatibility(cpuRequirement.PinnedModel, labelFilteringEnabled, allLabels),
+	}
 
-	placed, err := placement.PlaceSandbox(ctx, o.placementAlgorithm, clusterNodes, node, sbxRequest, cpuRequirement, labelFilteringEnabled, allLabels)
+	var intentLease *startIntentLease
+	if usesStartIntents(o.capacityDemandMode) {
+		intentLease, err = beginStartIntent(
+			ctx,
+			o.startIntentStore,
+			intent,
+			o.startIntentLeaseTTL,
+			o.startIntentHeartbeatInterval,
+			o.startIntentHandoffTTL,
+		)
+		if err != nil {
+			o.recordStartIntentLifecycle(ctx, "intent_persisted", "error")
+
+			return sandbox.Sandbox{}, startIntentAPIError("Failed to persist sandbox start intent", err)
+		}
+		defer intentLease.Remove(ctx)
+		telemetry.ReportEvent(ctx, "Sandbox start intent persisted")
+		o.recordStartIntentLifecycle(ctx, "intent_persisted", "success")
+	}
+
+	var placed placement.PlacementResult
+	placementAttempt := 0
+	placementCtx := ctx //nolint:contextcheck // the optional lease context is derived from this request context
+	if intentLease != nil {
+		placementCtx = intentLease.Context()
+	}
+	err = o.waitForCapacity(placementCtx, o.capacityDemandMode, intent, func(attemptCtx context.Context) error {
+		if placementAttempt == 0 {
+			telemetry.ReportEvent(ctx, "First sandbox placement")
+			o.recordStartIntentLifecycle(ctx, "first_placement", "attempt")
+		}
+		if placementAttempt > 0 {
+			o.refreshCapacityNodes(attemptCtx, nodeClusterID)
+		}
+
+		preferredNode := node
+		if placementAttempt > 0 {
+			preferredNode = nil
+		}
+		placementAttempt++
+
+		clusterNodes := o.GetClusterNodes(nodeClusterID)
+		var placeErr error
+		placed, placeErr = placement.PlaceSandbox(attemptCtx, o.placementAlgorithm, clusterNodes, preferredNode, sbxRequest, cpuRequirement, labelFilteringEnabled, allLabels)
+
+		return placeErr
+	})
+	if intentLease != nil {
+		if leaseErr := intentLease.Err(); leaseErr != nil {
+			return sandbox.Sandbox{}, startIntentAPIError("Sandbox start intent lease was lost", leaseErr)
+		}
+	}
 	if err != nil {
 		if isResume && placed.TimedOut {
 			// Remap by the snapshot's own sandbox ID: when forking, the started
@@ -492,6 +553,29 @@ func (o *Orchestrator) CreateSandbox(
 		}
 	}
 
+	if intentLease != nil {
+		if err := intentLease.Handoff(ctx); err != nil {
+			o.recordStartIntentLifecycle(ctx, "handoff", "error")
+			killErr := o.removeSandboxFromNode(
+				context.WithoutCancel(ctx),
+				sbx,
+				sandbox.StateActionKill,
+				sandbox.KillReasonUnknown,
+				false,
+			)
+			if killErr != nil {
+				logger.L().Error(ctx, "Error removing sandbox after start intent handoff failure",
+					zap.Error(killErr),
+					logger.WithSandboxID(sandboxID),
+				)
+			}
+
+			return sandbox.Sandbox{}, startIntentAPIError("Failed to hand off sandbox start intent", err)
+		}
+		telemetry.ReportEvent(ctx, "Sandbox start intent handed off")
+		o.recordStartIntentLifecycle(ctx, "handoff", "success")
+	}
+
 	err = o.sandboxStore.Add(ctx, sbx, &creationMeta)
 	if err != nil {
 		telemetry.ReportError(ctx, "failed to add sandbox to store", err)
@@ -523,7 +607,22 @@ func (o *Orchestrator) CreateSandbox(
 		}
 	}
 
+	if intentLease != nil {
+		intentLease.Remove(ctx)
+		telemetry.ReportEvent(ctx, "Sandbox running observed for start intent")
+		o.recordStartIntentLifecycle(ctx, "running_observed", "success")
+	}
+
 	return sbx, nil
+}
+
+func startIntentAPIError(clientMessage string, err error) *api.APIError {
+	return &api.APIError{
+		Code:      http.StatusServiceUnavailable,
+		ErrorCode: "sandbox_start_intent_unavailable",
+		ClientMsg: clientMessage,
+		Err:       err,
+	}
 }
 
 // maybeRemapResumeOriginNode repoints the snapshot's origin_node_id to the

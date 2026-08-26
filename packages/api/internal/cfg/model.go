@@ -24,7 +24,13 @@ const (
 	// orchestrator address. Used to develop the API against the darwin dummy
 	// orchestrator on macOS, where neither Nomad nor Kubernetes is available.
 	ServiceDiscoveryProviderLocal = "local"
+
+	SandboxCapacityDemandModeLegacy        SandboxCapacityDemandMode = "legacy-failure-ledger"
+	SandboxCapacityDemandModeDualWrite     SandboxCapacityDemandMode = "dual-write"
+	SandboxCapacityDemandModeStartIntentV1 SandboxCapacityDemandMode = "start-intent-v1"
 )
+
+type SandboxCapacityDemandMode string
 
 type Config struct {
 	AdminToken string `env:"ADMIN_TOKEN"`
@@ -100,6 +106,16 @@ type Config struct {
 	RedisTLSEnabled  bool   `env:"REDIS_TLS_ENABLED"`
 	RedisPassword    string `env:"REDIS_PASSWORD"`
 	RedisPoolSize    int    `env:"REDIS_POOL_SIZE"     envDefault:"160"`
+
+	// SandboxCapacityWaitTimeout enables server-side waiting when all compatible
+	// orchestrators refuse a create for capacity. Zero preserves the immediate
+	// capacity error behavior.
+	SandboxCapacityWaitTimeout   time.Duration             `env:"SANDBOX_CAPACITY_WAIT_TIMEOUT"    envDefault:"0s"`
+	SandboxCapacityRetryInterval time.Duration             `env:"SANDBOX_CAPACITY_RETRY_INTERVAL"  envDefault:"500ms"`
+	SandboxCapacityDemandMode    SandboxCapacityDemandMode `env:"SANDBOX_CAPACITY_DEMAND_MODE"     envDefault:"legacy-failure-ledger"`
+	SandboxCapacityPoolVCPU      int64                     `env:"SANDBOX_CAPACITY_POOL_VCPU"`
+	SandboxCapacityPoolMemoryMiB int64                     `env:"SANDBOX_CAPACITY_POOL_MEMORY_MIB"`
+	CapacitySnapshotServiceToken string                    `env:"CAPACITY_SNAPSHOT_SERVICE_TOKEN"`
 
 	APIInternalGrpcPort uint16 `env:"API_INTERNAL_GRPC_PORT" envDefault:"5009"`
 	APIEdgeGrpcPort     uint16 `env:"API_EDGE_GRPC_PORT"     envDefault:"5109"`
@@ -280,6 +296,33 @@ func Parse() (Config, error) {
 
 	if err := config.VolumesToken.validate(); err != nil {
 		return config, err
+	}
+	if config.SandboxCapacityWaitTimeout < 0 {
+		return config, errors.New("SANDBOX_CAPACITY_WAIT_TIMEOUT cannot be negative")
+	}
+	if config.SandboxCapacityRetryInterval <= 0 {
+		return config, errors.New("SANDBOX_CAPACITY_RETRY_INTERVAL must be positive")
+	}
+	if config.SandboxCapacityWaitTimeout > 0 && config.SandboxCapacityRetryInterval >= config.SandboxCapacityWaitTimeout {
+		return config, errors.New("SANDBOX_CAPACITY_RETRY_INTERVAL must be shorter than SANDBOX_CAPACITY_WAIT_TIMEOUT")
+	}
+	if !slices.Contains([]SandboxCapacityDemandMode{
+		SandboxCapacityDemandModeLegacy,
+		SandboxCapacityDemandModeDualWrite,
+		SandboxCapacityDemandModeStartIntentV1,
+	}, config.SandboxCapacityDemandMode) {
+		return config, fmt.Errorf("invalid SANDBOX_CAPACITY_DEMAND_MODE: %s", config.SandboxCapacityDemandMode)
+	}
+	if config.SandboxCapacityDemandMode != SandboxCapacityDemandModeLegacy && strings.TrimSpace(config.CapacitySnapshotServiceToken) == "" {
+		return config, errors.New("CAPACITY_SNAPSHOT_SERVICE_TOKEN is required for start-intent capacity demand modes")
+	}
+	if config.SandboxCapacityDemandMode != SandboxCapacityDemandModeLegacy {
+		if config.SandboxCapacityPoolVCPU <= 0 {
+			return config, errors.New("SANDBOX_CAPACITY_POOL_VCPU must be positive for start-intent capacity demand modes")
+		}
+		if config.SandboxCapacityPoolMemoryMiB <= 0 {
+			return config, errors.New("SANDBOX_CAPACITY_POOL_MEMORY_MIB must be positive for start-intent capacity demand modes")
+		}
 	}
 
 	return config, nil

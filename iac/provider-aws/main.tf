@@ -71,6 +71,13 @@ resource "random_password" "volume_token_key" {
   }
 }
 
+resource "random_password" "capacity_snapshot_service_token" {
+  count = var.capacity_autoscaler_enabled ? 1 : 0
+
+  length  = 48
+  special = false
+}
+
 locals {
   redis_port            = 6379
   ingress_port          = 8080
@@ -81,6 +88,8 @@ locals {
   loki_port             = 3100
   logs_proxy_port       = 30006
   otel_collector_port   = 4317
+
+  capacity_snapshot_service_token = var.capacity_autoscaler_enabled ? random_password.capacity_snapshot_service_token[0].result : ""
 
   auth_provider_config = {
     jwt = []
@@ -100,6 +109,24 @@ locals {
   # CA implies TLS: the factory refuses a CA without the flag.
   redis_tls_enabled = var.redis_managed ? "true" : "false"
   redis_url         = local.redis_cluster_url == "" ? "redis.service.consul:${local.redis_port}" : ""
+
+  client_cluster_min_size = coalesce(var.client_cluster_min_size, var.client_cluster_size)
+  client_cluster_max_size = coalesce(var.client_cluster_max_size, var.client_cluster_size)
+
+  capacity_api_env_vars = var.capacity_autoscaler_enabled ? merge({
+    SANDBOX_CAPACITY_DEMAND_MODE    = var.capacity_api_demand_mode
+    SANDBOX_CAPACITY_WAIT_TIMEOUT   = var.capacity_api_wait_timeout
+    SANDBOX_CAPACITY_RETRY_INTERVAL = var.capacity_api_retry_interval
+    CAPACITY_SNAPSHOT_SERVICE_TOKEN = local.capacity_snapshot_service_token
+    }, var.capacity_api_demand_mode == "legacy-failure-ledger" ? {} : {
+    SANDBOX_CAPACITY_POOL_VCPU       = tostring(var.capacity_api_pool_vcpu)
+    SANDBOX_CAPACITY_POOL_MEMORY_MIB = tostring(var.capacity_api_pool_memory_mib)
+  }) : {}
+
+  capacity_orchestrator_env_vars = var.capacity_autoscaler_enabled ? {
+    MAX_SANDBOXES_PER_NODE          = tostring(var.capacity_controller_slots_per_node)
+    MAX_STARTING_INSTANCES_PER_NODE = tostring(coalesce(var.capacity_controller_max_starting_per_node, var.capacity_controller_slots_per_node))
+  } : {}
 
   clickhouse_connection_string = var.clickhouse_cluster_size > 0 ? "clickhouse://${module.init.clickhouse.username}:${module.init.clickhouse.password}@clickhouse.service.consul:${local.clickhouse_port}/${local.clickhouse_database}" : ""
 
@@ -145,11 +172,31 @@ locals {
     VOLUME_TOKEN_SIGNING_KEY_NAME = "e2b-volume-token-key"
     VOLUME_TOKEN_DURATION         = "1h"
     VOLUME_TOKEN_SIGNING_METHOD   = "HS256"
-  }, var.api_env_vars)
+  }, local.capacity_api_env_vars, var.api_env_vars)
 
   api_db_migrator_env_vars = merge({
     POSTGRES_CONNECTION_STRING = module.init.postgres_connection_string
   }, var.api_db_migrator_env_vars)
+
+  capacity_controller_env_vars = merge({
+    AWS_REGION                      = data.aws_region.current.id
+    AWS_ASG_NAME                    = module.cluster.client_autoscaling_group_name
+    CAPACITY_DEMAND_MODE            = var.capacity_controller_demand_mode
+    CAPACITY_SNAPSHOT_GRPC_ADDRESS  = "api-internal-grpc.service.consul:${var.api_internal_grpc_port}"
+    CAPACITY_SNAPSHOT_SERVICE_TOKEN = local.capacity_snapshot_service_token
+    E2B_CLUSTER_ID                  = var.capacity_controller_cluster_id
+    MAX_NODES                       = tostring(local.client_cluster_max_size)
+    MIN_NODES                       = tostring(local.client_cluster_min_size)
+    NOMAD_ADDR                      = "http://127.0.0.1:${local.nomad_port}"
+    NOMAD_NODE_POOL                 = local.client_pool_name
+    NOMAD_TOKEN                     = module.init.cluster.nomad_acl_token
+    RECONCILE_INTERVAL              = var.capacity_controller_reconcile_interval
+    REDIS_CLUSTER_URL               = local.redis_cluster_url
+    REDIS_TLS_CA_BASE64             = local.redis_tls_ca_base64
+    REDIS_TLS_ENABLED               = local.redis_tls_enabled
+    REDIS_URL                       = local.redis_url
+    SLOTS_PER_NODE                  = tostring(var.capacity_controller_slots_per_node)
+  }, var.capacity_controller_env_vars)
 
   client_proxy_env_vars = merge({
     ENVIRONMENT                  = var.environment
@@ -191,7 +238,7 @@ locals {
     S3_USE_PATH_STYLE            = tostring(var.s3_use_path_style)
     AWS_REGION                   = data.aws_region.current.id
     AWS_DOCKER_REPOSITORY_NAME   = module.init.custom_environments_repository_name
-  }, var.orchestrator_env_vars)
+  }, local.capacity_orchestrator_env_vars, var.orchestrator_env_vars)
 
   template_manager_env_vars = merge({
     CONSUL_TOKEN                 = module.init.cluster.consul_acl_token
@@ -284,6 +331,9 @@ module "cluster" {
 
   client_node_pool_name               = local.client_pool_name
   client_cluster_size                 = var.client_cluster_size
+  client_cluster_min_size             = local.client_cluster_min_size
+  client_cluster_max_size             = local.client_cluster_max_size
+  capacity_autoscaler_enabled         = var.capacity_autoscaler_enabled
   client_image_family_prefix          = var.client_image_family_prefix != "" ? var.client_image_family_prefix : local.ami_family_prefix
   client_machine_type                 = var.client_server_machine_type
   client_security_group_ids           = [aws_security_group.cluster_node.id]
@@ -324,6 +374,9 @@ module "nomad" {
   api_db_migrator_env_vars    = local.api_db_migrator_env_vars
   api_repository_name         = module.init.api_repository_name
   db_migrator_repository_name = module.init.db_migrator_repository_name
+
+  capacity_autoscaler_enabled  = var.capacity_autoscaler_enabled
+  capacity_controller_env_vars = local.capacity_controller_env_vars
 
   ingress_count         = var.ingress_count
   ingress_port          = local.ingress_port

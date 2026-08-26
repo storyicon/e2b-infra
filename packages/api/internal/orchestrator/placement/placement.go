@@ -17,6 +17,8 @@ import (
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/api/internal/orchestrator/placement")
 
+const nodeExhaustedLogLevel = zap.DebugLevel
+
 // PlacementResult carries the outcome of a placement attempt alongside the error.
 type PlacementResult struct {
 	// Node is the node the sandbox was placed on, or nil on failure.
@@ -171,8 +173,9 @@ func PlaceSandbox(
 		switch statusCode {
 		case codes.ResourceExhausted:
 			refusals++
+			nodesExcluded[failedNode.ID] = struct{}{}
 			failedNode.PlacementMetrics.Skip(sbxRequest.GetSandbox().GetSandboxId())
-			logger.L().Warn(ctx, "Node exhausted, trying another node", logger.WithSandboxID(sbxRequest.GetSandbox().GetSandboxId()), logger.WithNodeID(failedNode.ID), zap.Error(utils.UnwrapGRPCError(err)))
+			logger.L().Log(ctx, nodeExhaustedLogLevel, "Node exhausted, trying another node", logger.WithSandboxID(sbxRequest.GetSandbox().GetSandboxId()), logger.WithNodeID(failedNode.ID), zap.Error(utils.UnwrapGRPCError(err)))
 		default:
 			nodesExcluded[failedNode.ID] = struct{}{}
 			failedNode.PlacementMetrics.Fail(sbxRequest.GetSandbox().GetSandboxId())

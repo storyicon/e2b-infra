@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
+	"github.com/e2b-dev/infra/packages/api/internal/cfg"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/placement"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
@@ -91,6 +92,7 @@ func newCreateSandboxTestOrchestratorWithFlags(t *testing.T, flagSource *ldtestd
 		featureFlagsClient:      ffClient,
 		createdSandboxesCounter: counter,
 		routingCatalog:          e2bcatalog.NewRedisSandboxCatalog(client),
+		capacityDemandMode:      cfg.SandboxCapacityDemandModeLegacy,
 	}
 
 	o.registerNode(node)

@@ -256,6 +256,23 @@ func (o *Orchestrator) discoverClusterNode(ctx context.Context, clusterID uuid.U
 	}
 }
 
+// refreshCapacityNodes pulls newly joined orchestrators into the local node
+// cache while a capacity-waiting request is retrying placement. Without this
+// on-demand refresh, the request can wait for the periodic discovery interval
+// even after the autoscaled instance is ready in Nomad.
+func (o *Orchestrator) refreshCapacityNodes(ctx context.Context, clusterID uuid.UUID) {
+	key := "capacity-refresh:" + clusterID.String()
+	o.discoveryGroup.Do(key, func() (any, error) {
+		if clusterID == consts.LocalClusterID {
+			o.discoverNomadNodes(ctx)
+		} else {
+			o.discoverClusterNode(ctx, clusterID)
+		}
+
+		return nil, nil
+	})
+}
+
 func (o *Orchestrator) GetClusterNodes(clusterID uuid.UUID) []*nodemanager.Node {
 	clusterNodes := make([]*nodemanager.Node, 0)
 	for _, n := range o.nodes.Items() {

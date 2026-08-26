@@ -5,7 +5,7 @@ import (
 )
 
 // NoNodesAvailableError reports no capacity: no candidate node at all, or
-// nothing but ResourceExhausted refusals until the deadline.
+// every current candidate refused with ResourceExhausted.
 type NoNodesAvailableError struct{}
 
 var _ error = NoNodesAvailableError{}

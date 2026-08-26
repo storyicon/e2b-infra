@@ -5,6 +5,8 @@ package server
 import (
 	"net"
 	"reflect"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +25,27 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
+
+func TestReserveSandboxStartIsAtomic(t *testing.T) {
+	t.Parallel()
+
+	var inFlight atomic.Int64
+	const limit = 20
+	var accepted atomic.Int64
+	var wg sync.WaitGroup
+
+	for range 100 {
+		wg.Go(func() {
+			if reserveSandboxStart(&inFlight, func() int { return 0 }, limit) {
+				accepted.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+
+	assert.Equal(t, int64(limit), accepted.Load())
+	assert.Equal(t, int64(limit), inFlight.Load())
+}
 
 var (
 	startTime = time.Now()

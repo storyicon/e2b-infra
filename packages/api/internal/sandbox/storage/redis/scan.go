@@ -184,3 +184,76 @@ func (s *Storage) AllRunningItems(ctx context.Context) ([]sandboxtypes.Sandbox, 
 
 	return items.out, nil
 }
+
+// AllRunningItemsStrict returns a complete running-sandbox snapshot or an
+// error. Capacity decisions must not use the best-effort AllRunningItems view:
+// skipping one team or one corrupt record would silently undercount demand.
+func (s *Storage) AllRunningItemsStrict(ctx context.Context) ([]sandboxtypes.Sandbox, error) {
+	teams, err := s.redisClient.ZRange(ctx, globalTeamsSet, 0, -1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list teams from global index: %w", err)
+	}
+
+	items := newRunningItems()
+	for _, teamID := range teams {
+		if err := s.forEachTeamSandboxBatchStrict(ctx, teamID, items.add); err != nil {
+			return nil, fmt.Errorf("strict sandbox scan failed for team %s: %w", teamID, err)
+		}
+	}
+
+	return items.out, nil
+}
+
+func (s *Storage) forEachTeamSandboxBatchStrict(ctx context.Context, teamID string, fn func([]sandboxtypes.Sandbox)) error {
+	var cursor uint64
+	for {
+		sandboxIDs, next, err := s.redisClient.SScan(ctx, GetSandboxStorageTeamIndexKey(teamID), cursor, "", sandboxScanBatchSize).Result()
+		if err != nil {
+			return fmt.Errorf("failed to scan team index: %w", err)
+		}
+
+		for start := 0; start < len(sandboxIDs); start += sandboxScanBatchSize {
+			end := min(start+sandboxScanBatchSize, len(sandboxIDs))
+			batch, err := s.fetchSandboxBatchStrict(ctx, teamID, sandboxIDs[start:end])
+			if err != nil {
+				return err
+			}
+			fn(batch)
+		}
+
+		cursor = next
+		if cursor == 0 {
+			return nil
+		}
+	}
+}
+
+func (s *Storage) fetchSandboxBatchStrict(ctx context.Context, teamID string, sandboxIDs []string) ([]sandboxtypes.Sandbox, error) {
+	if len(sandboxIDs) == 0 {
+		return nil, nil
+	}
+
+	keys := utils.Map(sandboxIDs, func(id string) string { return getSandboxKey(teamID, id) })
+	values, err := s.redisClient.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, fmt.Errorf("MGET failed: %w", err)
+	}
+
+	result := make([]sandboxtypes.Sandbox, 0, len(values))
+	for index, raw := range values {
+		if raw == nil {
+			continue
+		}
+		encoded, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf("sandbox %q has unexpected Redis value type", sandboxIDs[index])
+		}
+		var sbx sandboxtypes.Sandbox
+		if err := json.Unmarshal([]byte(encoded), &sbx); err != nil {
+			return nil, fmt.Errorf("decode sandbox %q: %w", sandboxIDs[index], err)
+		}
+		result = append(result, sbx)
+	}
+
+	return result, nil
+}

@@ -93,6 +93,11 @@ jobs:
             test_path: ./...
             sudo: false
             runner: blacksmith-4vcpu-ubuntu-2404-arm
+          - package: packages/capacity-controller
+            flag: arm64-capacity-controller
+            test_path: ./...
+            sudo: false
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
           - package: packages/client-proxy
             flag: arm64-client-proxy
             test_path: ./...
@@ -213,6 +218,10 @@ jobs:
           gotestsum --junitfile=junit.xml --format=standard-verbose \
             -- -timeout 20m -coverprofile=coverage.txt -covermode=atomic ${{ matrix.test_path }}
         if: matrix.sudo == false
+
+      - name: Run shared capacity benchmark tests
+        if: matrix.package == 'packages/shared'
+        run: node --test packages/shared/scripts/capacity-smoke-model.test.mjs
 
       - name: Upload coverage to Codecov
         if: ${{ !cancelled() && env.CODECOV_TOKEN != '' && hashFiles(format('{0}/coverage.txt', matrix.package)) != '' }}

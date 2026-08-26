@@ -177,9 +177,52 @@ func TestBestOfK_ChooseNode_NoAvailableNodes(t *testing.T) {
 	}
 
 	selected, err := algo.chooseNode(ctx, nodes, excludedNodes, resources, CPURequirement{}, false, nil)
-	require.Error(t, err)
+	var noNodesErr NoNodesAvailableError
+	require.ErrorAs(t, err, &noNodesErr)
 	assert.Nil(t, selected)
-	assert.Contains(t, err.Error(), "no node available")
+}
+
+func TestBestOfK_ChooseNode_IncompatibleCPUIsNotCapacity(t *testing.T) {
+	t.Parallel()
+
+	algo := NewBestOfK(DefaultBestOfKConfig()).(*BestOfK)
+	node := nodemanager.NewTestNode("node1", api.NodeStatusReady, 0, 4)
+	requirement := CPURequirement{PinnedModel: machineinfo.IceLakeModel}
+
+	selected, err := algo.chooseNode(
+		t.Context(),
+		[]*nodemanager.Node{node},
+		map[string]struct{}{},
+		nodemanager.SandboxResources{CPUs: 1, MiBMemory: 512},
+		requirement,
+		false,
+		nil,
+	)
+
+	var incompatibleErr FailedToPlaceSandboxError
+	require.ErrorAs(t, err, &incompatibleErr)
+	assert.Nil(t, selected)
+}
+
+func TestBestOfK_ChooseNode_TemporarilyExcludedNodesAreCapacity(t *testing.T) {
+	t.Parallel()
+
+	algo := NewBestOfK(DefaultBestOfKConfig()).(*BestOfK)
+	node := nodemanager.NewTestNode("node1", api.NodeStatusReady, 0, 4)
+
+	selected, err := algo.chooseNode(
+		t.Context(),
+		[]*nodemanager.Node{node},
+		map[string]struct{}{node.ID: {}},
+		nodemanager.SandboxResources{CPUs: 1, MiBMemory: 512},
+		CPURequirement{},
+		false,
+		nil,
+	)
+
+	var noNodesErr NoNodesAvailableError
+	require.ErrorAs(t, err, &noNodesErr)
+	assert.Nil(t, selected)
 }
 
 func TestFailedToPlaceSandboxError_Error(t *testing.T) {

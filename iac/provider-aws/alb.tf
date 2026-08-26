@@ -37,6 +37,7 @@ resource "aws_lb" "ingress" {
   name               = "${var.prefix}ingress"
   internal           = false
   load_balancer_type = "application"
+  idle_timeout       = var.capacity_autoscaler_enabled ? var.capacity_ingress_idle_timeout_seconds : 60
   subnets            = module.init.vpc_public_subnet_ids
   security_groups = [
     aws_security_group.ingress.id

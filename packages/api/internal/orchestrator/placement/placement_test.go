@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -20,6 +21,12 @@ import (
 
 type mockAlgorithm struct {
 	mock.Mock
+}
+
+func TestNodeExhaustedLogLevel(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, zap.DebugLevel, nodeExhaustedLogLevel)
 }
 
 func (m *mockAlgorithm) chooseNode(ctx context.Context, nodes []*nodemanager.Node, nodesExcluded map[string]struct{}, requested nodemanager.SandboxResources, cpu CPURequirement, filterByLabels bool, requiredLabels []string) (*nodemanager.Node, error) {
@@ -209,8 +216,56 @@ func TestPlaceSandbox_ResourceExhausted(t *testing.T) {
 	assert.Equal(t, node2, resultNode.Node, "should succeed on node2 after node1 was exhausted")
 	algorithm.AssertExpectations(t)
 
-	// Verify node1 was NOT excluded (ResourceExhausted nodes should be retried)
+	// Verify placement continued to node2 after node1 refused capacity.
 	algorithm.AssertNumberOfCalls(t, "chooseNode", 2)
+}
+
+func TestPlaceSandbox_EachExhaustedNodeIsTriedOnce(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	nodes := []*nodemanager.Node{
+		nodemanager.NewTestNode("node1", api.NodeStatusReady, 0, 4,
+			nodemanager.WithSandboxCreateError(status.Error(codes.ResourceExhausted, "node exhausted"))),
+		nodemanager.NewTestNode("node2", api.NodeStatusReady, 0, 4,
+			nodemanager.WithSandboxCreateError(status.Error(codes.ResourceExhausted, "node exhausted"))),
+	}
+
+	chooseCalls := 0
+	algorithm := stubAlgorithm{choose: func(excluded map[string]struct{}) (*nodemanager.Node, error) {
+		chooseCalls++
+		if chooseCalls > len(nodes) {
+			cancel()
+
+			return nodes[0], nil
+		}
+
+		for _, node := range nodes {
+			if _, found := excluded[node.ID]; !found {
+				return node, nil
+			}
+		}
+
+		return nil, errors.New("all nodes exhausted")
+	}}
+
+	result, err := PlaceSandbox(
+		ctx,
+		algorithm,
+		nodes,
+		nil,
+		testSbxRequest("test-sandbox"),
+		CPURequirement{},
+		false,
+		nil,
+	)
+
+	var noNodesErr NoNodesAvailableError
+	require.ErrorAs(t, err, &noNodesErr)
+	assert.False(t, result.TimedOut)
+	assert.Equal(t, len(nodes), chooseCalls)
 }
 
 func TestPlaceSandbox_TriggersOptimisticUpdate(t *testing.T) {

@@ -23,6 +23,8 @@ import (
 	redisreservations "github.com/e2b-dev/infra/packages/api/internal/sandbox/reservations/redis"
 	redisbackend "github.com/e2b-dev/infra/packages/api/internal/sandbox/storage/redis"
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
+	capacitydemand "github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand"
+	"github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand/startintent"
 	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
@@ -59,10 +61,22 @@ type Orchestrator struct {
 	sandboxCountGaugeRegistration metric.Registration
 	createdSandboxesCounter       metric.Int64Counter
 	resumeOriginNodeRemapCounter  metric.Int64Counter
+	startIntentLifecycleCounter   metric.Int64Counter
 	teamMetricsObserver           *metrics.TeamObserver
 	accessTokenGenerator          *sandbox.AccessTokenGenerator
 	createdCounter                metric.Int64Counter
 	snapshotCache                 SnapshotCacheInvalidator
+	capacityWaiter                *capacityWaiter
+	capacityDemandMode            cfg.SandboxCapacityDemandMode
+	capacityWaitTimeout           time.Duration
+	capacityRetryInterval         time.Duration
+	capacityPoolVCPU              int64
+	capacityPoolMemoryMiB         int64
+	startIntentStore              startIntentStore
+	startIntentLeaseTTL           time.Duration
+	startIntentHeartbeatInterval  time.Duration
+	startIntentHandoffTTL         time.Duration
+	runningSandboxReader          runningSandboxReader
 
 	snapshotUpsertSem *utils.AdjustableSemaphore
 	redisStorage      *redisbackend.Storage
@@ -168,6 +182,21 @@ func New(
 		tel:                  tel,
 		clusters:             clusters,
 		redisStorage:         redisStorage,
+		capacityWaiter: newCapacityWaiter(
+			capacitydemand.NewRedisStore(redisClient),
+			config.SandboxCapacityWaitTimeout,
+			config.SandboxCapacityRetryInterval,
+		),
+		capacityDemandMode:           config.SandboxCapacityDemandMode,
+		capacityWaitTimeout:          config.SandboxCapacityWaitTimeout,
+		capacityRetryInterval:        config.SandboxCapacityRetryInterval,
+		capacityPoolVCPU:             config.SandboxCapacityPoolVCPU,
+		capacityPoolMemoryMiB:        config.SandboxCapacityPoolMemoryMiB,
+		startIntentStore:             startintent.NewRedisStore(redisClient),
+		startIntentLeaseTTL:          defaultStartIntentLeaseTTL,
+		startIntentHeartbeatInterval: defaultStartIntentHeartbeatInterval,
+		startIntentHandoffTTL:        defaultStartIntentHandoffTTL,
+		runningSandboxReader:         redisStorage,
 
 		createdCounter: createdCounter,
 

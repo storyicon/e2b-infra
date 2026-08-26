@@ -44,6 +44,7 @@ flowchart TB
         API["API<br/>REST :80, gRPC :5009/:5109"]
         DashAPI["dashboard-api :3010"]
         CP["client-proxy<br/>:3002"]
+        CC["capacity-controller<br/>AWS scale-out only"]
     end
 
     subgraph datastores["State"]
@@ -77,6 +78,9 @@ flowchart TB
     ORCH --> ENVD
     ENVD --> USERPROC
     API --> PG & RD & CH
+    API -->|"start-intent leases"| RD
+    CC -->|"authenticated capacity snapshot"| API
+    CC -->|"SetDesiredCapacity"| ASG["AWS client-node ASG"]
     DashAPI --> PG & CH
     ORCH --> OS & CH
     TM --> OS
@@ -92,6 +96,7 @@ flowchart TB
 | Client proxy | `packages/client-proxy` | API nodes | Edge router: sandbox URL → correct node |
 | Envd | `packages/envd` | inside every VM | In-VM agent: process/filesystem API for SDKs |
 | Dashboard API | `packages/dashboard-api` | API nodes | Backend for the web dashboard (teams, builds, admin) |
+| Capacity controller | `packages/capacity-controller` | one API node allocation (AWS, optional) | Converts the API's de-duplicated running + start-intent workload snapshot into scale-out-only client ASG capacity |
 
 Supporting packages: `packages/shared` (protos, telemetry, storage clients, feature flags),
 `packages/auth` (authentication library), `packages/db` (Postgres migrations + sqlc queries),
@@ -117,7 +122,16 @@ The control-plane entry point (Gin, OpenAPI-generated from `spec/openapi.yml`, p
 - **Placement**: keeps a live map of orchestrator nodes (discovered via Nomad, Kubernetes, or a
   static list). Chooses a node per sandbox with a **best-of-K** algorithm
   (`internal/orchestrator/placement/`): sample K ready nodes, score by CPU
-  commitment/usage, pick the lowest; retry on exhausted nodes. Tunable live via feature flags.
+  commitment/usage, pick the lowest; retry on exhausted nodes. In `start-intent-v1`, the unique
+  reservation owner writes an expiring, cluster-scoped intent after metadata validation and before
+  the first placement attempt. The owner heartbeats that lease while placement waits for capacity.
+  Success changes it to a short handoff lease until the running index is visible; failure,
+  cancellation, and timeout remove it with a bounded context that does not inherit request
+  cancellation. Duplicate requests join the existing reservation and never add demand. The
+  explicit `dual-write` migration mode also maintains the legacy failure ledger, but the controller
+  always reads exactly one configured source and never falls back automatically. The API derives
+  its request, HTTP write, and graceful-shutdown deadlines from the configured capacity-wait budget;
+  upstream proxies must have a longer timeout. Tunable live via feature flags.
 - **State**: writes sandbox records to Redis (source of truth for *running* sandboxes) and the
   sandbox→node **routing catalog** in Redis that client-proxy reads. Persistent entities
   (templates, builds, snapshots, teams) live in Postgres.
@@ -153,6 +167,13 @@ gRPC services on :5008 (`pkg/server/`, `pkg/service/`, `pkg/template/server/`, `
 - **ChunkService / VolumeService** — peer-to-peer template chunk serving; persistent volumes.
 
 Key mechanisms (all under `pkg/sandbox/`):
+
+- **Node admission**: AWS deployments with pending-demand autoscaling pin the orchestrator's
+  running limit to the controller's `slots_per_node`. The concurrent-start limit defaults to the
+  same value but can be lowered independently to protect node startup reliability without changing
+  eventual capacity. An atomic in-flight reservation closes the race between the live sandbox
+  count check and insertion into the running map, so concurrent creates cannot exceed that
+  configured node limit.
 
 - **Firecracker** (`fc/`): each sandbox is one Firecracker process in its own cgroup and network
   namespace. The FC HTTP API (unix socket) configures machine, drives, network, and snapshots.
@@ -266,7 +287,7 @@ planes today.
 | Store | Owner packages | What lives there |
 |---|---|---|
 | **PostgreSQL** | `packages/db` (goose migrations, sqlc) | Durable control-plane state: `teams`, `users`, `tiers` (quota defaults), `project_limits` (per-team quota overrides pushed in by the owning service; the `team_limits` view reads it in preference to `tiers`), `envs` (templates), `env_builds` (build rows: vcpu, ram_mb, status, versions), `env_aliases`, `snapshots` (paused sandboxes), `team_api_keys`, `volumes`, `clusters` |
-| **Redis** | API, client-proxy, orchestrator | Ephemeral runtime state: running-sandbox store (source of truth), sandbox→node routing catalog, team/template/snapshot caches, rate limiting, P2P chunk peer registry |
+| **Redis** | API, client-proxy, orchestrator | Ephemeral runtime state: running-sandbox store (source of truth), sandbox→node routing catalog, team/template/snapshot caches, rate limiting, P2P chunk peer registry, versioned start-intent leases, and the isolated legacy demand namespace retained for explicit rollback |
 | **ClickHouse** | `packages/clickhouse` | Time-series/analytics: `metrics_gauge`/`metrics_sum` (written by the OTel collector), `sandbox_events`, `sandbox_host_stats` (written by orchestrator), team metrics, and optionally `sandbox_logs` during the log migration. Read by API and dashboard-api |
 | **Object storage** (GCS/S3/local, `packages/shared/pkg/storage`) | orchestrator, template-manager | Template & snapshot artifacts, keyed by build ID: `{buildID}/memfile`, `{buildID}/rootfs.ext4`, `{buildID}/snapfile`, `{buildID}/metadata.json` + `.header` index files |
 
@@ -284,13 +305,22 @@ sequenceDiagram
     participant C as SDK
     participant API as API
     participant R as Redis
+    participant CC as Capacity controller (AWS, optional)
+    participant ASG as Client-node ASG
     participant O as Orchestrator (chosen node)
     participant FC as Firecracker
     participant E as envd (in VM)
 
     C->>API: POST /sandboxes {templateID}
     API->>API: auth team, resolve template alias → ready build (Postgres/cache)
-    API->>API: best-of-K placement → pick node
+    API->>R: reservation owner upserts expiring start intent
+    CC->>API: internal gRPC snapshot (independent bearer)
+    API->>R: read running IDs and active intent IDs
+    API-->>CC: cardinality(running UNION intents)
+    CC->>ASG: target=max(desired, ceil(workload/slots))
+    API->>API: best-of-K placement; refresh nodes and retry on capacity errors
+    ASG-->>API: new orchestrators become discoverable through Nomad
+    API->>API: pick node
     API->>O: gRPC SandboxService.Create(SandboxConfig)
     O->>O: fetch template (local cache / NFS / object storage)
     O->>O: acquire network slot + NBD rootfs overlay + uffd memory
@@ -298,7 +328,8 @@ sequenceDiagram
     O->>E: POST /init (env vars, access token) — retried until ready
     E-->>O: 204
     O-->>API: Create OK
-    API->>R: store running sandbox + routing catalog entry
+    API->>R: intent outstanding -> handoff
+    API->>R: store running sandbox + routing catalog; remove owned handoff
     API-->>C: 201 sandbox {sandboxID, domain}
 ```
 
@@ -457,7 +488,8 @@ flowchart TB
         NS["Nomad + Consul servers (control plane)"]
     end
     subgraph apipool["api pool"]
-        AJ["api, dashboard-api, client-proxy,<br/>ingress (Traefik),<br/>redis, loki, otel-collector, autoscaler"]
+        AJ["api, dashboard-api, client-proxy,<br/>ingress (Traefik), redis, loki,<br/>otel-collector, autoscalers"]
+        CCJ["capacity-controller (AWS optional,<br/>singleton raw_exec)"]
     end
     subgraph clientpool["default pool (autoscaled)"]
         OJ["orchestrator (system job, raw_exec)<br/>+ Firecracker sandboxes"]
@@ -471,12 +503,26 @@ flowchart TB
 
     LB --> apipool
     AJ -->|gRPC| OJ & TJ
+    CCJ -->|private authenticated gRPC| AJ
+    CCJ -->|SetDesiredCapacity on named ASG| clientpool
     NS -.->|schedules jobs| apipool & clientpool & buildpool & chpool
 ```
 
 - **Server nodes** run only Nomad/Consul servers (scheduling, service discovery, Consul DNS —
   services address each other as `*.service.consul`).
 - **API nodes** host every control-plane container and are the only LB backend.
+- **AWS capacity controller** is an optional singleton on the API node pool. In
+  `start-intent-v1` it calls the API's internal gRPC service through Consul DNS with an independent
+  bearer credential; this service is not registered on edge gRPC and returns only aggregate counts.
+  The API strictly reads running records and active intent leases for the requested cluster, unions
+  their Sandbox IDs, and fails the snapshot instead of silently undercounting a corrupt or
+  unavailable authority. The controller computes
+  `max(currentDesired, ceil(workloadCount / slotsPerNode))`, clamps it to explicit min/max, and only
+  raises the named client ASG. Snapshot errors produce no ASG write and no automatic legacy
+  fallback. Ready Nomad count is diagnostic: already-requested but not-ready EC2 capacity is covered
+  by ASG desired and is not requested twice. The controller has no listener or public route and
+  never scales in. The legacy failure-ledger reader remains isolated for explicit operational
+  rollback until the migration observation period is complete.
 - **Sandbox ("client") nodes** run the orchestrator as a Nomad *system* job via `raw_exec`
   (it needs root for Firecracker, namespaces, NBD, cgroups). Configured with hugepages and local
   template caches. Autoscaled.
@@ -498,6 +544,7 @@ packages/
   client-proxy/         Edge router for sandbox traffic
   envd/                 In-VM agent (bump pkg/version.go on behavior change!)
   dashboard-api/        Web-dashboard backend
+  capacity-controller/  Optional AWS pending-demand to client-ASG scale-out controller
   shared/               Protos, telemetry, storage clients, proxy engine, feature flags
   auth/                 AuthN library (API keys, JWT/OIDC) used by api + dashboard-api
   db/                   Postgres migrations (goose) + queries (sqlc)

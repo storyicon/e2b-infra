@@ -54,6 +54,16 @@ variable "cluster_size" {
   default = 1
 }
 
+variable "min_size" {
+  type        = number
+  description = "Minimum number of instances in the Auto Scaling group"
+}
+
+variable "max_size" {
+  type        = number
+  description = "Maximum number of instances in the Auto Scaling group"
+}
+
 variable "machine_type" {
   type    = string
   default = "m8i.4xlarge"

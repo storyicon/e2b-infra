@@ -59,6 +59,94 @@ func TestReservation(t *testing.T) {
 	assert.NotNil(t, finishStart)
 }
 
+func TestReservation_HeartbeatRefreshesOwnerLease(t *testing.T) {
+	t.Parallel()
+	storage, client := setupTestReservationStorage(t)
+	storage.heartbeatInterval = 10 * time.Millisecond
+
+	teamID := uuid.New()
+	sandboxID := "heartbeat-refresh"
+	_, _, err := storage.Reserve(t.Context(), teamID, sandboxID, 1)
+	require.NoError(t, err)
+
+	pendingKey := getPendingSetKey(teamID.String())
+	oldScore := float64(time.Now().Add(-staleTTL).Unix())
+	require.NoError(t, client.ZAdd(t.Context(), pendingKey, goredis.Z{Score: oldScore, Member: sandboxID}).Err())
+
+	require.Eventually(t, func() bool {
+		score, scoreErr := client.ZScore(t.Context(), pendingKey, sandboxID).Result()
+
+		return scoreErr == nil && score > oldScore
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestReservation_HeartbeatDoesNotRestoreMissingLease(t *testing.T) {
+	t.Parallel()
+	storage, client := setupTestReservationStorage(t)
+	storage.heartbeatInterval = 10 * time.Millisecond
+
+	teamID := uuid.New()
+	sandboxID := "heartbeat-missing"
+	_, _, err := storage.Reserve(t.Context(), teamID, sandboxID, 1)
+	require.NoError(t, err)
+
+	pendingKey := getPendingSetKey(teamID.String())
+	require.NoError(t, client.ZRem(t.Context(), pendingKey, sandboxID).Err())
+	require.Never(t, func() bool {
+		return client.ZScore(t.Context(), pendingKey, sandboxID).Err() == nil
+	}, 100*time.Millisecond, 10*time.Millisecond)
+}
+
+func TestReservation_HeartbeatStopsBeforeFinish(t *testing.T) {
+	t.Parallel()
+	storage, client := setupTestReservationStorage(t)
+	storage.heartbeatInterval = 10 * time.Millisecond
+
+	teamID := uuid.New()
+	sandboxID := "heartbeat-finish"
+	finishStart, _, err := storage.Reserve(t.Context(), teamID, sandboxID, 1)
+	require.NoError(t, err)
+	require.NotNil(t, finishStart)
+
+	finishStart(testSandbox(teamID, sandboxID), nil)
+
+	// A new lease with the same sandbox ID must not be refreshed by the old
+	// owner's heartbeat after finishStart returns.
+	pendingKey := getPendingSetKey(teamID.String())
+	marker := float64(time.Now().Add(-time.Hour).Unix())
+	require.NoError(t, client.ZAdd(t.Context(), pendingKey, goredis.Z{Score: marker, Member: sandboxID}).Err())
+	require.Never(t, func() bool {
+		score, scoreErr := client.ZScore(t.Context(), pendingKey, sandboxID).Result()
+
+		return scoreErr == nil && score != marker
+	}, 100*time.Millisecond, 10*time.Millisecond)
+}
+
+func TestReservation_HeartbeatStopsOnOwnerCancellation(t *testing.T) {
+	t.Parallel()
+	storage, client := setupTestReservationStorage(t)
+	storage.heartbeatInterval = 10 * time.Millisecond
+
+	ownerCtx, cancelOwner := context.WithCancel(t.Context())
+	teamID := uuid.New()
+	sandboxID := "heartbeat-cancel"
+	_, _, err := storage.Reserve(ownerCtx, teamID, sandboxID, 1)
+	require.NoError(t, err)
+	cancelOwner()
+
+	// Wait for the heartbeat goroutine to observe cancellation, then replace
+	// the score with a marker that must remain untouched.
+	time.Sleep(30 * time.Millisecond)
+	pendingKey := getPendingSetKey(teamID.String())
+	marker := float64(time.Now().Add(-time.Hour).Unix())
+	require.NoError(t, client.ZAdd(t.Context(), pendingKey, goredis.Z{Score: marker, Member: sandboxID}).Err())
+	require.Never(t, func() bool {
+		score, scoreErr := client.ZScore(t.Context(), pendingKey, sandboxID).Result()
+
+		return scoreErr == nil && score != marker
+	}, 100*time.Millisecond, 10*time.Millisecond)
+}
+
 func TestReservation_Exceeded(t *testing.T) {
 	t.Parallel()
 	storage, _ := setupTestReservationStorage(t)
