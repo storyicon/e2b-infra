@@ -234,7 +234,7 @@ func TestRefreshCapacityNodesThrottlesSequentialDiscovery(t *testing.T) {
 		}
 		discoveryAttempts.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode([]*nomadapi.ServiceRegistration{}))
+		assert.NoError(t, json.NewEncoder(w).Encode([]*nomadapi.ServiceRegistration{}))
 	})
 	o := newTestOrchestrator(t, nomadClient)
 	o.capacityRetryInterval = time.Minute

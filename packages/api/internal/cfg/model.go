@@ -110,9 +110,9 @@ type Config struct {
 	// SandboxCapacityWaitTimeout enables server-side waiting when all compatible
 	// orchestrators refuse a create for capacity. Zero preserves the immediate
 	// capacity error behavior.
-	SandboxCapacityWaitTimeout   time.Duration             `env:"SANDBOX_CAPACITY_WAIT_TIMEOUT"    envDefault:"0s"`
-	SandboxCapacityRetryInterval time.Duration             `env:"SANDBOX_CAPACITY_RETRY_INTERVAL"  envDefault:"500ms"`
-	SandboxCapacityDemandMode    SandboxCapacityDemandMode `env:"SANDBOX_CAPACITY_DEMAND_MODE"     envDefault:"legacy-failure-ledger"`
+	SandboxCapacityWaitTimeout   time.Duration             `env:"SANDBOX_CAPACITY_WAIT_TIMEOUT"          envDefault:"0s"`
+	SandboxCapacityRetryInterval time.Duration             `env:"SANDBOX_CAPACITY_RETRY_INTERVAL"        envDefault:"500ms"`
+	SandboxCapacityDemandMode    SandboxCapacityDemandMode `env:"SANDBOX_CAPACITY_DEMAND_MODE"           envDefault:"legacy-failure-ledger"`
 	SandboxCapacityPoolVCPU      int64                     `env:"SANDBOX_CAPACITY_POOL_VCPU"`
 	SandboxCapacityPoolMemoryMiB int64                     `env:"SANDBOX_CAPACITY_POOL_MEMORY_MIB"`
 	SandboxCapacityPoolCPUArch   string                    `env:"SANDBOX_CAPACITY_POOL_CPU_ARCHITECTURE"`

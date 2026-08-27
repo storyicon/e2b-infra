@@ -177,7 +177,7 @@ func TestReconcileStartIntentScalesAtMaxBoundaryDuringContinuousGrowth(t *testin
 	r := newStartIntentTestReconciler(snapshot, &fakeNodeCounter{ready: 1}, target)
 	t0 := time.Unix(100, 0)
 
-	for step := 0; step < 10; step++ {
+	for step := range 10 {
 		snapshot.snapshot.WorkloadCount = int64(40 + step*20)
 		result, err := r.Reconcile(t.Context(), t0.Add(time.Duration(step)*time.Second))
 		require.NoError(t, err)
@@ -200,7 +200,7 @@ func TestReconcileStartIntentPreservesMaxBoundaryWhenDesiredChangesButDemandIsUn
 	r := newStartIntentTestReconciler(snapshot, &fakeNodeCounter{ready: 1}, target)
 	t0 := time.Unix(100, 0)
 
-	for step := 0; step < 10; step++ {
+	for step := range 10 {
 		snapshot.snapshot.WorkloadCount = int64(40 + step*20)
 		if step == 9 {
 			target.desired = 2

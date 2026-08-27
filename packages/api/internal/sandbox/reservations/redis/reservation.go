@@ -102,7 +102,7 @@ func (s *ReservationStorage) ReserveOwned(ctx context.Context, teamID uuid.UUID,
 	return s.reservationResult(ctx, teamID, sandboxID, result, nil)
 }
 
-func (s *ReservationStorage) reservationResult(ctx context.Context, teamID uuid.UUID, sandboxID string, result int, finishStart func(sandboxtypes.Sandbox, error)) (func(sandboxtypes.Sandbox, error), func(context.Context) (sandboxtypes.Sandbox, error), error) {
+func (s *ReservationStorage) reservationResult(_ context.Context, teamID uuid.UUID, sandboxID string, result int, finishStart func(sandboxtypes.Sandbox, error)) (func(sandboxtypes.Sandbox, error), func(context.Context) (sandboxtypes.Sandbox, error), error) {
 	switch result {
 	case reserveResultReserved:
 		return finishStart, nil, nil
@@ -162,6 +162,7 @@ func (s *ReservationStorage) startReservationHeartbeat(ctx context.Context, team
 				}
 				if refreshed == 0 {
 					owner.CancelCause(errors.New("reservation lease is no longer owned by this request"))
+
 					return
 				}
 			}

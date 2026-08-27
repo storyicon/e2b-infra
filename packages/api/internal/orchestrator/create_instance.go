@@ -197,11 +197,11 @@ func (o *Orchestrator) CreateSandbox(
 
 	// Check if team has reached max instances
 	reservationCtx := ctx
-	cancelReservation := func(error) {}
 	var finishStart func(sandbox.Sandbox, error)
 	var waitForStart func(context.Context) (sandbox.Sandbox, error)
 	var err error
 	if usesStartIntents(o.capacityDemandMode) {
+		var cancelReservation context.CancelCauseFunc
 		reservationCtx, cancelReservation = context.WithCancelCause(ctx)
 		defer cancelReservation(nil)
 		finishStart, waitForStart, err = o.sandboxStore.ReserveOwned(

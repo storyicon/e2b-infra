@@ -175,7 +175,7 @@ func (s *Store) ReserveOwned(ctx context.Context, teamID uuid.UUID, sandboxID st
 	})
 }
 
-func (s *Store) reserve(ctx context.Context, teamID uuid.UUID, sandboxID string, reserve func() (func(Sandbox, error), func(context.Context) (Sandbox, error), error)) (finishStart func(Sandbox, error), waitForStart func(ctx context.Context) (Sandbox, error), err error) {
+func (s *Store) reserve(_ context.Context, teamID uuid.UUID, sandboxID string, reserve func() (func(Sandbox, error), func(context.Context) (Sandbox, error), error)) (finishStart func(Sandbox, error), waitForStart func(ctx context.Context) (Sandbox, error), err error) {
 	finishStart, waitForStart, err = reserve()
 	if err != nil {
 		if errors.Is(err, ErrAlreadyExists) {

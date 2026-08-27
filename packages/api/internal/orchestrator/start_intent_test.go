@@ -170,10 +170,12 @@ func (r *memoryReservation) Reserve(_ context.Context, _ uuid.UUID, sandboxID st
 	defer r.mu.Unlock()
 	r.legacyCalls++
 
-	return r.reserve(sandboxID)
+	finishStart, waitForStart := r.reserve(sandboxID)
+
+	return finishStart, waitForStart, nil
 }
 
-func (r *memoryReservation) reserve(sandboxID string) (func(sandbox.Sandbox, error), func(context.Context) (sandbox.Sandbox, error), error) {
+func (r *memoryReservation) reserve(sandboxID string) (func(sandbox.Sandbox, error), func(context.Context) (sandbox.Sandbox, error)) {
 	if entry, ok := r.entries[sandboxID]; ok {
 		return nil, func(ctx context.Context) (sandbox.Sandbox, error) {
 			select {
@@ -182,7 +184,7 @@ func (r *memoryReservation) reserve(sandboxID string) (func(sandbox.Sandbox, err
 			case <-entry.done:
 				return entry.sbx, entry.err
 			}
-		}, nil
+		}
 	}
 
 	entry := &memoryReservationEntry{done: make(chan struct{})}
@@ -196,15 +198,17 @@ func (r *memoryReservation) reserve(sandboxID string) (func(sandbox.Sandbox, err
 		})
 	}
 
-	return finish, nil, nil
+	return finish, nil
 }
 
-func (r *memoryReservation) ReserveOwned(ctx context.Context, teamID uuid.UUID, sandboxID string, limit int, _ sandbox.ReservationOwner) (func(sandbox.Sandbox, error), func(context.Context) (sandbox.Sandbox, error), error) {
+func (r *memoryReservation) ReserveOwned(_ context.Context, _ uuid.UUID, sandboxID string, _ int, _ sandbox.ReservationOwner) (func(sandbox.Sandbox, error), func(context.Context) (sandbox.Sandbox, error), error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.ownedCalls++
 
-	return r.reserve(sandboxID)
+	finishStart, waitForStart := r.reserve(sandboxID)
+
+	return finishStart, waitForStart, nil
 }
 
 func (r *memoryReservation) Release(_ context.Context, _ uuid.UUID, sandboxID string) error {
@@ -216,6 +220,8 @@ func (r *memoryReservation) Release(_ context.Context, _ uuid.UUID, sandboxID st
 }
 
 func newStartIntentTestOrchestrator(t *testing.T) *Orchestrator {
+	t.Helper()
+
 	o, _ := newStartIntentTestOrchestratorWithReservation(t)
 
 	return o
@@ -393,6 +399,8 @@ func TestCreateSandboxReservationOwnershipIsFeatureGated(t *testing.T) {
 		}, wantOwned: 1},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
 			o, reservations := newStartIntentTestOrchestratorWithReservation(t)
 			testCase.configure(o)
 			node := o.GetClusterNodes(uuid.Nil)[0]
@@ -434,8 +442,8 @@ func TestCreateSandboxRejectsIncompatibleBuildCPUBeforeIntentPersistence(t *test
 	configureStartIntentMode(o, store)
 	o.capacityPoolCPU.CPUModel = machineinfo.IceLakeModel
 
-	fetcher := func(context.Context) (SandboxMetadata, *api.APIError) {
-		metadata, fetchErr := successFetcher()(t.Context())
+	fetcher := func(ctx context.Context) (SandboxMetadata, *api.APIError) {
+		metadata, fetchErr := successFetcher()(ctx)
 		architecture := "x86_64"
 		family := "6"
 		model := machineinfo.EmeraldRapidsModel

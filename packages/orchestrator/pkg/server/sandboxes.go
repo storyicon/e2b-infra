@@ -196,8 +196,7 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 	}
 
 	maxRunningSandboxesPerNode := s.config.MaxSandboxesPerNode
-	reservedStart := false
-	admitted := false
+	var admitted, reservedStart bool
 	if maxRunningSandboxesPerNode > 0 {
 		admitted, reservedStart = reserveSandboxAdmission(&s.sandboxStartsInFlight, s.sandboxFactory.Sandboxes.Count, maxRunningSandboxesPerNode, 0)
 	} else {
