@@ -124,7 +124,7 @@ jobs:
     uses: ./.github/workflows/pr-tests.yml
     with:
       run-tests: ${{ contains(fromJSON(needs.detect-changes.outputs.changed-scopes), 'test-inputs') && needs.detect-changes.outputs.docs-only != 'true' }}
-      same_repository: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+      use_specialized_runners: ${{ github.repository == 'e2b-dev/infra' }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
   terraform-validation:
@@ -137,7 +137,7 @@ jobs:
     uses: ./.github/workflows/pr-tests-arm64.yml
     with:
       run-tests: ${{ contains(fromJSON(needs.detect-changes.outputs.changed-scopes), 'test-inputs') && needs.detect-changes.outputs.docs-only != 'true' }}
-      same_repository: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+      use_specialized_runners: ${{ github.repository == 'e2b-dev/infra' }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
   integration-tests:
@@ -148,7 +148,7 @@ jobs:
       publish: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
       # The integration suite requires the upstream repository's dedicated KVM
       # runner. Forks validate portable unit, lint, and cross-compile coverage.
-      run-tests: ${{ github.event.pull_request.head.repo.full_name == github.repository && contains(fromJSON(needs.detect-changes.outputs.changed-scopes), 'integration-inputs') && needs.detect-changes.outputs.docs-only != 'true' }}
+      run-tests: ${{ github.repository == 'e2b-dev/infra' && contains(fromJSON(needs.detect-changes.outputs.changed-scopes), 'integration-inputs') && needs.detect-changes.outputs.docs-only != 'true' }}
       # PRs shard the full-suite uncompressed config across parallel runners
       # for wall time (the compressed configs run their allow-list unsharded
       # either way); push to main runs all three configs unsharded.

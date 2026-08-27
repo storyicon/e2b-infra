@@ -13,9 +13,9 @@ on:
         description: "Whether to run unit tests"
         required: false
         default: true
-      same_repository:
+      use_specialized_runners:
         type: boolean
-        description: "Whether the pull request head belongs to this repository"
+        description: "Whether upstream-only specialized runners are available"
         required: true
     secrets:
       CODECOV_TOKEN: { required: false }
@@ -31,7 +31,7 @@ jobs:
     if: ${{ inputs.run-tests == true }}
     # Shards that only need Docker run on Blacksmith. The orchestrator shard
     # stays on infra-tests: it needs modprobe nbd and /dev/kvm (smoketest).
-    runs-on: ${{ inputs.same_repository && matrix.runner || 'ubuntu-24.04' }}
+    runs-on: ${{ inputs.use_specialized_runners && matrix.runner || 'ubuntu-24.04' }}
     env:
       GIN_MODE: test
       # Parallel `go test ./...` binaries derive the same Ryuk session id
@@ -91,11 +91,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Explain fork orchestrator test coverage
-        if: ${{ !inputs.same_repository && matrix.package == 'packages/orchestrator' }}
+        if: ${{ !inputs.use_specialized_runners && matrix.package == 'packages/orchestrator' }}
         run: echo "orchestrator runtime tests require the upstream KVM runner; compilation still runs on forks"
 
       - name: Setup Go for fork orchestrator compilation
-        if: ${{ !inputs.same_repository && matrix.package == 'packages/orchestrator' }}
+        if: ${{ !inputs.use_specialized_runners && matrix.package == 'packages/orchestrator' }}
         uses: ./.github/actions/go-setup-cache
         with:
           cache-dependency-paths: |
@@ -104,12 +104,12 @@ jobs:
             packages/orchestrator/go.sum
 
       - name: Compile fork orchestrator tests
-        if: ${{ !inputs.same_repository && matrix.package == 'packages/orchestrator' }}
+        if: ${{ !inputs.use_specialized_runners && matrix.package == 'packages/orchestrator' }}
         working-directory: packages/orchestrator
         run: go test -run '^$' ./...
 
       - name: Run unit tests
-        if: ${{ inputs.same_repository || matrix.package != 'packages/orchestrator' }}
+        if: ${{ inputs.use_specialized_runners || matrix.package != 'packages/orchestrator' }}
         uses: ./.github/actions/unit-tests
         with:
           package: ${{ matrix.package }}
