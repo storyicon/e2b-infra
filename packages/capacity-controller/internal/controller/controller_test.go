@@ -52,45 +52,77 @@ func (f *fakeNodeCounter) ReadyCount(context.Context, string) (int32, error) {
 }
 
 type fakeScaleTarget struct {
-	desired int32
-	err     error
-	sets    []int32
+	desired  int32
+	readErr  error
+	setErr   error
+	metadata ScaleWriteMetadata
+	attempts []int32
+	sets     []int32
 }
 
 func (f *fakeScaleTarget) DesiredCapacity(context.Context, string) (int32, error) {
-	return f.desired, f.err
+	return f.desired, f.readErr
 }
 
-func (f *fakeScaleTarget) SetDesiredCapacity(_ context.Context, _ string, desired int32) error {
+func (f *fakeScaleTarget) SetDesiredCapacity(_ context.Context, _ string, desired int32) (ScaleWriteMetadata, error) {
+	f.attempts = append(f.attempts, desired)
+	if f.setErr != nil {
+		return ScaleWriteMetadata{}, f.setErr
+	}
 	f.sets = append(f.sets, desired)
 	f.desired = desired
 
-	return nil
+	return f.metadata, nil
+}
+
+type fakeAuditSink struct {
+	events []ScaleAuditEvent
+}
+
+func (f *fakeAuditSink) Record(event ScaleAuditEvent) {
+	f.events = append(f.events, event)
 }
 
 func newTestReconciler(demand *fakeDemandReader, nodes *fakeNodeCounter, target *fakeScaleTarget) *Reconciler {
 	return New(&Config{
-		Mode:             ModeLegacyFailureLedger,
-		ClusterID:        "cluster-1",
-		NodePool:         "orchestrator",
-		ASGName:          "workers",
-		SlotsPerNode:     20,
-		MinNodes:         1,
-		MaxNodes:         30,
-		ReconcileTimeout: time.Second,
+		Mode:              ModeLegacyFailureLedger,
+		ClusterID:         "cluster-1",
+		NodePool:          "orchestrator",
+		ASGName:           "workers",
+		SlotsPerNode:      20,
+		MinNodes:          1,
+		MaxNodes:          30,
+		BatchIdleDuration: time.Second,
+		BatchMaxDuration:  10 * time.Second,
+		ReconcileTimeout:  time.Second,
 	}, demand, nil, nodes, target)
+}
+
+func reconcileStableStartIntent(t *testing.T, r *Reconciler, now time.Time) Result {
+	t.Helper()
+
+	initial, err := r.Reconcile(t.Context(), now)
+	require.NoError(t, err)
+	require.True(t, initial.Aggregating)
+
+	result, err := r.Reconcile(t.Context(), now.Add(time.Second))
+	require.NoError(t, err)
+
+	return result
 }
 
 func newStartIntentTestReconciler(snapshot *fakeCapacitySnapshotReader, nodes *fakeNodeCounter, target *fakeScaleTarget) *Reconciler {
 	return New(&Config{
-		Mode:             ModeStartIntentV1,
-		ClusterID:        "cluster-1",
-		NodePool:         "orchestrator",
-		ASGName:          "workers",
-		SlotsPerNode:     20,
-		MinNodes:         1,
-		MaxNodes:         30,
-		ReconcileTimeout: time.Second,
+		Mode:              ModeStartIntentV1,
+		ClusterID:         "cluster-1",
+		NodePool:          "orchestrator",
+		ASGName:           "workers",
+		SlotsPerNode:      20,
+		MinNodes:          1,
+		MaxNodes:          30,
+		BatchIdleDuration: time.Second,
+		BatchMaxDuration:  10 * time.Second,
+		ReconcileTimeout:  time.Second,
 	}, nil, snapshot, nodes, target)
 }
 
@@ -102,15 +134,268 @@ func TestReconcileStartIntentSizesFiveHundredWorkloadsToTwentyFiveNodes(t *testi
 	target := &fakeScaleTarget{desired: 1}
 	r := newStartIntentTestReconciler(snapshot, nodes, target)
 
-	result, err := r.Reconcile(t.Context(), time.Unix(100, 0))
-
-	require.NoError(t, err)
+	result := reconcileStableStartIntent(t, r, time.Unix(100, 0))
 	require.Equal(t, ModeStartIntentV1, result.Mode)
 	require.Equal(t, int64(500), result.WorkloadCount)
 	require.Equal(t, int32(1), result.ReadyNodes)
 	require.Equal(t, int32(25), result.TargetNodes)
 	require.False(t, result.Capped)
 	require.Equal(t, []int32{25}, target.sets)
+}
+
+func TestReconcileStartIntentScalesAtIdleBoundary(t *testing.T) {
+	t.Parallel()
+
+	snapshot := &fakeCapacitySnapshotReader{snapshot: CapacitySnapshot{WorkloadCount: 100}}
+	target := &fakeScaleTarget{desired: 1}
+	r := newStartIntentTestReconciler(snapshot, &fakeNodeCounter{ready: 1}, target)
+	t0 := time.Unix(100, 0)
+
+	first, err := r.Reconcile(t.Context(), t0)
+	require.NoError(t, err)
+	require.True(t, first.Aggregating)
+	require.Empty(t, target.sets)
+
+	snapshot.snapshot.WorkloadCount = 500
+	second, err := r.Reconcile(t.Context(), t0.Add(500*time.Millisecond))
+	require.NoError(t, err)
+	require.True(t, second.Aggregating)
+	require.Empty(t, target.sets)
+
+	third, err := r.Reconcile(t.Context(), t0.Add(1500*time.Millisecond))
+	require.NoError(t, err)
+	require.False(t, third.Aggregating)
+	require.Equal(t, int32(25), third.TargetNodes)
+	require.Equal(t, []int32{25}, target.sets)
+}
+
+func TestReconcileStartIntentScalesAtMaxBoundaryDuringContinuousGrowth(t *testing.T) {
+	t.Parallel()
+
+	snapshot := &fakeCapacitySnapshotReader{snapshot: CapacitySnapshot{WorkloadCount: 40}}
+	target := &fakeScaleTarget{desired: 1}
+	r := newStartIntentTestReconciler(snapshot, &fakeNodeCounter{ready: 1}, target)
+	t0 := time.Unix(100, 0)
+
+	for step := 0; step < 10; step++ {
+		snapshot.snapshot.WorkloadCount = int64(40 + step*20)
+		result, err := r.Reconcile(t.Context(), t0.Add(time.Duration(step)*time.Second))
+		require.NoError(t, err)
+		require.True(t, result.Aggregating)
+	}
+
+	snapshot.snapshot.WorkloadCount = 500
+	result, err := r.Reconcile(t.Context(), t0.Add(10*time.Second))
+	require.NoError(t, err)
+	require.False(t, result.Aggregating)
+	require.Equal(t, "max", result.BatchTrigger)
+	require.Equal(t, []int32{25}, target.sets)
+}
+
+func TestReconcileStartIntentPreservesMaxBoundaryWhenDesiredChangesButDemandIsUnmet(t *testing.T) {
+	t.Parallel()
+
+	snapshot := &fakeCapacitySnapshotReader{snapshot: CapacitySnapshot{WorkloadCount: 40}}
+	target := &fakeScaleTarget{desired: 1}
+	r := newStartIntentTestReconciler(snapshot, &fakeNodeCounter{ready: 1}, target)
+	t0 := time.Unix(100, 0)
+
+	for step := 0; step < 10; step++ {
+		snapshot.snapshot.WorkloadCount = int64(40 + step*20)
+		if step == 9 {
+			target.desired = 2
+		}
+		result, err := r.Reconcile(t.Context(), t0.Add(time.Duration(step)*time.Second))
+		require.NoError(t, err)
+		require.True(t, result.Aggregating)
+	}
+
+	snapshot.snapshot.WorkloadCount = 500
+	result, err := r.Reconcile(t.Context(), t0.Add(10*time.Second))
+	require.NoError(t, err)
+	require.Equal(t, "max", result.BatchTrigger)
+	require.Equal(t, []int32{25}, target.sets)
+}
+
+func TestReconcileStartIntentStartsNewBatchAfterSuccessfulWrite(t *testing.T) {
+	t.Parallel()
+
+	snapshot := &fakeCapacitySnapshotReader{snapshot: CapacitySnapshot{WorkloadCount: 100}}
+	target := &fakeScaleTarget{desired: 1}
+	r := newStartIntentTestReconciler(snapshot, &fakeNodeCounter{ready: 1}, target)
+	t0 := time.Unix(100, 0)
+
+	first := reconcileStableStartIntent(t, r, t0)
+	require.Equal(t, "idle", first.BatchTrigger)
+	require.Equal(t, []int32{5}, target.sets)
+
+	snapshot.snapshot.WorkloadCount = 500
+	newBatch, err := r.Reconcile(t.Context(), t0.Add(2*time.Second))
+	require.NoError(t, err)
+	require.True(t, newBatch.Aggregating)
+	require.Equal(t, []int32{5}, target.sets)
+
+	second, err := r.Reconcile(t.Context(), t0.Add(3*time.Second))
+	require.NoError(t, err)
+	require.Equal(t, "idle", second.BatchTrigger)
+	require.Equal(t, []int32{5, 25}, target.sets)
+}
+
+func TestReconcileStartIntentResetsBatchAfterASGWriteFailure(t *testing.T) {
+	t.Parallel()
+
+	snapshot := &fakeCapacitySnapshotReader{snapshot: CapacitySnapshot{WorkloadCount: 500}}
+	target := &fakeScaleTarget{desired: 1, setErr: errors.New("write failed")}
+	r := newStartIntentTestReconciler(snapshot, &fakeNodeCounter{ready: 1}, target)
+	t0 := time.Unix(100, 0)
+
+	_, err := r.Reconcile(t.Context(), t0)
+	require.NoError(t, err)
+	_, err = r.Reconcile(t.Context(), t0.Add(time.Second))
+	require.ErrorContains(t, err, "write failed")
+
+	target.setErr = nil
+	afterFailure, err := r.Reconcile(t.Context(), t0.Add(2*time.Second))
+	require.NoError(t, err)
+	require.True(t, afterFailure.Aggregating)
+	require.Len(t, target.attempts, 1)
+	require.Empty(t, target.sets)
+
+	_, err = r.Reconcile(t.Context(), t0.Add(3*time.Second))
+	require.NoError(t, err)
+	require.Equal(t, []int32{25, 25}, target.attempts)
+	require.Equal(t, []int32{25}, target.sets)
+}
+
+func TestReconcileStartIntentAuditsEveryScaleWriteAttempt(t *testing.T) {
+	t.Parallel()
+
+	snapshot := &fakeCapacitySnapshotReader{snapshot: CapacitySnapshot{WorkloadCount: 100}}
+	target := &fakeScaleTarget{desired: 1, metadata: ScaleWriteMetadata{RequestID: "request-1"}}
+	audit := &fakeAuditSink{}
+	r := New(&Config{
+		Mode:              ModeStartIntentV1,
+		ClusterID:         "cluster-1",
+		NodePool:          "orchestrator",
+		ASGName:           "workers",
+		SlotsPerNode:      20,
+		MinNodes:          1,
+		MaxNodes:          30,
+		BatchIdleDuration: time.Second,
+		BatchMaxDuration:  10 * time.Second,
+		ReconcileTimeout:  time.Second,
+	}, nil, snapshot, &fakeNodeCounter{ready: 1}, target, audit)
+	t0 := time.Unix(100, 0)
+
+	result := reconcileStableStartIntent(t, r, t0)
+	require.True(t, result.Scaled)
+	require.Len(t, audit.events, 3)
+	startedController, startedWrite, finishedWrite := audit.events[0], audit.events[1], audit.events[2]
+	require.Equal(t, AuditEventControllerStarted, startedController.Event)
+	require.NotEmpty(t, startedController.ControllerInstanceID)
+	require.Equal(t, AuditEventScaleWriteStarted, startedWrite.Event)
+	require.Equal(t, uint64(1), startedWrite.ScaleWriteSequence)
+	require.Equal(t, int64(100), startedWrite.WorkloadCount)
+	require.Equal(t, int32(1), startedWrite.CurrentDesired)
+	require.Equal(t, int32(5), startedWrite.Target)
+	require.Equal(t, "idle", startedWrite.BatchTrigger)
+	require.Equal(t, AuditEventScaleWriteFinished, finishedWrite.Event)
+	require.Equal(t, startedWrite.ControllerInstanceID, finishedWrite.ControllerInstanceID)
+	require.Equal(t, startedWrite.ScaleWriteSequence, finishedWrite.ScaleWriteSequence)
+	require.Equal(t, "success", finishedWrite.Outcome)
+	require.Equal(t, "request-1", finishedWrite.AWSRequestID)
+	require.Empty(t, finishedWrite.Error)
+}
+
+func TestReconcileStartIntentAuditsWriteFailureWithContinuousSequence(t *testing.T) {
+	t.Parallel()
+
+	snapshot := &fakeCapacitySnapshotReader{snapshot: CapacitySnapshot{WorkloadCount: 100}}
+	target := &fakeScaleTarget{desired: 1, setErr: errors.New("write failed")}
+	audit := &fakeAuditSink{}
+	r := New(&Config{
+		Mode: ModeStartIntentV1, ClusterID: "cluster-1", NodePool: "orchestrator", ASGName: "workers",
+		SlotsPerNode: 20, MinNodes: 1, MaxNodes: 30, BatchIdleDuration: time.Second,
+		BatchMaxDuration: 10 * time.Second, ReconcileTimeout: time.Second,
+	}, nil, snapshot, &fakeNodeCounter{ready: 1}, target, audit)
+	t0 := time.Unix(100, 0)
+
+	_, err := r.Reconcile(t.Context(), t0)
+	require.NoError(t, err)
+	_, err = r.Reconcile(t.Context(), t0.Add(time.Second))
+	require.ErrorContains(t, err, "write failed")
+	target.setErr = nil
+	_, err = r.Reconcile(t.Context(), t0.Add(2*time.Second))
+	require.NoError(t, err)
+	_, err = r.Reconcile(t.Context(), t0.Add(3*time.Second))
+	require.NoError(t, err)
+
+	require.Len(t, audit.events, 5)
+	require.Equal(t, []uint64{1, 1, 2, 2}, []uint64{
+		audit.events[1].ScaleWriteSequence,
+		audit.events[2].ScaleWriteSequence,
+		audit.events[3].ScaleWriteSequence,
+		audit.events[4].ScaleWriteSequence,
+	})
+	require.Equal(t, "error", audit.events[2].Outcome)
+	require.Equal(t, "write failed", audit.events[2].Error)
+	require.Equal(t, "success", audit.events[4].Outcome)
+}
+
+func TestNewReconcilerUsesNewAuditIdentityAfterRestart(t *testing.T) {
+	t.Parallel()
+
+	firstAudit := &fakeAuditSink{}
+	secondAudit := &fakeAuditSink{}
+	config := &Config{Mode: ModeStartIntentV1}
+	New(config, nil, nil, nil, nil, firstAudit)
+	New(config, nil, nil, nil, nil, secondAudit)
+
+	require.Len(t, firstAudit.events, 1)
+	require.Len(t, secondAudit.events, 1)
+	require.NotEqual(t, firstAudit.events[0].ControllerInstanceID, secondAudit.events[0].ControllerInstanceID)
+}
+
+func TestReconcileStartIntentResetsStabilizationAfterSnapshotFailure(t *testing.T) {
+	t.Parallel()
+
+	snapshot := &fakeCapacitySnapshotReader{snapshot: CapacitySnapshot{WorkloadCount: 500}}
+	target := &fakeScaleTarget{desired: 1}
+	r := newStartIntentTestReconciler(snapshot, &fakeNodeCounter{ready: 1}, target)
+	t0 := time.Unix(100, 0)
+
+	first, err := r.Reconcile(t.Context(), t0)
+	require.NoError(t, err)
+	require.True(t, first.Aggregating)
+
+	snapshot.err = errors.New("snapshot unavailable")
+	_, err = r.Reconcile(t.Context(), t0.Add(time.Second))
+	require.ErrorContains(t, err, "snapshot unavailable")
+	snapshot.err = nil
+
+	afterFailure, err := r.Reconcile(t.Context(), t0.Add(2*time.Second))
+	require.NoError(t, err)
+	require.True(t, afterFailure.Aggregating)
+	require.Empty(t, target.sets)
+
+	_, err = r.Reconcile(t.Context(), t0.Add(3*time.Second))
+	require.NoError(t, err)
+	require.Equal(t, []int32{25}, target.sets)
+}
+
+func TestReconcileStartIntentScalesWhenNomadDiagnosticIsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	snapshot := &fakeCapacitySnapshotReader{snapshot: CapacitySnapshot{WorkloadCount: 500}}
+	nodes := &fakeNodeCounter{err: errors.New("nomad unavailable")}
+	target := &fakeScaleTarget{desired: 1}
+	r := newStartIntentTestReconciler(snapshot, nodes, target)
+
+	result := reconcileStableStartIntent(t, r, time.Now())
+	require.Equal(t, []int32{25}, target.sets)
+	require.True(t, result.Scaled)
+	require.False(t, result.ReadyNodesObserved)
+	require.ErrorContains(t, result.ReadyNodesError, "nomad unavailable")
 }
 
 func TestReconcileStartIntentDoesNotRepeatCapacityAlreadyInASGDesired(t *testing.T) {
@@ -122,7 +407,6 @@ func TestReconcileStartIntentDoesNotRepeatCapacityAlreadyInASGDesired(t *testing
 	r := newStartIntentTestReconciler(snapshot, nodes, target)
 
 	result, err := r.Reconcile(t.Context(), time.Unix(100, 0))
-
 	require.NoError(t, err)
 	require.Equal(t, int32(25), result.TargetNodes)
 	require.False(t, result.Scaled)
@@ -137,9 +421,7 @@ func TestReconcileStartIntentClampsAtMaximumAndReportsCapped(t *testing.T) {
 	target := &fakeScaleTarget{desired: 1}
 	r := newStartIntentTestReconciler(snapshot, nodes, target)
 
-	result, err := r.Reconcile(t.Context(), time.Unix(100, 0))
-
-	require.NoError(t, err)
+	result := reconcileStableStartIntent(t, r, time.Unix(100, 0))
 	require.Equal(t, int32(30), result.TargetNodes)
 	require.True(t, result.Capped)
 	require.Equal(t, []int32{30}, target.sets)
@@ -152,9 +434,7 @@ func TestReconcileStartIntentClampsMaximumInt64WorkloadWithoutOverflow(t *testin
 	target := &fakeScaleTarget{desired: 1}
 	r := newStartIntentTestReconciler(snapshot, &fakeNodeCounter{ready: 1}, target)
 
-	result, err := r.Reconcile(t.Context(), time.Unix(100, 0))
-
-	require.NoError(t, err)
+	result := reconcileStableStartIntent(t, r, time.Unix(100, 0))
 	require.Equal(t, int32(30), result.TargetNodes)
 	require.True(t, result.Capped)
 	require.Equal(t, []int32{30}, target.sets)
@@ -168,14 +448,16 @@ func TestReconcileStartIntentFailsClosedWhenSnapshotReadFails(t *testing.T) {
 	nodes := &fakeNodeCounter{ready: 1}
 	target := &fakeScaleTarget{desired: 1}
 	r := New(&Config{
-		Mode:             ModeStartIntentV1,
-		ClusterID:        "cluster-1",
-		NodePool:         "orchestrator",
-		ASGName:          "workers",
-		SlotsPerNode:     20,
-		MinNodes:         1,
-		MaxNodes:         30,
-		ReconcileTimeout: time.Second,
+		Mode:              ModeStartIntentV1,
+		ClusterID:         "cluster-1",
+		NodePool:          "orchestrator",
+		ASGName:           "workers",
+		SlotsPerNode:      20,
+		MinNodes:          1,
+		MaxNodes:          30,
+		BatchIdleDuration: time.Second,
+		BatchMaxDuration:  10 * time.Second,
+		ReconcileTimeout:  time.Second,
 	}, legacy, snapshot, nodes, target)
 
 	result, err := r.Reconcile(t.Context(), time.Unix(100, 0))
@@ -192,14 +474,16 @@ func TestReconcileBoundsAllExternalCallsWithOneCycleDeadline(t *testing.T) {
 	snapshot := &fakeCapacitySnapshotReader{wait: true}
 	target := &fakeScaleTarget{desired: 1}
 	r := New(&Config{
-		Mode:             ModeStartIntentV1,
-		ClusterID:        "cluster-1",
-		NodePool:         "orchestrator",
-		ASGName:          "workers",
-		SlotsPerNode:     20,
-		MinNodes:         1,
-		MaxNodes:         30,
-		ReconcileTimeout: 20 * time.Millisecond,
+		Mode:              ModeStartIntentV1,
+		ClusterID:         "cluster-1",
+		NodePool:          "orchestrator",
+		ASGName:           "workers",
+		SlotsPerNode:      20,
+		MinNodes:          1,
+		MaxNodes:          30,
+		BatchIdleDuration: time.Second,
+		BatchMaxDuration:  10 * time.Second,
+		ReconcileTimeout:  20 * time.Millisecond,
 	}, nil, snapshot, &fakeNodeCounter{ready: 1}, target)
 	startedAt := time.Now()
 
@@ -224,7 +508,7 @@ func TestReconcileStartIntentRejectsInvalidWorkloadWithoutWritingASG(t *testing.
 	require.Empty(t, target.sets)
 }
 
-func TestReconcileStartIntentRecomputesSameTargetAfterRestart(t *testing.T) {
+func TestReconcileStartIntentRestartsStabilizationAfterRestart(t *testing.T) {
 	t.Parallel()
 
 	snapshot := &fakeCapacitySnapshotReader{snapshot: CapacitySnapshot{WorkloadCount: 500}}
@@ -233,12 +517,19 @@ func TestReconcileStartIntentRecomputesSameTargetAfterRestart(t *testing.T) {
 	firstTarget := &fakeScaleTarget{desired: 1}
 	first, err := newStartIntentTestReconciler(snapshot, nodes, firstTarget).Reconcile(t.Context(), time.Unix(100, 0))
 	require.NoError(t, err)
+	require.True(t, first.Aggregating)
+	require.Empty(t, firstTarget.sets)
 
 	secondTarget := &fakeScaleTarget{desired: 1}
-	second, err := newStartIntentTestReconciler(snapshot, nodes, secondTarget).Reconcile(t.Context(), time.Unix(101, 0))
-
+	secondReconciler := newStartIntentTestReconciler(snapshot, nodes, secondTarget)
+	second, err := secondReconciler.Reconcile(t.Context(), time.Unix(101, 0))
 	require.NoError(t, err)
-	require.Equal(t, first.TargetNodes, second.TargetNodes)
+	require.True(t, second.Aggregating)
+	require.Empty(t, secondTarget.sets)
+
+	second, err = secondReconciler.Reconcile(t.Context(), time.Unix(102, 0))
+	require.NoError(t, err)
+	require.False(t, second.Aggregating)
 	require.Equal(t, []int32{25}, secondTarget.sets)
 }
 
@@ -445,7 +736,7 @@ func TestReconcileDoesNotMutateASGWhenAnObservationFails(t *testing.T) {
 	}{
 		{name: "demand", demand: &fakeDemandReader{err: errors.New("redis unavailable")}, nodes: &fakeNodeCounter{}, target: &fakeScaleTarget{desired: 1}},
 		{name: "nomad", demand: &fakeDemandReader{}, nodes: &fakeNodeCounter{err: errors.New("nomad unavailable")}, target: &fakeScaleTarget{desired: 1}},
-		{name: "asg", demand: &fakeDemandReader{}, nodes: &fakeNodeCounter{}, target: &fakeScaleTarget{err: errors.New("aws unavailable")}},
+		{name: "asg", demand: &fakeDemandReader{}, nodes: &fakeNodeCounter{}, target: &fakeScaleTarget{readErr: errors.New("aws unavailable")}},
 	}
 
 	for _, tt := range tests {
@@ -470,24 +761,17 @@ func TestReconcileRetriesScaleOutAfterASGWriteFails(t *testing.T) {
 	target := &fakeScaleTarget{desired: 1}
 	r := newTestReconciler(demand, nodes, target)
 	targetSetError := errors.New("write denied")
-	targetWithFailure := &failingScaleTarget{fakeScaleTarget: target, setErr: targetSetError}
-	r.target = targetWithFailure
+	target.setErr = targetSetError
 
 	_, err := r.Reconcile(t.Context(), time.Unix(100, 0))
 	require.ErrorIs(t, err, targetSetError)
-	targetWithFailure.setErr = nil
+	target.setErr = nil
 
 	result, err := r.Reconcile(t.Context(), time.Unix(101, 0))
 
 	require.NoError(t, err)
 	require.True(t, result.Scaled)
 	require.Equal(t, []int32{5}, target.sets)
-}
-
-type failingScaleTarget struct {
-	*fakeScaleTarget
-
-	setErr error
 }
 
 func TestParseModeRejectsUnknownValues(t *testing.T) {
@@ -503,12 +787,4 @@ func TestParseModeRejectsUnknownValues(t *testing.T) {
 	_, err := ParseMode("automatic")
 
 	require.Error(t, err)
-}
-
-func (f *failingScaleTarget) SetDesiredCapacity(ctx context.Context, asgName string, desired int32) error {
-	if f.setErr != nil {
-		return f.setErr
-	}
-
-	return f.fakeScaleTarget.SetDesiredCapacity(ctx, asgName, desired)
 }

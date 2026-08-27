@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -28,6 +29,7 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/machineinfo"
 	e2bcatalog "github.com/e2b-dev/infra/packages/shared/pkg/sandbox-catalog"
 	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
@@ -72,6 +74,7 @@ type Orchestrator struct {
 	capacityRetryInterval         time.Duration
 	capacityPoolVCPU              int64
 	capacityPoolMemoryMiB         int64
+	capacityPoolCPU               machineinfo.MachineInfo
 	startIntentStore              startIntentStore
 	startIntentLeaseTTL           time.Duration
 	startIntentHeartbeatInterval  time.Duration
@@ -110,6 +113,12 @@ type Orchestrator struct {
 	// same string, and nesting Do calls for the same key on the same Group would
 	// block forever.
 	discoveryGroup singleflight.Group
+
+	// capacityRefreshes bounds on-demand discovery to one completed or active
+	// refresh per cluster and retry interval. singleflight alone only merges
+	// callers whose requests overlap in time.
+	capacityRefreshMu sync.Mutex
+	capacityRefreshes map[string]time.Time
 }
 
 func New(
@@ -187,11 +196,16 @@ func New(
 			config.SandboxCapacityWaitTimeout,
 			config.SandboxCapacityRetryInterval,
 		),
-		capacityDemandMode:           config.SandboxCapacityDemandMode,
-		capacityWaitTimeout:          config.SandboxCapacityWaitTimeout,
-		capacityRetryInterval:        config.SandboxCapacityRetryInterval,
-		capacityPoolVCPU:             config.SandboxCapacityPoolVCPU,
-		capacityPoolMemoryMiB:        config.SandboxCapacityPoolMemoryMiB,
+		capacityDemandMode:    config.SandboxCapacityDemandMode,
+		capacityWaitTimeout:   config.SandboxCapacityWaitTimeout,
+		capacityRetryInterval: config.SandboxCapacityRetryInterval,
+		capacityPoolVCPU:      config.SandboxCapacityPoolVCPU,
+		capacityPoolMemoryMiB: config.SandboxCapacityPoolMemoryMiB,
+		capacityPoolCPU: machineinfo.MachineInfo{
+			CPUArchitecture: config.SandboxCapacityPoolCPUArch,
+			CPUFamily:       config.SandboxCapacityPoolCPUFamily,
+			CPUModel:        config.SandboxCapacityPoolCPUModel,
+		},
 		startIntentStore:             startintent.NewRedisStore(redisClient),
 		startIntentLeaseTTL:          defaultStartIntentLeaseTTL,
 		startIntentHeartbeatInterval: defaultStartIntentHeartbeatInterval,

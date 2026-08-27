@@ -115,6 +115,9 @@ type Config struct {
 	SandboxCapacityDemandMode    SandboxCapacityDemandMode `env:"SANDBOX_CAPACITY_DEMAND_MODE"     envDefault:"legacy-failure-ledger"`
 	SandboxCapacityPoolVCPU      int64                     `env:"SANDBOX_CAPACITY_POOL_VCPU"`
 	SandboxCapacityPoolMemoryMiB int64                     `env:"SANDBOX_CAPACITY_POOL_MEMORY_MIB"`
+	SandboxCapacityPoolCPUArch   string                    `env:"SANDBOX_CAPACITY_POOL_CPU_ARCHITECTURE"`
+	SandboxCapacityPoolCPUFamily string                    `env:"SANDBOX_CAPACITY_POOL_CPU_FAMILY"`
+	SandboxCapacityPoolCPUModel  string                    `env:"SANDBOX_CAPACITY_POOL_CPU_MODEL"`
 	CapacitySnapshotServiceToken string                    `env:"CAPACITY_SNAPSHOT_SERVICE_TOKEN"`
 
 	APIInternalGrpcPort uint16 `env:"API_INTERNAL_GRPC_PORT" envDefault:"5009"`
@@ -317,11 +320,23 @@ func Parse() (Config, error) {
 		return config, errors.New("CAPACITY_SNAPSHOT_SERVICE_TOKEN is required for start-intent capacity demand modes")
 	}
 	if config.SandboxCapacityDemandMode != SandboxCapacityDemandModeLegacy {
+		if config.SandboxCapacityWaitTimeout <= 0 {
+			return config, errors.New("SANDBOX_CAPACITY_WAIT_TIMEOUT must be positive for start-intent capacity demand modes")
+		}
 		if config.SandboxCapacityPoolVCPU <= 0 {
 			return config, errors.New("SANDBOX_CAPACITY_POOL_VCPU must be positive for start-intent capacity demand modes")
 		}
 		if config.SandboxCapacityPoolMemoryMiB <= 0 {
 			return config, errors.New("SANDBOX_CAPACITY_POOL_MEMORY_MIB must be positive for start-intent capacity demand modes")
+		}
+		if strings.TrimSpace(config.SandboxCapacityPoolCPUArch) == "" {
+			return config, errors.New("SANDBOX_CAPACITY_POOL_CPU_ARCHITECTURE is required for start-intent capacity demand modes")
+		}
+		if strings.TrimSpace(config.SandboxCapacityPoolCPUFamily) == "" {
+			return config, errors.New("SANDBOX_CAPACITY_POOL_CPU_FAMILY is required for start-intent capacity demand modes")
+		}
+		if strings.TrimSpace(config.SandboxCapacityPoolCPUModel) == "" {
+			return config, errors.New("SANDBOX_CAPACITY_POOL_CPU_MODEL is required for start-intent capacity demand modes")
 		}
 	}
 

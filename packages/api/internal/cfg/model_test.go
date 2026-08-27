@@ -113,8 +113,12 @@ func TestParse(t *testing.T) {
 	t.Run("start intent mode and snapshot service token are parsed explicitly", func(t *testing.T) {
 		t.Setenv("SANDBOX_CAPACITY_DEMAND_MODE", string(SandboxCapacityDemandModeStartIntentV1))
 		t.Setenv("CAPACITY_SNAPSHOT_SERVICE_TOKEN", "capacity-service-token")
+		t.Setenv("SANDBOX_CAPACITY_WAIT_TIMEOUT", "2m")
 		t.Setenv("SANDBOX_CAPACITY_POOL_VCPU", "2")
 		t.Setenv("SANDBOX_CAPACITY_POOL_MEMORY_MIB", "1024")
+		t.Setenv("SANDBOX_CAPACITY_POOL_CPU_ARCHITECTURE", "x86_64")
+		t.Setenv("SANDBOX_CAPACITY_POOL_CPU_FAMILY", "6")
+		t.Setenv("SANDBOX_CAPACITY_POOL_CPU_MODEL", "207")
 
 		result, err := Parse()
 		require.NoError(t, err)
@@ -122,6 +126,51 @@ func TestParse(t *testing.T) {
 		assert.Equal(t, "capacity-service-token", result.CapacitySnapshotServiceToken)
 		assert.Equal(t, int64(2), result.SandboxCapacityPoolVCPU)
 		assert.Equal(t, int64(1024), result.SandboxCapacityPoolMemoryMiB)
+		assert.Equal(t, "x86_64", result.SandboxCapacityPoolCPUArch)
+		assert.Equal(t, "6", result.SandboxCapacityPoolCPUFamily)
+		assert.Equal(t, "207", result.SandboxCapacityPoolCPUModel)
+	})
+
+	t.Run("start intent modes require capacity waiting", func(t *testing.T) {
+		t.Setenv("SANDBOX_CAPACITY_DEMAND_MODE", string(SandboxCapacityDemandModeStartIntentV1))
+		t.Setenv("CAPACITY_SNAPSHOT_SERVICE_TOKEN", "capacity-service-token")
+		t.Setenv("SANDBOX_CAPACITY_POOL_VCPU", "2")
+		t.Setenv("SANDBOX_CAPACITY_POOL_MEMORY_MIB", "1024")
+		t.Setenv("SANDBOX_CAPACITY_POOL_CPU_ARCHITECTURE", "x86_64")
+		t.Setenv("SANDBOX_CAPACITY_POOL_CPU_FAMILY", "6")
+		t.Setenv("SANDBOX_CAPACITY_POOL_CPU_MODEL", "207")
+		removeEnv(t, "SANDBOX_CAPACITY_WAIT_TIMEOUT")
+
+		_, err := Parse()
+		assert.ErrorContains(t, err, "SANDBOX_CAPACITY_WAIT_TIMEOUT")
+	})
+
+	t.Run("start intent modes require complete pool CPU identity", func(t *testing.T) {
+		for _, tt := range []struct {
+			name      string
+			arch      string
+			family    string
+			model     string
+			wantError string
+		}{
+			{name: "missing architecture", family: "6", model: "207", wantError: "SANDBOX_CAPACITY_POOL_CPU_ARCHITECTURE"},
+			{name: "missing family", arch: "x86_64", model: "207", wantError: "SANDBOX_CAPACITY_POOL_CPU_FAMILY"},
+			{name: "missing model", arch: "x86_64", family: "6", wantError: "SANDBOX_CAPACITY_POOL_CPU_MODEL"},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Setenv("SANDBOX_CAPACITY_DEMAND_MODE", string(SandboxCapacityDemandModeStartIntentV1))
+				t.Setenv("CAPACITY_SNAPSHOT_SERVICE_TOKEN", "capacity-service-token")
+				t.Setenv("SANDBOX_CAPACITY_POOL_VCPU", "2")
+				t.Setenv("SANDBOX_CAPACITY_POOL_MEMORY_MIB", "1024")
+				t.Setenv("SANDBOX_CAPACITY_WAIT_TIMEOUT", "2m")
+				t.Setenv("SANDBOX_CAPACITY_POOL_CPU_ARCHITECTURE", tt.arch)
+				t.Setenv("SANDBOX_CAPACITY_POOL_CPU_FAMILY", tt.family)
+				t.Setenv("SANDBOX_CAPACITY_POOL_CPU_MODEL", tt.model)
+
+				_, err := Parse()
+				assert.ErrorContains(t, err, tt.wantError)
+			})
+		}
 	})
 
 	t.Run("start intent modes require positive pool resources", func(t *testing.T) {
@@ -142,6 +191,7 @@ func TestParse(t *testing.T) {
 					t.Setenv("CAPACITY_SNAPSHOT_SERVICE_TOKEN", "capacity-service-token")
 					t.Setenv("SANDBOX_CAPACITY_POOL_VCPU", tt.vcpu)
 					t.Setenv("SANDBOX_CAPACITY_POOL_MEMORY_MIB", tt.memoryMiB)
+					t.Setenv("SANDBOX_CAPACITY_WAIT_TIMEOUT", "2m")
 
 					_, err := Parse()
 

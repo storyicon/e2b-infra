@@ -27,6 +27,8 @@ type Config struct {
 	MinNodes                     int32
 	MaxNodes                     int32
 	ReconcileInterval            time.Duration
+	BatchIdleDuration            time.Duration
+	BatchMaxDuration             time.Duration
 	ReconcileTimeout             time.Duration
 }
 
@@ -60,6 +62,18 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	var batchIdleDuration time.Duration
+	var batchMaxDuration time.Duration
+	if mode == controller.ModeStartIntentV1 {
+		batchIdleDuration, err = durationEnv("START_INTENT_BATCH_IDLE_DURATION", time.Second)
+		if err != nil {
+			return nil, err
+		}
+		batchMaxDuration, err = durationEnv("START_INTENT_BATCH_MAX_DURATION", 10*time.Second)
+		if err != nil {
+			return nil, err
+		}
+	}
 	reconcileTimeout, err := durationEnv("RECONCILE_TIMEOUT", 10*time.Second)
 	if err != nil {
 		return nil, err
@@ -82,6 +96,8 @@ func Load() (*Config, error) {
 		MinNodes:                     int32(minNodes),
 		MaxNodes:                     int32(maxNodes),
 		ReconcileInterval:            interval,
+		BatchIdleDuration:            batchIdleDuration,
+		BatchMaxDuration:             batchMaxDuration,
 		ReconcileTimeout:             reconcileTimeout,
 	}
 
@@ -130,6 +146,17 @@ func (c *Config) validate() error {
 	}
 	if c.ReconcileInterval <= 0 {
 		return errors.New("RECONCILE_INTERVAL must be positive")
+	}
+	if c.Mode == controller.ModeStartIntentV1 {
+		if c.BatchIdleDuration <= 0 {
+			return errors.New("START_INTENT_BATCH_IDLE_DURATION must be positive in start-intent-v1 mode")
+		}
+		if c.BatchMaxDuration <= 0 {
+			return errors.New("START_INTENT_BATCH_MAX_DURATION must be positive in start-intent-v1 mode")
+		}
+		if c.BatchIdleDuration > c.BatchMaxDuration {
+			return errors.New("START_INTENT_BATCH_IDLE_DURATION must not exceed START_INTENT_BATCH_MAX_DURATION")
+		}
 	}
 	if c.ReconcileTimeout <= 0 {
 		return errors.New("RECONCILE_TIMEOUT must be positive")

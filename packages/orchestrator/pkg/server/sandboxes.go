@@ -195,16 +195,26 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		}
 	}
 
-	maxRunningSandboxesPerNode := resolveNodeLimit(
-		s.config.MaxSandboxesPerNode,
-		s.featureFlags.IntFlag(ctx, featureflags.MaxSandboxesPerNode),
-	)
-	if !reserveSandboxStart(&s.sandboxStartsInFlight, s.sandboxFactory.Sandboxes.Count, maxRunningSandboxesPerNode) {
+	maxRunningSandboxesPerNode := s.config.MaxSandboxesPerNode
+	reservedStart := false
+	admitted := false
+	if maxRunningSandboxesPerNode > 0 {
+		admitted, reservedStart = reserveSandboxAdmission(&s.sandboxStartsInFlight, s.sandboxFactory.Sandboxes.Count, maxRunningSandboxesPerNode, 0)
+	} else {
+		// Preserve the legacy feature-flag path when the static autoscaling
+		// limit is disabled: it checks running sandboxes only and lets the
+		// independent starting semaphore govern concurrent starts.
+		maxRunningSandboxesPerNode = s.featureFlags.IntFlag(ctx, featureflags.MaxSandboxesPerNode)
+		admitted, reservedStart = reserveSandboxAdmission(&s.sandboxStartsInFlight, s.sandboxFactory.Sandboxes.Count, 0, maxRunningSandboxesPerNode)
+	}
+	if !admitted {
 		telemetry.ReportEvent(ctx, "max number of running sandboxes reached")
 
 		return nil, status.Errorf(codes.ResourceExhausted, "max number of running sandboxes on node reached (%d), please retry", maxRunningSandboxesPerNode)
 	}
-	defer s.sandboxStartsInFlight.Add(-1)
+	if reservedStart {
+		defer s.sandboxStartsInFlight.Add(-1)
+	}
 
 	// Check if we've reached the max number of starting instances on this node
 	if req.GetSandbox().GetSnapshot() {
@@ -432,6 +442,14 @@ func reserveSandboxStart(inFlight *atomic.Int64, runningCount func() int, limit 
 			return true
 		}
 	}
+}
+
+func reserveSandboxAdmission(inFlight *atomic.Int64, runningCount func() int, staticLimit, legacyLimit int) (admitted, reservedStart bool) {
+	if staticLimit > 0 {
+		return reserveSandboxStart(inFlight, runningCount, staticLimit), true
+	}
+
+	return runningCount() < legacyLimit, false
 }
 
 func createVolumeMountModelsFromAPI(volumeMounts []*orchestrator.SandboxVolumeMount) ([]sandbox.VolumeMountConfig, error) {

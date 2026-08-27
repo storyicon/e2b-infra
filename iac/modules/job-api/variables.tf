@@ -55,3 +55,8 @@ variable "db_migrator_env_vars" {
   default   = {}
   sensitive = true
 }
+
+variable "kill_timeout" {
+  type    = string
+  default = "150s"
+}

@@ -47,6 +47,18 @@ func TestReserveSandboxStartIsAtomic(t *testing.T) {
 	assert.Equal(t, int64(limit), inFlight.Load())
 }
 
+func TestReserveSandboxAdmissionPreservesLegacyRunningOnlyCheck(t *testing.T) {
+	t.Parallel()
+
+	var inFlight atomic.Int64
+	for range 2 {
+		admitted, reserved := reserveSandboxAdmission(&inFlight, func() int { return 19 }, 0, 20)
+		require.True(t, admitted)
+		require.False(t, reserved)
+	}
+	require.Zero(t, inFlight.Load())
+}
+
 var (
 	startTime = time.Now()
 	endTime   = time.Now().Add(time.Hour)

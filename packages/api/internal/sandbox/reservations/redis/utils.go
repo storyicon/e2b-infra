@@ -8,6 +8,7 @@ import (
 const (
 	reservationsKey = "reservations"
 	pendingKey      = "pending"
+	ownersKey       = "owners"
 	resultKey       = "result"
 	notifySuffix    = "notify"
 )
@@ -27,6 +28,10 @@ func getReservationPrefix(teamID string) string {
 // e.g. sandbox:storage:{teamID}:reservations:pending
 func getPendingSetKey(teamID string) string {
 	return redis_utils.CreateKey(getReservationPrefix(teamID), pendingKey)
+}
+
+func getOwnersHashKey(teamID string) string {
+	return redis_utils.CreateKey(getReservationPrefix(teamID), ownersKey)
 }
 
 // getResultKey returns the key for a sandbox creation result.

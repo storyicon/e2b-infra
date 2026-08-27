@@ -76,8 +76,8 @@ func TestCapacitySnapshotUnionsRunningAndActiveIntentIDs(t *testing.T) {
 	o := &Orchestrator{
 		startIntentStore: intentStore,
 		runningSandboxReader: fakeRunningSandboxReader{items: []sandbox.Sandbox{
-			{SandboxID: "shared", ClusterID: clusterID, State: sandbox.StateRunning},
-			{SandboxID: "running-only", ClusterID: clusterID, State: sandbox.StateRunning},
+			{SandboxID: "shared", ClusterID: clusterID, State: sandbox.StateRunning, VCpu: 1, RamMB: 512},
+			{SandboxID: "running-only", ClusterID: clusterID, State: sandbox.StateRunning, VCpu: 1, RamMB: 512},
 			{SandboxID: "other-running", ClusterID: otherClusterID, State: sandbox.StateRunning},
 		}},
 	}
@@ -102,6 +102,42 @@ func TestCapacitySnapshotUnionsRunningAndActiveIntentIDs(t *testing.T) {
 	intentStore.mu.Lock()
 	defer intentStore.mu.Unlock()
 	require.Contains(t, intentStore.records, "intent-only")
+}
+
+func TestCapacitySnapshotRejectsRunningSandboxForDifferentPool(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		vcpu      int64
+		memoryMiB int64
+	}{
+		{name: "missing resources", vcpu: 0, memoryMiB: 0},
+		{name: "vCPU", vcpu: 2, memoryMiB: 512},
+		{name: "memory", vcpu: 1, memoryMiB: 1024},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			clusterID := uuid.New()
+			o := &Orchestrator{
+				startIntentStore: newFakeStartIntentStore(),
+				runningSandboxReader: fakeRunningSandboxReader{items: []sandbox.Sandbox{{
+					SandboxID: "incompatible-running",
+					ClusterID: clusterID,
+					State:     sandbox.StateRunning,
+					VCpu:      tt.vcpu,
+					RamMB:     tt.memoryMiB,
+				}}},
+			}
+			configureCapacitySnapshotPool(o)
+
+			_, err := o.CapacitySnapshot(t.Context(), clusterID.String())
+
+			require.ErrorContains(t, err, "incompatible running sandbox")
+		})
+	}
 }
 
 func TestCapacitySnapshotRejectsIntentForDifferentPool(t *testing.T) {
@@ -156,7 +192,7 @@ func TestCapacitySnapshotDoesNotWaitForObservedHandoffCleanup(t *testing.T) {
 	o := &Orchestrator{
 		startIntentStore: store,
 		runningSandboxReader: fakeRunningSandboxReader{items: []sandbox.Sandbox{
-			{SandboxID: "shared", ClusterID: clusterID, State: sandbox.StateRunning},
+			{SandboxID: "shared", ClusterID: clusterID, State: sandbox.StateRunning, VCpu: 1, RamMB: 512},
 		}},
 	}
 	configureCapacitySnapshotPool(o)

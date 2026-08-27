@@ -40,6 +40,32 @@ func mainRun() int {
 	return 0
 }
 
+type slogAuditSink struct{}
+
+func (slogAuditSink) Record(event controller.ScaleAuditEvent) {
+	checkpointGeneratedEpochMs := int64(0)
+	if !event.CheckpointGeneratedAt.IsZero() {
+		checkpointGeneratedEpochMs = event.CheckpointGeneratedAt.UnixMilli()
+	}
+	slog.Info(event.Event,
+		"controller_instance_id", event.ControllerInstanceID,
+		"scale_write_sequence", event.ScaleWriteSequence,
+		"mode", event.Mode,
+		"workload_count", event.WorkloadCount,
+		"current_desired", event.CurrentDesired,
+		"target", event.Target,
+		"batch_trigger", event.BatchTrigger,
+		"batch_age_ms", event.BatchAge.Milliseconds(),
+		"batch_idle_age_ms", event.BatchIdleAge.Milliseconds(),
+		"outcome", event.Outcome,
+		"duration_ms", event.Duration.Milliseconds(),
+		"aws_request_id", event.AWSRequestID,
+		"error", event.Error,
+		"audit_dropped_total", event.AuditDroppedTotal,
+		"checkpoint_generated_epoch_ms", checkpointGeneratedEpochMs,
+	)
+}
+
 func run(ctx context.Context) error {
 	cfg, err := appconfig.Load()
 	if err != nil {
@@ -98,22 +124,29 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	audit := controller.NewAsyncAuditSink(slogAuditSink{}, 128)
+	defer audit.Close()
 
 	reconciler := controller.New(&controller.Config{
-		Mode:             cfg.Mode,
-		ClusterID:        cfg.ClusterID,
-		NodePool:         cfg.NomadNodePool,
-		ASGName:          cfg.ASGName,
-		SlotsPerNode:     cfg.SlotsPerNode,
-		MinNodes:         cfg.MinNodes,
-		MaxNodes:         cfg.MaxNodes,
-		ReconcileTimeout: cfg.ReconcileTimeout,
-	}, demandReader, snapshotReader, adapters.NewNomad(nomadClient), adapters.NewASG(autoscaling.NewFromConfig(awsCfg)))
+		Mode:              cfg.Mode,
+		ClusterID:         cfg.ClusterID,
+		NodePool:          cfg.NomadNodePool,
+		ASGName:           cfg.ASGName,
+		SlotsPerNode:      cfg.SlotsPerNode,
+		MinNodes:          cfg.MinNodes,
+		MaxNodes:          cfg.MaxNodes,
+		BatchIdleDuration: cfg.BatchIdleDuration,
+		BatchMaxDuration:  cfg.BatchMaxDuration,
+		ReconcileTimeout:  cfg.ReconcileTimeout,
+	}, demandReader, snapshotReader, adapters.NewNomad(nomadClient), adapters.NewASG(autoscaling.NewFromConfig(awsCfg)), audit)
 
 	ticker := time.NewTicker(cfg.ReconcileInterval)
 	defer ticker.Stop()
 	for {
 		result, err := reconciler.Reconcile(ctx, time.Now().UTC())
+		if cfg.Mode == controller.ModeStartIntentV1 {
+			reconciler.RecordAuditCheckpoint(time.Now().UTC())
+		}
 		if err != nil {
 			slog.Error("capacity reconciliation failed",
 				"mode", result.Mode,
@@ -138,8 +171,18 @@ func run(ctx context.Context) error {
 				"target_nodes", result.TargetNodes,
 				"capped", result.Capped,
 				"scaled", result.Scaled,
+				"aggregating", result.Aggregating,
 				"outcome", "success",
 			)
+			if result.ReadyNodesError != nil {
+				slog.Warn("Nomad readiness diagnostic unavailable",
+					"mode", result.Mode,
+					"desired_nodes", result.DesiredNodes,
+					"target_nodes", result.TargetNodes,
+					"scaled", result.Scaled,
+					"error", result.ReadyNodesError,
+				)
+			}
 		}
 
 		select {

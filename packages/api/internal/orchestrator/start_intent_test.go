@@ -20,12 +20,59 @@ import (
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand/startintent"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
+	"github.com/e2b-dev/infra/packages/shared/pkg/machineinfo"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
 )
 
 type memorySandboxStorage struct {
 	mu    sync.Mutex
 	items map[string]sandbox.Sandbox
+}
+
+func TestValidateStartIntentPoolRejectsUnsupportedRequestBeforePersistence(t *testing.T) {
+	t.Parallel()
+
+	compatible := startintent.Intent{
+		VCPU:          2,
+		MemoryMiB:     4096,
+		Compatibility: startintent.SinglePoolCompatibility,
+	}
+	require.NoError(t, validateStartIntentPool(compatible, 2, 4096))
+
+	for _, incompatible := range []startintent.Intent{
+		{VCPU: 4, MemoryMiB: 4096, Compatibility: startintent.SinglePoolCompatibility},
+		{VCPU: 2, MemoryMiB: 8192, Compatibility: startintent.SinglePoolCompatibility},
+		{VCPU: 2, MemoryMiB: 4096, Compatibility: startintent.SinglePoolCompatibility + ":labels"},
+	} {
+		require.ErrorContains(t, validateStartIntentPool(incompatible, 2, 4096), "does not match autoscaled pool")
+	}
+}
+
+func TestStartIntentCompatibilityChecksBuildCPUAgainstPool(t *testing.T) {
+	t.Parallel()
+
+	pool := machineinfo.MachineInfo{CPUArchitecture: "x86_64", CPUFamily: "6", CPUModel: machineinfo.IceLakeModel}
+	compatible := placement.CPURequirement{Build: pool}
+	require.Equal(t, startintent.SinglePoolCompatibility, startIntentCompatibility(compatible, pool, false, nil))
+
+	incompatible := placement.CPURequirement{Build: machineinfo.MachineInfo{
+		CPUArchitecture: "x86_64",
+		CPUFamily:       "6",
+		CPUModel:        machineinfo.EmeraldRapidsModel,
+	}}
+	require.NotEqual(t, startintent.SinglePoolCompatibility, startIntentCompatibility(incompatible, pool, false, nil))
+}
+
+func TestBenchmarkRunHashFromMetadataIsScopedAndDoesNotLogRawIdentifier(t *testing.T) {
+	t.Parallel()
+
+	runHash, ok := benchmarkRunHashFromMetadata(map[string]string{"benchmarkRunId": "run-1"})
+	require.True(t, ok)
+	require.Equal(t, "4e65d3fbe8ad6535681b021b30785b12b6c0e3f8878859a4148b3f58b8835db0", runHash)
+	require.NotContains(t, runHash, "run-1")
+
+	_, ok = benchmarkRunHashFromMetadata(map[string]string{"benchmarkRunId": "invalid/run"})
+	require.False(t, ok)
 }
 
 func newMemorySandboxStorage() *memorySandboxStorage {
@@ -38,6 +85,10 @@ func (s *memorySandboxStorage) Add(_ context.Context, sbx sandbox.Sandbox) error
 	s.items[sbx.SandboxID] = sbx
 
 	return nil
+}
+
+func (s *memorySandboxStorage) AddCapacity(ctx context.Context, sbx sandbox.Sandbox) error {
+	return s.Add(ctx, sbx)
 }
 
 func (s *memorySandboxStorage) Get(_ context.Context, _ uuid.UUID, sandboxID string) (sandbox.Sandbox, error) {
@@ -98,8 +149,10 @@ func (s *memorySandboxStorage) Reconcile(context.Context, []sandbox.NodeSandbox,
 }
 
 type memoryReservation struct {
-	mu      sync.Mutex
-	entries map[string]*memoryReservationEntry
+	mu          sync.Mutex
+	entries     map[string]*memoryReservationEntry
+	legacyCalls int
+	ownedCalls  int
 }
 
 type memoryReservationEntry struct {
@@ -115,6 +168,12 @@ func newMemoryReservation() *memoryReservation {
 func (r *memoryReservation) Reserve(_ context.Context, _ uuid.UUID, sandboxID string, _ int) (func(sandbox.Sandbox, error), func(context.Context) (sandbox.Sandbox, error), error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.legacyCalls++
+
+	return r.reserve(sandboxID)
+}
+
+func (r *memoryReservation) reserve(sandboxID string) (func(sandbox.Sandbox, error), func(context.Context) (sandbox.Sandbox, error), error) {
 	if entry, ok := r.entries[sandboxID]; ok {
 		return nil, func(ctx context.Context) (sandbox.Sandbox, error) {
 			select {
@@ -140,6 +199,14 @@ func (r *memoryReservation) Reserve(_ context.Context, _ uuid.UUID, sandboxID st
 	return finish, nil, nil
 }
 
+func (r *memoryReservation) ReserveOwned(ctx context.Context, teamID uuid.UUID, sandboxID string, limit int, _ sandbox.ReservationOwner) (func(sandbox.Sandbox, error), func(context.Context) (sandbox.Sandbox, error), error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ownedCalls++
+
+	return r.reserve(sandboxID)
+}
+
 func (r *memoryReservation) Release(_ context.Context, _ uuid.UUID, sandboxID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -149,6 +216,12 @@ func (r *memoryReservation) Release(_ context.Context, _ uuid.UUID, sandboxID st
 }
 
 func newStartIntentTestOrchestrator(t *testing.T) *Orchestrator {
+	o, _ := newStartIntentTestOrchestratorWithReservation(t)
+
+	return o
+}
+
+func newStartIntentTestOrchestratorWithReservation(t *testing.T) (*Orchestrator, *memoryReservation) {
 	t.Helper()
 
 	ffClient, err := featureflags.NewClientWithDatasource(ldtestdata.DataSource())
@@ -157,7 +230,8 @@ func newStartIntentTestOrchestrator(t *testing.T) *Orchestrator {
 	counter, err := meter.Int64Counter("created")
 	require.NoError(t, err)
 
-	store := sandbox.NewStore(newMemorySandboxStorage(), newMemoryReservation(), sandbox.Callbacks{
+	reservations := newMemoryReservation()
+	store := sandbox.NewStore(newMemorySandboxStorage(), reservations, sandbox.Callbacks{
 		AddSandboxToRoutingTable: func(context.Context, sandbox.Sandbox) {},
 		AsyncNewlyCreatedSandbox: func(context.Context, sandbox.Sandbox, sandbox.CreationMetadata) {},
 	})
@@ -173,7 +247,7 @@ func newStartIntentTestOrchestrator(t *testing.T) *Orchestrator {
 	node.ClusterID = uuid.Nil
 	o.registerNode(node)
 
-	return o
+	return o, reservations
 }
 
 type fakeStartIntentStore struct {
@@ -291,10 +365,46 @@ func (s *fakeStartIntentStore) snapshotHistory() []string {
 
 func configureStartIntentMode(o *Orchestrator, store startIntentStore) {
 	o.capacityDemandMode = cfg.SandboxCapacityDemandModeStartIntentV1
+	o.capacityPoolVCPU = testBuild().Vcpu
+	o.capacityPoolMemoryMiB = testBuild().RamMb
+	o.capacityPoolCPU = machineinfo.MachineInfo{
+		CPUArchitecture: "x86_64",
+		CPUFamily:       "6",
+		CPUModel:        machineinfo.EmeraldRapidsModel,
+	}
 	o.startIntentStore = store
 	o.startIntentLeaseTTL = time.Minute
 	o.startIntentHeartbeatInterval = time.Hour
 	o.startIntentHandoffTTL = time.Minute
+}
+
+func TestCreateSandboxReservationOwnershipIsFeatureGated(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name       string
+		configure  func(*Orchestrator)
+		wantLegacy int
+		wantOwned  int
+	}{
+		{name: "legacy mode preserves legacy reservation protocol", configure: func(*Orchestrator) {}, wantLegacy: 1},
+		{name: "start intent mode uses owner fencing", configure: func(o *Orchestrator) {
+			configureStartIntentMode(o, newFakeStartIntentStore())
+		}, wantOwned: 1},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			o, reservations := newStartIntentTestOrchestratorWithReservation(t)
+			testCase.configure(o)
+			node := o.GetClusterNodes(uuid.Nil)[0]
+			node.SetSandboxClient(&nodemanager.MockSandboxClientCustom{})
+
+			now := time.Now()
+			_, apiErr := o.CreateSandbox(t.Context(), fixedSandboxID(t), uuid.NewString(), testTeam(), successFetcher(), now, now.Add(time.Hour), time.Hour, false, false, sandbox.CreationMetadata{})
+			require.Nil(t, apiErr)
+			require.Equal(t, testCase.wantLegacy, reservations.legacyCalls)
+			require.Equal(t, testCase.wantOwned, reservations.ownedCalls)
+		})
+	}
 }
 
 func TestCreateSandboxStartIntentOwnerLifecycleAndOrdering(t *testing.T) {
@@ -314,6 +424,34 @@ func TestCreateSandboxStartIntentOwnerLifecycleAndOrdering(t *testing.T) {
 	_, apiErr := o.CreateSandbox(t.Context(), fixedSandboxID(t), uuid.NewString(), testTeam(), successFetcher(), now, now.Add(time.Hour), time.Hour, false, false, sandbox.CreationMetadata{})
 	require.Nil(t, apiErr)
 	require.Equal(t, []string{"upsert", "placement", "handoff", "remove"}, store.snapshotHistory())
+}
+
+func TestCreateSandboxRejectsIncompatibleBuildCPUBeforeIntentPersistence(t *testing.T) {
+	t.Parallel()
+
+	store := newFakeStartIntentStore()
+	o := newStartIntentTestOrchestrator(t)
+	configureStartIntentMode(o, store)
+	o.capacityPoolCPU.CPUModel = machineinfo.IceLakeModel
+
+	fetcher := func(context.Context) (SandboxMetadata, *api.APIError) {
+		metadata, fetchErr := successFetcher()(t.Context())
+		architecture := "x86_64"
+		family := "6"
+		model := machineinfo.EmeraldRapidsModel
+		metadata.Build.CpuArchitecture = &architecture
+		metadata.Build.CpuFamily = &family
+		metadata.Build.CpuModel = &model
+
+		return metadata, fetchErr
+	}
+
+	now := time.Now()
+	_, apiErr := o.CreateSandbox(t.Context(), fixedSandboxID(t), uuid.NewString(), testTeam(), fetcher, now, now.Add(time.Hour), time.Hour, false, false, sandbox.CreationMetadata{})
+	require.NotNil(t, apiErr)
+	require.Equal(t, http.StatusUnprocessableEntity, apiErr.Code)
+	require.Equal(t, "sandbox_capacity_pool_incompatible", apiErr.ErrorCode)
+	require.Empty(t, store.snapshotHistory())
 }
 
 func TestCreateSandboxJoinedRequestDoesNotRegisterAnotherIntent(t *testing.T) {

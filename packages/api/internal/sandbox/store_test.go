@@ -119,6 +119,10 @@ func (n *NoOpReservationStorage) Reserve(_ context.Context, _ uuid.UUID, _ strin
 	return nil, nil, nil
 }
 
+func (n *NoOpReservationStorage) ReserveOwned(_ context.Context, _ uuid.UUID, _ string, _ int, _ ReservationOwner) (func(Sandbox, error), func(ctx context.Context) (Sandbox, error), error) {
+	return nil, nil, nil
+}
+
 func (n *NoOpReservationStorage) Release(_ context.Context, _ uuid.UUID, _ string) error {
 	return nil
 }
@@ -155,6 +159,10 @@ func (m *MockStorage) Add(ctx context.Context, sbx Sandbox) error {
 	}
 
 	return m.Storage.Add(ctx, sbx)
+}
+
+func (m *MockStorage) AddCapacity(ctx context.Context, sbx Sandbox) error {
+	return m.Add(ctx, sbx)
 }
 
 // createTestSandbox creates a test sandbox with default values

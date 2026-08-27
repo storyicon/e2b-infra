@@ -67,6 +67,16 @@ func (o *Orchestrator) CapacitySnapshot(ctx context.Context, clusterIDRaw string
 	runningIDs := make(map[string]struct{})
 	for _, sbx := range running {
 		if sbx.ClusterID == clusterID && sbx.State == sandbox.StateRunning {
+			if sbx.VCpu != o.capacityPoolVCPU || sbx.RamMB != o.capacityPoolMemoryMiB {
+				return CapacitySnapshot{}, fmt.Errorf(
+					"incompatible running sandbox %q: vCPU=%d memoryMiB=%d, supported vCPU=%d memoryMiB=%d",
+					sbx.SandboxID,
+					sbx.VCpu,
+					sbx.RamMB,
+					o.capacityPoolVCPU,
+					o.capacityPoolMemoryMiB,
+				)
+			}
 			runningIDs[sbx.SandboxID] = struct{}{}
 		}
 	}

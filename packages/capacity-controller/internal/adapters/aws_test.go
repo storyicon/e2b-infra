@@ -48,7 +48,8 @@ func TestASGReadsAndSetsDesiredCapacityWithoutCooldown(t *testing.T) {
 	desired, err := target.DesiredCapacity(t.Context(), "workers")
 	require.NoError(t, err)
 	require.Equal(t, int32(3), desired)
-	require.NoError(t, target.SetDesiredCapacity(t.Context(), "workers", 7))
+	_, err = target.SetDesiredCapacity(t.Context(), "workers", 7)
+	require.NoError(t, err)
 	require.Equal(t, int32(7), *client.setInput.DesiredCapacity)
 	require.False(t, *client.setInput.HonorCooldown)
 }

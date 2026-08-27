@@ -119,8 +119,11 @@ var (
 		return 1
 	`)
 	activeScript = redis.NewScript(`
-		local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1])
-		if #expired > 0 then
+		while true do
+			local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, 1000)
+			if #expired == 0 then
+				break
+			end
 			redis.call('HDEL', KEYS[1], unpack(expired))
 			redis.call('ZREM', KEYS[2], unpack(expired))
 		end

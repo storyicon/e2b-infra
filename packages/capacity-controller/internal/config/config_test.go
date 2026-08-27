@@ -28,7 +28,49 @@ func TestLoadUsesSafeDefaults(t *testing.T) { //nolint:paralleltest // environme
 	require.Equal(t, int32(1), cfg.MinNodes)
 	require.Equal(t, int32(30), cfg.MaxNodes)
 	require.Equal(t, time.Second, cfg.ReconcileInterval)
+	require.Equal(t, time.Duration(0), cfg.BatchIdleDuration)
+	require.Equal(t, time.Duration(0), cfg.BatchMaxDuration)
 	require.Equal(t, 10*time.Second, cfg.ReconcileTimeout)
+}
+
+func TestLoadValidatesStartIntentBatchDurations(t *testing.T) {
+	tests := []struct {
+		name      string
+		idle      string
+		max       string
+		wantError string
+	}{
+		{name: "non-positive idle", idle: "0s", max: "10s", wantError: "START_INTENT_BATCH_IDLE_DURATION"},
+		{name: "non-positive max", idle: "1s", max: "0s", wantError: "START_INTENT_BATCH_MAX_DURATION"},
+		{name: "idle exceeds max", idle: "11s", max: "10s", wantError: "must not exceed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("CAPACITY_DEMAND_MODE", "start-intent-v1")
+			t.Setenv("REDIS_URL", "")
+			t.Setenv("CAPACITY_SNAPSHOT_GRPC_ADDRESS", "api-internal-grpc.service.consul:5009")
+			t.Setenv("CAPACITY_SNAPSHOT_SERVICE_TOKEN", "service-token")
+			t.Setenv("START_INTENT_BATCH_IDLE_DURATION", tt.idle)
+			t.Setenv("START_INTENT_BATCH_MAX_DURATION", tt.max)
+
+			_, err := Load()
+			require.ErrorContains(t, err, tt.wantError)
+		})
+	}
+}
+
+func TestLoadIgnoresInvalidBatchDurationsInLegacyMode(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("START_INTENT_BATCH_IDLE_DURATION", "0s")
+	t.Setenv("START_INTENT_BATCH_MAX_DURATION", "0s")
+
+	cfg, err := Load()
+
+	require.NoError(t, err)
+	require.Equal(t, time.Duration(0), cfg.BatchIdleDuration)
+	require.Equal(t, time.Duration(0), cfg.BatchMaxDuration)
 }
 
 func TestLoadSupportsStartIntentModeWithoutRedis(t *testing.T) {
@@ -44,6 +86,8 @@ func TestLoadSupportsStartIntentModeWithoutRedis(t *testing.T) {
 	require.Equal(t, "start-intent-v1", string(cfg.Mode))
 	require.Equal(t, "api-internal-grpc.service.consul:5009", cfg.CapacitySnapshotGRPCAddress)
 	require.Equal(t, "service-token", cfg.CapacitySnapshotServiceToken)
+	require.Equal(t, time.Second, cfg.BatchIdleDuration)
+	require.Equal(t, 10*time.Second, cfg.BatchMaxDuration)
 }
 
 func TestLoadRejectsMissingOrUnknownCapacityDemandMode(t *testing.T) {

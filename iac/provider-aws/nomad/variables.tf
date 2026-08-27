@@ -166,6 +166,11 @@ variable "api_env_vars" {
   sensitive = true
 }
 
+variable "api_kill_timeout" {
+  type    = string
+  default = "150s"
+}
+
 variable "api_db_migrator_env_vars" {
   type      = map(string)
   default   = {}

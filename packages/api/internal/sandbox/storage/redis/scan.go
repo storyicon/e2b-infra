@@ -3,6 +3,7 @@ package redis
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -186,39 +187,80 @@ func (s *Storage) AllRunningItems(ctx context.Context) ([]sandboxtypes.Sandbox, 
 }
 
 // AllRunningItemsStrict returns a complete running-sandbox snapshot or an
-// error. Capacity decisions must not use the best-effort AllRunningItems view:
-// skipping one team or one corrupt record would silently undercount demand.
+// error. It unions the expiration and team indexes: either index can repair a
+// historical omission in the other, while an indexed corrupt record fails the
+// snapshot instead of silently undercounting capacity demand.
 func (s *Storage) AllRunningItemsStrict(ctx context.Context) ([]sandboxtypes.Sandbox, error) {
-	teams, err := s.redisClient.ZRange(ctx, globalTeamsSet, 0, -1).Result()
-	if err != nil {
-		return nil, fmt.Errorf("failed to list teams from global index: %w", err)
+	items := newRunningItems()
+	teamIDs := make(map[string]struct{})
+	var cursor uint64
+	for {
+		entries, next, err := s.redisClient.ZScan(ctx, globalExpirationSet, cursor, "", sandboxScanBatchSize).Result()
+		if err != nil {
+			return nil, fmt.Errorf("scan global expiration index: %w", err)
+		}
+		if len(entries)%2 != 0 {
+			return nil, errors.New("global expiration index returned an invalid member/score page")
+		}
+
+		byTeam := make(map[string][]expirationSandboxRef)
+		for index := 0; index < len(entries); index += 2 {
+			teamID, sandboxID, executionID, ok := parseExpirationMember(entries[index])
+			if !ok {
+				return nil, fmt.Errorf("invalid global expiration index member %q", entries[index])
+			}
+			teamIDs[teamID] = struct{}{}
+			byTeam[teamID] = append(byTeam[teamID], expirationSandboxRef{sandboxID: sandboxID, executionID: executionID})
+		}
+
+		for teamID, refs := range byTeam {
+			batch, err := s.fetchExpirationSandboxBatchStrict(ctx, teamID, refs)
+			if err != nil {
+				return nil, fmt.Errorf("strict sandbox scan failed for team %s: %w", teamID, err)
+			}
+			items.add(batch)
+		}
+
+		cursor = next
+		if cursor == 0 {
+			break
+		}
 	}
 
-	items := newRunningItems()
-	for _, teamID := range teams {
-		if err := s.forEachTeamSandboxBatchStrict(ctx, teamID, items.add); err != nil {
-			return nil, fmt.Errorf("strict sandbox scan failed for team %s: %w", teamID, err)
+	indexedTeams, err := s.redisClient.ZRange(ctx, globalTeamsSet, 0, -1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("list global team index: %w", err)
+	}
+	for _, teamID := range indexedTeams {
+		teamIDs[teamID] = struct{}{}
+	}
+	for teamID := range teamIDs {
+		if err := s.addStrictTeamRunningItems(ctx, teamID, items); err != nil {
+			return nil, fmt.Errorf("strict team sandbox scan failed for team %s: %w", teamID, err)
 		}
 	}
 
 	return items.out, nil
 }
 
-func (s *Storage) forEachTeamSandboxBatchStrict(ctx context.Context, teamID string, fn func([]sandboxtypes.Sandbox)) error {
+func (s *Storage) addStrictTeamRunningItems(ctx context.Context, teamID string, items *runningItems) error {
+	if _, err := uuid.Parse(teamID); err != nil {
+		return fmt.Errorf("invalid team ID: %w", err)
+	}
+
 	var cursor uint64
 	for {
 		sandboxIDs, next, err := s.redisClient.SScan(ctx, GetSandboxStorageTeamIndexKey(teamID), cursor, "", sandboxScanBatchSize).Result()
 		if err != nil {
-			return fmt.Errorf("failed to scan team index: %w", err)
+			return fmt.Errorf("scan team index: %w", err)
 		}
-
 		for start := 0; start < len(sandboxIDs); start += sandboxScanBatchSize {
 			end := min(start+sandboxScanBatchSize, len(sandboxIDs))
-			batch, err := s.fetchSandboxBatchStrict(ctx, teamID, sandboxIDs[start:end])
+			batch, err := s.fetchTeamSandboxBatchStrict(ctx, teamID, sandboxIDs[start:end])
 			if err != nil {
 				return err
 			}
-			fn(batch)
+			items.add(batch)
 		}
 
 		cursor = next
@@ -228,7 +270,7 @@ func (s *Storage) forEachTeamSandboxBatchStrict(ctx context.Context, teamID stri
 	}
 }
 
-func (s *Storage) fetchSandboxBatchStrict(ctx context.Context, teamID string, sandboxIDs []string) ([]sandboxtypes.Sandbox, error) {
+func (s *Storage) fetchTeamSandboxBatchStrict(ctx context.Context, teamID string, sandboxIDs []string) ([]sandboxtypes.Sandbox, error) {
 	if len(sandboxIDs) == 0 {
 		return nil, nil
 	}
@@ -251,6 +293,54 @@ func (s *Storage) fetchSandboxBatchStrict(ctx context.Context, teamID string, sa
 		var sbx sandboxtypes.Sandbox
 		if err := json.Unmarshal([]byte(encoded), &sbx); err != nil {
 			return nil, fmt.Errorf("decode sandbox %q: %w", sandboxIDs[index], err)
+		}
+		if sbx.TeamID.String() != teamID || sbx.SandboxID != sandboxIDs[index] {
+			return nil, fmt.Errorf("sandbox %q record identity does not match its team index", sandboxIDs[index])
+		}
+		result = append(result, sbx)
+	}
+
+	return result, nil
+}
+
+type expirationSandboxRef struct {
+	sandboxID   string
+	executionID string
+}
+
+func (s *Storage) fetchExpirationSandboxBatchStrict(ctx context.Context, teamID string, refs []expirationSandboxRef) ([]sandboxtypes.Sandbox, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+
+	keys := utils.Map(refs, func(ref expirationSandboxRef) string { return getSandboxKey(teamID, ref.sandboxID) })
+	values, err := s.redisClient.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, fmt.Errorf("MGET failed: %w", err)
+	}
+
+	result := make([]sandboxtypes.Sandbox, 0, len(values))
+	for index, raw := range values {
+		ref := refs[index]
+		if raw == nil {
+			// Add writes the expiration index first and Remove deletes the record
+			// first, so a missing record is a safe stale-index entry, never an
+			// unindexed live sandbox.
+			continue
+		}
+		encoded, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf("sandbox %q has unexpected Redis value type", ref.sandboxID)
+		}
+		var sbx sandboxtypes.Sandbox
+		if err := json.Unmarshal([]byte(encoded), &sbx); err != nil {
+			return nil, fmt.Errorf("decode sandbox %q: %w", ref.sandboxID, err)
+		}
+		if sbx.TeamID.String() != teamID || sbx.SandboxID != ref.sandboxID {
+			return nil, fmt.Errorf("sandbox %q record identity does not match its expiration index", ref.sandboxID)
+		}
+		if sbx.ExecutionID != ref.executionID {
+			continue
 		}
 		result = append(result, sbx)
 	}

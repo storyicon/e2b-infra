@@ -49,6 +49,36 @@ func PlaceSandbox(
 	labelFilteringEnabled bool,
 	requiredLabels []string,
 ) (PlacementResult, error) {
+	return placeSandbox(ctx, algorithm, clusterNodes, preferredNode, sbxRequest, cpu, labelFilteringEnabled, requiredLabels, false)
+}
+
+// PlaceSandboxOncePerNode tries each capacity-refusing node at most once. It is
+// used only when the caller owns the outer capacity-wait loop; the default
+// PlaceSandbox entrypoint preserves the legacy in-request retry behavior.
+func PlaceSandboxOncePerNode(
+	ctx context.Context,
+	algorithm Algorithm,
+	clusterNodes []*nodemanager.Node,
+	preferredNode *nodemanager.Node,
+	sbxRequest *orchestrator.SandboxCreateRequest,
+	cpu CPURequirement,
+	labelFilteringEnabled bool,
+	requiredLabels []string,
+) (PlacementResult, error) {
+	return placeSandbox(ctx, algorithm, clusterNodes, preferredNode, sbxRequest, cpu, labelFilteringEnabled, requiredLabels, true)
+}
+
+func placeSandbox(
+	ctx context.Context,
+	algorithm Algorithm,
+	clusterNodes []*nodemanager.Node,
+	preferredNode *nodemanager.Node,
+	sbxRequest *orchestrator.SandboxCreateRequest,
+	cpu CPURequirement,
+	labelFilteringEnabled bool,
+	requiredLabels []string,
+	excludeExhaustedNodes bool,
+) (PlacementResult, error) {
 	ctx, span := tracer.Start(ctx, "place-sandbox")
 	defer span.End()
 
@@ -173,7 +203,9 @@ func PlaceSandbox(
 		switch statusCode {
 		case codes.ResourceExhausted:
 			refusals++
-			nodesExcluded[failedNode.ID] = struct{}{}
+			if excludeExhaustedNodes {
+				nodesExcluded[failedNode.ID] = struct{}{}
+			}
 			failedNode.PlacementMetrics.Skip(sbxRequest.GetSandbox().GetSandboxId())
 			logger.L().Log(ctx, nodeExhaustedLogLevel, "Node exhausted, trying another node", logger.WithSandboxID(sbxRequest.GetSandbox().GetSandboxId()), logger.WithNodeID(failedNode.ID), zap.Error(utils.UnwrapGRPCError(err)))
 		default:

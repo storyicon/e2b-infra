@@ -263,6 +263,19 @@ func (o *Orchestrator) discoverClusterNode(ctx context.Context, clusterID uuid.U
 func (o *Orchestrator) refreshCapacityNodes(ctx context.Context, clusterID uuid.UUID) {
 	key := "capacity-refresh:" + clusterID.String()
 	o.discoveryGroup.Do(key, func() (any, error) {
+		o.capacityRefreshMu.Lock()
+		lastRefresh := o.capacityRefreshes[key]
+		if o.capacityRetryInterval > 0 && time.Since(lastRefresh) < o.capacityRetryInterval {
+			o.capacityRefreshMu.Unlock()
+
+			return nil, nil
+		}
+		if o.capacityRefreshes == nil {
+			o.capacityRefreshes = make(map[string]time.Time)
+		}
+		o.capacityRefreshes[key] = time.Now()
+		o.capacityRefreshMu.Unlock()
+
 		if clusterID == consts.LocalClusterID {
 			o.discoverNomadNodes(ctx)
 		} else {

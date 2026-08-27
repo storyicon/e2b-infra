@@ -251,7 +251,7 @@ func TestPlaceSandbox_EachExhaustedNodeIsTriedOnce(t *testing.T) {
 		return nil, errors.New("all nodes exhausted")
 	}}
 
-	result, err := PlaceSandbox(
+	result, err := PlaceSandboxOncePerNode(
 		ctx,
 		algorithm,
 		nodes,
@@ -266,6 +266,39 @@ func TestPlaceSandbox_EachExhaustedNodeIsTriedOnce(t *testing.T) {
 	require.ErrorAs(t, err, &noNodesErr)
 	assert.False(t, result.TimedOut)
 	assert.Equal(t, len(nodes), chooseCalls)
+}
+
+func TestPlaceSandbox_DefaultRetriesExhaustedNode(t *testing.T) {
+	t.Parallel()
+
+	node := nodemanager.NewTestNode("node1", api.NodeStatusReady, 0, 4)
+	createCalls := 0
+	node.SetSandboxClient(&nodemanager.MockSandboxClientCustom{CreateFunc: func() error {
+		createCalls++
+		if createCalls == 1 {
+			return status.Error(codes.ResourceExhausted, "temporarily exhausted")
+		}
+
+		return nil
+	}})
+	algorithm := stubAlgorithm{choose: func(map[string]struct{}) (*nodemanager.Node, error) {
+		return node, nil
+	}}
+
+	result, err := PlaceSandbox(
+		t.Context(),
+		algorithm,
+		[]*nodemanager.Node{node},
+		nil,
+		testSbxRequest("test-sandbox"),
+		CPURequirement{},
+		false,
+		nil,
+	)
+
+	require.NoError(t, err)
+	require.Same(t, node, result.Node)
+	require.Equal(t, 2, createCalls)
 }
 
 func TestPlaceSandbox_TriggersOptimisticUpdate(t *testing.T) {

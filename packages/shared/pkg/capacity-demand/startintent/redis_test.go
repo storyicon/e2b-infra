@@ -2,6 +2,7 @@ package startintent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -278,6 +279,31 @@ func TestRedisStoreUsesVersionedNamespaceSeparateFromLegacy(t *testing.T) {
 
 	require.Equal(t, "e2b:capacity-demand:start-intent:v1:{cluster-a}:entries", entriesKey("cluster-a"))
 	require.Equal(t, "e2b:capacity-demand:start-intent:v1:{cluster-a}:deadlines", deadlinesKey("cluster-a"))
+}
+
+func TestRedisStoreActiveCleansLargeExpiredBurstInBoundedBatches(t *testing.T) { //nolint:paralleltest // tests may share the configured Redis instance
+	client := setupRedis(t)
+	store := NewRedisStore(client)
+	clusterID := "cluster-large-expiry"
+	now := time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC)
+
+	pipe := client.Pipeline()
+	for i := range 10_000 {
+		sandboxID := fmt.Sprintf("expired-%05d", i)
+		pipe.HSet(t.Context(), entriesKey(clusterID), sandboxID, `{}`)
+		pipe.ZAdd(t.Context(), deadlinesKey(clusterID), redis.Z{
+			Score:  float64(now.Add(-time.Second).UnixMilli()),
+			Member: sandboxID,
+		})
+	}
+	_, err := pipe.Exec(t.Context())
+	require.NoError(t, err)
+
+	records, err := store.Active(t.Context(), clusterID, now)
+	require.NoError(t, err)
+	require.Empty(t, records)
+	require.Zero(t, client.HLen(t.Context(), entriesKey(clusterID)).Val())
+	require.Zero(t, client.ZCard(t.Context(), deadlinesKey(clusterID)).Val())
 }
 
 func TestRedisStoreRejectsMissingClient(t *testing.T) {

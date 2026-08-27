@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -16,9 +17,11 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
+	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/placement"
 	capacitydemand "github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand"
 	"github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand/startintent"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/machineinfo"
 )
 
 const (
@@ -27,6 +30,8 @@ const (
 	defaultStartIntentHandoffTTL        = 30 * time.Second
 	startIntentCleanupTimeout           = 2 * time.Second
 )
+
+var benchmarkRunIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
 type startIntentStore interface {
 	Upsert(ctx context.Context, intent startintent.Intent, now, expiresAt time.Time) (bool, error)
@@ -182,14 +187,17 @@ func (l *startIntentLease) Remove(requestCtx context.Context) {
 	})
 }
 
-func startIntentCompatibility(pinnedCPU string, labelFilteringEnabled bool, labels []string) string {
-	if pinnedCPU == "" && (!labelFilteringEnabled || len(labels) == 0) {
+func startIntentCompatibility(cpu placement.CPURequirement, poolCPU machineinfo.MachineInfo, labelFilteringEnabled bool, labels []string) string {
+	buildCompatible := cpu.Build.CPUArchitecture == "" || cpu.Build.IsCompatibleWith(poolCPU)
+	pinCompatible := cpu.PinnedModel == "" || cpu.PinnedModel == poolCPU.CPUModel
+	if buildCompatible && pinCompatible && (!labelFilteringEnabled || len(labels) == 0) {
 		return startintent.SinglePoolCompatibility
 	}
 
 	canonicalLabels := append([]string(nil), labels...)
 	slices.Sort(canonicalLabels)
-	canonical := "cpu=" + pinnedCPU + ";labels="
+	canonical := "build_cpu=" + cpu.Build.CPUArchitecture + "/" + cpu.Build.CPUFamily + "/" + cpu.Build.CPUModel +
+		";pinned_cpu=" + cpu.PinnedModel + ";labels="
 	if labelFilteringEnabled {
 		canonical += strings.Join(canonicalLabels, ",")
 	}
@@ -198,19 +206,27 @@ func startIntentCompatibility(pinnedCPU string, labelFilteringEnabled bool, labe
 	return startintent.SinglePoolCompatibility + ":" + hex.EncodeToString(digest[:])
 }
 
+func validateStartIntentPool(intent startintent.Intent, poolVCPU, poolMemoryMiB int64) error {
+	if intent.Compatibility == startintent.SinglePoolCompatibility && intent.VCPU == poolVCPU && intent.MemoryMiB == poolMemoryMiB {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"sandbox request vCPU=%d memoryMiB=%d compatibility=%q does not match autoscaled pool vCPU=%d memoryMiB=%d compatibility=%q",
+		intent.VCPU,
+		intent.MemoryMiB,
+		intent.Compatibility,
+		poolVCPU,
+		poolMemoryMiB,
+		startintent.SinglePoolCompatibility,
+	)
+}
+
 func usesStartIntents(mode cfg.SandboxCapacityDemandMode) bool {
 	return mode == cfg.SandboxCapacityDemandModeDualWrite || mode == cfg.SandboxCapacityDemandModeStartIntentV1
 }
 
 func (o *Orchestrator) recordStartIntentLifecycle(ctx context.Context, stage, outcome string) {
-	if stage == "intent_persisted" && outcome == "success" {
-		// Keep this admission marker deliberately free of sandbox, team, and
-		// request identifiers. The isolated cold-start observer counts markers
-		// after its explicit T0 without turning customer metadata into log fields.
-		logger.L().Info(ctx, "sandbox start intent admitted",
-			zap.String("capacity_mode", string(o.capacityDemandMode)),
-		)
-	}
 	if o.startIntentLifecycleCounter == nil {
 		return
 	}
@@ -220,6 +236,26 @@ func (o *Orchestrator) recordStartIntentLifecycle(ctx context.Context, stage, ou
 		attribute.String("outcome", outcome),
 		attribute.String("mode", string(o.capacityDemandMode)),
 	))
+}
+
+func (o *Orchestrator) recordStartIntentAdmission(ctx context.Context, metadata map[string]string) {
+	fields := []zap.Field{zap.String("capacity_mode", string(o.capacityDemandMode))}
+	if runHash, ok := benchmarkRunHashFromMetadata(metadata); ok {
+		fields = append(fields, zap.String("benchmark_run_hash", runHash))
+	}
+	logger.L().Info(ctx, "sandbox start intent admitted", fields...)
+	o.recordStartIntentLifecycle(ctx, "intent_persisted", "success")
+}
+
+func benchmarkRunHashFromMetadata(metadata map[string]string) (string, bool) {
+	runID := metadata["benchmarkRunId"]
+	if !benchmarkRunIDPattern.MatchString(runID) {
+		return "", false
+	}
+
+	digest := sha256.Sum256([]byte(runID))
+
+	return hex.EncodeToString(digest[:]), true
 }
 
 func waitForStartIntentCapacity(ctx context.Context, timeout, retryInterval time.Duration, try func(context.Context) error) error {

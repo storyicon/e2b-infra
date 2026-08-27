@@ -196,7 +196,24 @@ func (o *Orchestrator) CreateSandbox(
 	totalConcurrentInstances := team.Limits.SandboxConcurrency
 
 	// Check if team has reached max instances
-	finishStart, waitForStart, err := o.sandboxStore.Reserve(ctx, team.Team.ID, sandboxID, int(totalConcurrentInstances))
+	reservationCtx := ctx
+	cancelReservation := func(error) {}
+	var finishStart func(sandbox.Sandbox, error)
+	var waitForStart func(context.Context) (sandbox.Sandbox, error)
+	var err error
+	if usesStartIntents(o.capacityDemandMode) {
+		reservationCtx, cancelReservation = context.WithCancelCause(ctx)
+		defer cancelReservation(nil)
+		finishStart, waitForStart, err = o.sandboxStore.ReserveOwned(
+			reservationCtx,
+			team.Team.ID,
+			sandboxID,
+			int(totalConcurrentInstances),
+			sandbox.ReservationOwner{Token: executionID, CancelCause: cancelReservation},
+		)
+	} else {
+		finishStart, waitForStart, err = o.sandboxStore.Reserve(ctx, team.Team.ID, sandboxID, int(totalConcurrentInstances))
+	}
 	if err != nil {
 		var limitErr *sandbox.LimitExceededError
 
@@ -256,6 +273,7 @@ func (o *Orchestrator) CreateSandbox(
 
 		return sbx, nil
 	}
+	ctx = reservationCtx
 
 	telemetry.ReportEvent(ctx, "Sandbox reservation owner")
 	o.recordStartIntentLifecycle(ctx, "reservation_owner", "success")
@@ -391,11 +409,19 @@ func (o *Orchestrator) CreateSandbox(
 		OwnerToken:    executionID,
 		VCPU:          sbxData.Build.Vcpu,
 		MemoryMiB:     sbxData.Build.RamMb,
-		Compatibility: startIntentCompatibility(cpuRequirement.PinnedModel, labelFilteringEnabled, allLabels),
+		Compatibility: startIntentCompatibility(cpuRequirement, o.capacityPoolCPU, labelFilteringEnabled, allLabels),
 	}
 
 	var intentLease *startIntentLease
 	if usesStartIntents(o.capacityDemandMode) {
+		if err := validateStartIntentPool(intent, o.capacityPoolVCPU, o.capacityPoolMemoryMiB); err != nil {
+			return sandbox.Sandbox{}, &api.APIError{
+				Code:      http.StatusUnprocessableEntity,
+				ErrorCode: "sandbox_capacity_pool_incompatible",
+				ClientMsg: "Sandbox requirements are incompatible with the configured autoscaled capacity pool",
+				Err:       err,
+			}
+		}
 		intentLease, err = beginStartIntent(
 			ctx,
 			o.startIntentStore,
@@ -411,7 +437,7 @@ func (o *Orchestrator) CreateSandbox(
 		}
 		defer intentLease.Remove(ctx)
 		telemetry.ReportEvent(ctx, "Sandbox start intent persisted")
-		o.recordStartIntentLifecycle(ctx, "intent_persisted", "success")
+		o.recordStartIntentAdmission(ctx, sbxData.Metadata)
 	}
 
 	var placed placement.PlacementResult
@@ -437,7 +463,11 @@ func (o *Orchestrator) CreateSandbox(
 
 		clusterNodes := o.GetClusterNodes(nodeClusterID)
 		var placeErr error
-		placed, placeErr = placement.PlaceSandbox(attemptCtx, o.placementAlgorithm, clusterNodes, preferredNode, sbxRequest, cpuRequirement, labelFilteringEnabled, allLabels)
+		if o.capacityWaitTimeout > 0 {
+			placed, placeErr = placement.PlaceSandboxOncePerNode(attemptCtx, o.placementAlgorithm, clusterNodes, preferredNode, sbxRequest, cpuRequirement, labelFilteringEnabled, allLabels)
+		} else {
+			placed, placeErr = placement.PlaceSandbox(attemptCtx, o.placementAlgorithm, clusterNodes, preferredNode, sbxRequest, cpuRequirement, labelFilteringEnabled, allLabels)
+		}
 
 		return placeErr
 	})
@@ -576,7 +606,11 @@ func (o *Orchestrator) CreateSandbox(
 		o.recordStartIntentLifecycle(ctx, "handoff", "success")
 	}
 
-	err = o.sandboxStore.Add(ctx, sbx, &creationMeta)
+	if intentLease != nil {
+		err = o.sandboxStore.AddCapacity(ctx, sbx, &creationMeta)
+	} else {
+		err = o.sandboxStore.Add(ctx, sbx, &creationMeta)
+	}
 	if err != nil {
 		telemetry.ReportError(ctx, "failed to add sandbox to store", err)
 

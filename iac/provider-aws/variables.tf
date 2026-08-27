@@ -144,23 +144,6 @@ variable "capacity_autoscaler_enabled" {
   type        = bool
   description = "Deploy the AWS scale-out-only sandbox capacity controller"
   default     = false
-
-  validation {
-    condition = !var.capacity_autoscaler_enabled || contains([
-      "legacy-failure-ledger:legacy-failure-ledger",
-      "dual-write:legacy-failure-ledger",
-      "dual-write:start-intent-v1",
-      "start-intent-v1:start-intent-v1",
-    ], "${var.capacity_api_demand_mode}:${var.capacity_controller_demand_mode}")
-    error_message = "capacity API/controller demand modes must form a safe explicit migration pair."
-  }
-
-  validation {
-    condition = !var.capacity_autoscaler_enabled || var.capacity_api_demand_mode == "legacy-failure-ledger" || (
-      var.capacity_api_pool_vcpu != null && var.capacity_api_pool_memory_mib != null
-    )
-    error_message = "capacity_api_pool_vcpu and capacity_api_pool_memory_mib are required for dual-write or start-intent-v1."
-  }
 }
 
 variable "capacity_controller_cluster_id" {
@@ -197,6 +180,18 @@ variable "capacity_controller_reconcile_interval" {
   default     = "1s"
 }
 
+variable "capacity_controller_batch_idle_duration" {
+  type        = string
+  description = "How long start-intent workload may remain unchanged before a scale-out decision"
+  default     = "1s"
+}
+
+variable "capacity_controller_batch_max_duration" {
+  type        = string
+  description = "Maximum time start-intent workload may batch before a scale-out decision"
+  default     = "10s"
+}
+
 variable "capacity_api_demand_mode" {
   type        = string
   description = "Explicit API capacity demand write mode"
@@ -230,6 +225,11 @@ variable "capacity_api_wait_timeout" {
   type        = string
   description = "Maximum time Sandbox.create waits for autoscaled capacity when the capacity controller is enabled"
   default     = "120s"
+
+  validation {
+    condition     = can(regex("^[1-9][0-9]*(ms|s|m|h)$", var.capacity_api_wait_timeout))
+    error_message = "capacity_api_wait_timeout must be a positive integer followed by ms, s, m, or h."
+  }
 }
 
 variable "capacity_api_retry_interval" {
@@ -262,10 +262,31 @@ variable "capacity_api_pool_memory_mib" {
   }
 }
 
+variable "capacity_api_pool_cpu_architecture" {
+  type        = string
+  description = "CPU architecture reported by every node in the single autoscaled sandbox pool"
+  default     = null
+  nullable    = true
+}
+
+variable "capacity_api_pool_cpu_family" {
+  type        = string
+  description = "CPU family reported by every node in the single autoscaled sandbox pool"
+  default     = null
+  nullable    = true
+}
+
+variable "capacity_api_pool_cpu_model" {
+  type        = string
+  description = "CPU model reported by every node in the single autoscaled sandbox pool"
+  default     = null
+  nullable    = true
+}
+
 variable "capacity_ingress_idle_timeout_seconds" {
   type        = number
-  description = "ALB idle timeout used while the capacity autoscaler is enabled; keep above the API capacity wait budget"
-  default     = 180
+  description = "ALB idle timeout used while the capacity autoscaler is enabled; covers normal request processing plus capacity waiting"
+  default     = 240
 
   validation {
     condition     = var.capacity_ingress_idle_timeout_seconds >= 61 && var.capacity_ingress_idle_timeout_seconds <= 4000

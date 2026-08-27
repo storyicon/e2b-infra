@@ -28,7 +28,25 @@ const (
 
 var testTeamID = uuid.New()
 
-func setupTestReservationStorage(t *testing.T) (*ReservationStorage, goredis.UniversalClient) {
+func testReservationOwner(token string) sandboxtypes.ReservationOwner {
+	return sandboxtypes.ReservationOwner{Token: token, CancelCause: func(error) {}}
+}
+
+type testReservationStorage struct {
+	*ReservationStorage
+}
+
+func (s *testReservationStorage) Reserve(ctx context.Context, teamID uuid.UUID, sandboxID string, limit int, owners ...sandboxtypes.ReservationOwner) (func(sandboxtypes.Sandbox, error), func(context.Context) (sandboxtypes.Sandbox, error), error) {
+	ownerCtx, cancelOwner := context.WithCancelCause(ctx)
+	owner := sandboxtypes.ReservationOwner{Token: uuid.NewString(), CancelCause: cancelOwner}
+	if len(owners) == 1 {
+		owner = owners[0]
+	}
+
+	return s.ReservationStorage.ReserveOwned(ownerCtx, teamID, sandboxID, limit, owner)
+}
+
+func setupTestReservationStorage(t *testing.T) (*testReservationStorage, goredis.UniversalClient) {
 	t.Helper()
 	client := redis_utils.SetupInstance(t)
 
@@ -36,7 +54,7 @@ func setupTestReservationStorage(t *testing.T) (*ReservationStorage, goredis.Uni
 	go storageInstance.Start(t.Context())
 	t.Cleanup(func() { storageInstance.Close(context.WithoutCancel(t.Context())) })
 
-	storage := NewReservationStorage(client, storageInstance.Notifier())
+	storage := &testReservationStorage{ReservationStorage: NewReservationStorage(client, storageInstance.Notifier())}
 
 	return storage, client
 }
@@ -57,6 +75,32 @@ func TestReservation(t *testing.T) {
 	finishStart, _, err := storage.Reserve(t.Context(), testTeamID, testSandboxID, 1)
 	require.NoError(t, err)
 	assert.NotNil(t, finishStart)
+}
+
+func TestReservation_LegacyPathDoesNotCreateOwnerFence(t *testing.T) {
+	t.Parallel()
+	storage, client := setupTestReservationStorage(t)
+	teamID := uuid.New()
+	sandboxID := "legacy-reservation"
+
+	finish, _, err := storage.ReservationStorage.Reserve(t.Context(), teamID, sandboxID, 1)
+	require.NoError(t, err)
+	require.NotNil(t, finish)
+	require.Equal(t, int64(0), client.HLen(t.Context(), getOwnersHashKey(teamID.String())).Val())
+	require.NoError(t, storage.Release(t.Context(), teamID, sandboxID))
+	require.ErrorIs(t, client.ZScore(t.Context(), getPendingSetKey(teamID.String()), sandboxID).Err(), goredis.Nil)
+}
+
+func TestReservation_LegacyReleaseCannotRemoveOwnedReservation(t *testing.T) {
+	t.Parallel()
+	storage, client := setupTestReservationStorage(t)
+	teamID := uuid.New()
+	sandboxID := "owned-reservation"
+
+	_, _, err := storage.Reserve(t.Context(), teamID, sandboxID, 1, testReservationOwner("owned"))
+	require.NoError(t, err)
+	require.NoError(t, storage.ReservationStorage.Release(t.Context(), teamID, sandboxID))
+	require.NoError(t, client.ZScore(t.Context(), getPendingSetKey(teamID.String()), sandboxID).Err())
 }
 
 func TestReservation_HeartbeatRefreshesOwnerLease(t *testing.T) {
@@ -95,6 +139,57 @@ func TestReservation_HeartbeatDoesNotRestoreMissingLease(t *testing.T) {
 	require.Never(t, func() bool {
 		return client.ZScore(t.Context(), pendingKey, sandboxID).Err() == nil
 	}, 100*time.Millisecond, 10*time.Millisecond)
+}
+
+func TestReservation_HeartbeatCancelsRequestAfterOwnershipIsLost(t *testing.T) {
+	t.Parallel()
+	storage, client := setupTestReservationStorage(t)
+	storage.heartbeatInterval = 10 * time.Millisecond
+
+	teamID := uuid.New()
+	sandboxID := "heartbeat-owner-lost"
+	lost := make(chan error, 1)
+	owner := sandboxtypes.ReservationOwner{
+		Token:       "owner-a",
+		CancelCause: func(err error) { lost <- err },
+	}
+	_, _, err := storage.Reserve(t.Context(), teamID, sandboxID, 1, owner)
+	require.NoError(t, err)
+	require.NoError(t, client.HSet(t.Context(), getOwnersHashKey(teamID.String()), sandboxID, "owner-b").Err())
+
+	select {
+	case err := <-lost:
+		require.ErrorContains(t, err, "no longer owned")
+	case <-time.After(time.Second):
+		require.FailNow(t, "reservation heartbeat did not cancel the old owner")
+	}
+}
+
+func TestReservation_OldOwnerCannotFinishReplacementLease(t *testing.T) {
+	t.Parallel()
+	storage, client := setupTestReservationStorage(t)
+	storage.heartbeatInterval = time.Hour
+
+	teamID := uuid.New()
+	sandboxID := "fenced-replacement"
+	ownerA := testReservationOwner("owner-a")
+	finishA, _, err := storage.Reserve(t.Context(), teamID, sandboxID, 1, ownerA)
+	require.NoError(t, err)
+
+	require.NoError(t, client.ZAdd(t.Context(), getPendingSetKey(teamID.String()), goredis.Z{
+		Score:  float64(time.Now().Add(-staleTTL - time.Second).Unix()),
+		Member: sandboxID,
+	}).Err())
+	ownerB := testReservationOwner("owner-b")
+	finishB, _, err := storage.Reserve(t.Context(), teamID, sandboxID, 1, ownerB)
+	require.NoError(t, err)
+
+	finishA(testSandbox(teamID, sandboxID), nil)
+	require.Equal(t, ownerB.Token, client.HGet(t.Context(), getOwnersHashKey(teamID.String()), sandboxID).Val())
+	require.ErrorIs(t, client.Get(t.Context(), getResultKey(teamID.String(), sandboxID)).Err(), goredis.Nil)
+
+	finishB(testSandbox(teamID, sandboxID), nil)
+	require.NoError(t, client.Get(t.Context(), getResultKey(teamID.String(), sandboxID)).Err())
 }
 
 func TestReservation_HeartbeatStopsBeforeFinish(t *testing.T) {
@@ -176,9 +271,10 @@ func TestReservation_Release(t *testing.T) {
 	storage, _ := setupTestReservationStorage(t)
 
 	teamID := uuid.New()
-	_, _, err := storage.Reserve(t.Context(), teamID, testSandboxID, 1)
+	owner := testReservationOwner("release-owner")
+	_, _, err := storage.Reserve(t.Context(), teamID, testSandboxID, 1, owner)
 	require.NoError(t, err)
-	err = storage.Release(t.Context(), teamID, testSandboxID)
+	err = storage.releaseOwned(t.Context(), teamID, testSandboxID, owner.Token)
 	require.NoError(t, err)
 
 	_, _, err = storage.Reserve(t.Context(), teamID, testSandboxID, 1)
@@ -246,7 +342,7 @@ func TestReservation_Remove(t *testing.T) {
 	finishStart(expectedSbx, nil)
 
 	// Remove the reservation
-	err = storage.Release(t.Context(), teamID, testSandboxID)
+	err = storage.releaseOwned(t.Context(), teamID, testSandboxID, "completed-owner")
 	require.NoError(t, err)
 
 	// Should be able to reserve again
@@ -502,7 +598,7 @@ func TestReservation_ConcurrentWaitAndFinish(t *testing.T) {
 
 func TestReservation_RaceConditionStressTest(t *testing.T) {
 	t.Parallel()
-	storage, _ := setupTestReservationStorage(t)
+	storage, client := setupTestReservationStorage(t)
 
 	teamID := uuid.New()
 	numOperations := 2000
@@ -543,7 +639,10 @@ func TestReservation_RaceConditionStressTest(t *testing.T) {
 				}
 			case 1:
 				// Remove
-				_ = storage.Release(t.Context(), teamID, sbxID)
+				ownerToken := client.HGet(t.Context(), getOwnersHashKey(teamID.String()), sbxID).Val()
+				if ownerToken != "" {
+					_ = storage.releaseOwned(t.Context(), teamID, sbxID, ownerToken)
+				}
 				operationCount.Add(1)
 			case 2:
 				// Reserve again
@@ -603,7 +702,7 @@ func TestReservation_StalePendingCleanup(t *testing.T) {
 	storageInstance := newTestSandboxStorage(t, client)
 	go storageInstance.Start(t.Context())
 	t.Cleanup(func() { storageInstance.Close(context.WithoutCancel(t.Context())) })
-	storage := NewReservationStorage(client, storageInstance.Notifier())
+	storage := &testReservationStorage{ReservationStorage: NewReservationStorage(client, storageInstance.Notifier())}
 
 	// Reserve with limit=1 — this should succeed because the stale entry
 	// gets cleaned up by the reserveScript before counting

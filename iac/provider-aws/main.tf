@@ -113,14 +113,38 @@ locals {
   client_cluster_min_size = coalesce(var.client_cluster_min_size, var.client_cluster_size)
   client_cluster_max_size = coalesce(var.client_cluster_max_size, var.client_cluster_size)
 
+  capacity_api_wait_parts = try(regex("^([1-9][0-9]*)(ms|s|m|h)$", var.capacity_api_wait_timeout), ["0", "s"])
+  capacity_api_wait_seconds = tonumber(local.capacity_api_wait_parts[0]) * lookup({
+    ms = 0.001
+    s  = 1
+    m  = 60
+    h  = 3600
+  }, local.capacity_api_wait_parts[1])
+  capacity_controller_batch_idle_parts = try(regex("^([1-9][0-9]*)(ms|s|m)$", var.capacity_controller_batch_idle_duration), ["0", "s"])
+  capacity_controller_batch_idle_seconds = tonumber(local.capacity_controller_batch_idle_parts[0]) * lookup({
+    ms = 0.001
+    s  = 1
+    m  = 60
+  }, local.capacity_controller_batch_idle_parts[1])
+  capacity_controller_batch_max_parts = try(regex("^([1-9][0-9]*)(ms|s|m)$", var.capacity_controller_batch_max_duration), ["0", "s"])
+  capacity_controller_batch_max_seconds = tonumber(local.capacity_controller_batch_max_parts[0]) * lookup({
+    ms = 0.001
+    s  = 1
+    m  = 60
+  }, local.capacity_controller_batch_max_parts[1])
+  api_kill_timeout = var.capacity_autoscaler_enabled && var.capacity_controller_demand_mode == "start-intent-v1" ? "${ceil(max(150, local.capacity_api_wait_seconds + 135))}s" : "150s"
+
   capacity_api_env_vars = var.capacity_autoscaler_enabled ? merge({
     SANDBOX_CAPACITY_DEMAND_MODE    = var.capacity_api_demand_mode
     SANDBOX_CAPACITY_WAIT_TIMEOUT   = var.capacity_api_wait_timeout
     SANDBOX_CAPACITY_RETRY_INTERVAL = var.capacity_api_retry_interval
     CAPACITY_SNAPSHOT_SERVICE_TOKEN = local.capacity_snapshot_service_token
     }, var.capacity_api_demand_mode == "legacy-failure-ledger" ? {} : {
-    SANDBOX_CAPACITY_POOL_VCPU       = tostring(var.capacity_api_pool_vcpu)
-    SANDBOX_CAPACITY_POOL_MEMORY_MIB = tostring(var.capacity_api_pool_memory_mib)
+    SANDBOX_CAPACITY_POOL_VCPU             = tostring(var.capacity_api_pool_vcpu)
+    SANDBOX_CAPACITY_POOL_MEMORY_MIB       = tostring(var.capacity_api_pool_memory_mib)
+    SANDBOX_CAPACITY_POOL_CPU_ARCHITECTURE = var.capacity_api_pool_cpu_architecture
+    SANDBOX_CAPACITY_POOL_CPU_FAMILY       = var.capacity_api_pool_cpu_family
+    SANDBOX_CAPACITY_POOL_CPU_MODEL        = var.capacity_api_pool_cpu_model
   }) : {}
 
   capacity_orchestrator_env_vars = var.capacity_autoscaler_enabled ? {
@@ -172,31 +196,33 @@ locals {
     VOLUME_TOKEN_SIGNING_KEY_NAME = "e2b-volume-token-key"
     VOLUME_TOKEN_DURATION         = "1h"
     VOLUME_TOKEN_SIGNING_METHOD   = "HS256"
-  }, local.capacity_api_env_vars, var.api_env_vars)
+  }, var.api_env_vars, local.capacity_api_env_vars)
 
   api_db_migrator_env_vars = merge({
     POSTGRES_CONNECTION_STRING = module.init.postgres_connection_string
   }, var.api_db_migrator_env_vars)
 
-  capacity_controller_env_vars = merge({
-    AWS_REGION                      = data.aws_region.current.id
-    AWS_ASG_NAME                    = module.cluster.client_autoscaling_group_name
-    CAPACITY_DEMAND_MODE            = var.capacity_controller_demand_mode
-    CAPACITY_SNAPSHOT_GRPC_ADDRESS  = "api-internal-grpc.service.consul:${var.api_internal_grpc_port}"
-    CAPACITY_SNAPSHOT_SERVICE_TOKEN = local.capacity_snapshot_service_token
-    E2B_CLUSTER_ID                  = var.capacity_controller_cluster_id
-    MAX_NODES                       = tostring(local.client_cluster_max_size)
-    MIN_NODES                       = tostring(local.client_cluster_min_size)
-    NOMAD_ADDR                      = "http://127.0.0.1:${local.nomad_port}"
-    NOMAD_NODE_POOL                 = local.client_pool_name
-    NOMAD_TOKEN                     = module.init.cluster.nomad_acl_token
-    RECONCILE_INTERVAL              = var.capacity_controller_reconcile_interval
-    REDIS_CLUSTER_URL               = local.redis_cluster_url
-    REDIS_TLS_CA_BASE64             = local.redis_tls_ca_base64
-    REDIS_TLS_ENABLED               = local.redis_tls_enabled
-    REDIS_URL                       = local.redis_url
-    SLOTS_PER_NODE                  = tostring(var.capacity_controller_slots_per_node)
-  }, var.capacity_controller_env_vars)
+  capacity_controller_env_vars = merge(var.capacity_controller_env_vars, {
+    AWS_REGION                       = data.aws_region.current.id
+    AWS_ASG_NAME                     = module.cluster.client_autoscaling_group_name
+    CAPACITY_DEMAND_MODE             = var.capacity_controller_demand_mode
+    CAPACITY_SNAPSHOT_GRPC_ADDRESS   = "api-internal-grpc.service.consul:${var.api_internal_grpc_port}"
+    CAPACITY_SNAPSHOT_SERVICE_TOKEN  = local.capacity_snapshot_service_token
+    E2B_CLUSTER_ID                   = var.capacity_controller_cluster_id
+    MAX_NODES                        = tostring(local.client_cluster_max_size)
+    MIN_NODES                        = tostring(local.client_cluster_min_size)
+    NOMAD_ADDR                       = "http://127.0.0.1:${local.nomad_port}"
+    NOMAD_NODE_POOL                  = local.client_pool_name
+    NOMAD_TOKEN                      = module.init.cluster.nomad_acl_token
+    RECONCILE_INTERVAL               = var.capacity_controller_reconcile_interval
+    START_INTENT_BATCH_IDLE_DURATION = var.capacity_controller_batch_idle_duration
+    START_INTENT_BATCH_MAX_DURATION  = var.capacity_controller_batch_max_duration
+    REDIS_CLUSTER_URL                = local.redis_cluster_url
+    REDIS_TLS_CA_BASE64              = local.redis_tls_ca_base64
+    REDIS_TLS_ENABLED                = local.redis_tls_enabled
+    REDIS_URL                        = local.redis_url
+    SLOTS_PER_NODE                   = tostring(var.capacity_controller_slots_per_node)
+  })
 
   client_proxy_env_vars = merge({
     ENVIRONMENT                  = var.environment
@@ -238,7 +264,7 @@ locals {
     S3_USE_PATH_STYLE            = tostring(var.s3_use_path_style)
     AWS_REGION                   = data.aws_region.current.id
     AWS_DOCKER_REPOSITORY_NAME   = module.init.custom_environments_repository_name
-  }, local.capacity_orchestrator_env_vars, var.orchestrator_env_vars)
+  }, var.orchestrator_env_vars, local.capacity_orchestrator_env_vars)
 
   template_manager_env_vars = merge({
     CONSUL_TOKEN                 = module.init.cluster.consul_acl_token
@@ -368,9 +394,13 @@ module "nomad" {
   clickhouse_node_pool   = local.clickhouse_pool_name
   clickhouse_jobs_prefix = local.clickhouse_jobs_prefix
 
-  api_cluster_size            = var.api_cluster_size
-  api_internal_grpc_port      = var.api_internal_grpc_port
-  api_env_vars                = local.api_env_vars
+  api_cluster_size       = var.api_cluster_size
+  api_internal_grpc_port = var.api_internal_grpc_port
+  api_env_vars           = local.api_env_vars
+  # Nomad must cover the API's 15s drain, 70s normal request budget,
+  # configured capacity wait, 5s server grace, 5s pprof drain, plus
+  # 30s cleanup and 10s termination slack.
+  api_kill_timeout            = local.api_kill_timeout
   api_db_migrator_env_vars    = local.api_db_migrator_env_vars
   api_repository_name         = module.init.api_repository_name
   db_migrator_repository_name = module.init.db_migrator_repository_name

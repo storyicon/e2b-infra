@@ -27,5 +27,6 @@ resource "nomad_job" "api" {
     db_migrator_docker_image = var.db_migrator_docker_image
     job_env_vars             = local.job_env_vars
     db_migrator_env_vars     = local.db_migrator_env_vars
+    kill_timeout             = var.kill_timeout
   })
 }

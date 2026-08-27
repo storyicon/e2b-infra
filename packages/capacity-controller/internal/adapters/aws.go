@@ -5,7 +5,10 @@ import (
 	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
+
+	"github.com/e2b-dev/infra/packages/capacity-controller/internal/controller"
 )
 
 type AutoScalingClient interface {
@@ -38,15 +41,17 @@ func (a *ASG) DesiredCapacity(ctx context.Context, asgName string) (int32, error
 	return *output.AutoScalingGroups[0].DesiredCapacity, nil
 }
 
-func (a *ASG) SetDesiredCapacity(ctx context.Context, asgName string, desired int32) error {
-	_, err := a.client.SetDesiredCapacity(ctx, &autoscaling.SetDesiredCapacityInput{
+func (a *ASG) SetDesiredCapacity(ctx context.Context, asgName string, desired int32) (controller.ScaleWriteMetadata, error) {
+	output, err := a.client.SetDesiredCapacity(ctx, &autoscaling.SetDesiredCapacityInput{
 		AutoScalingGroupName: aws.String(asgName),
 		DesiredCapacity:      aws.Int32(desired),
 		HonorCooldown:        aws.Bool(false),
 	})
 	if err != nil {
-		return fmt.Errorf("set Auto Scaling group desired capacity: %w", err)
+		return controller.ScaleWriteMetadata{}, fmt.Errorf("set Auto Scaling group desired capacity: %w", err)
 	}
 
-	return nil
+	requestID, _ := awsmiddleware.GetRequestIDMetadata(output.ResultMetadata)
+
+	return controller.ScaleWriteMetadata{RequestID: requestID}, nil
 }

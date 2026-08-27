@@ -7,6 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.12
 	github.com/aws/aws-sdk-go-v2/service/autoscaling v1.64.2
 	github.com/e2b-dev/infra/packages/shared v0.0.0
+	github.com/google/uuid v1.6.0
 	github.com/hashicorp/nomad/api v0.0.0-20260324203407-b27b0c2e019a
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/grpc v1.83.0
@@ -30,7 +31,6 @@ require (
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.3.2 // indirect
 	github.com/hashicorp/cronexpr v1.1.3 // indirect

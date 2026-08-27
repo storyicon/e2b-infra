@@ -24,18 +24,18 @@ func TestDeriveServerTimeouts(t *testing.T) {
 			shutdown: 75 * time.Second,
 		},
 		{
-			name:         "short capacity wait keeps defaults",
+			name:         "short capacity wait preserves the normal request budget",
 			capacityWait: 30 * time.Second,
-			request:      70 * time.Second,
-			write:        75 * time.Second,
-			shutdown:     75 * time.Second,
+			request:      100 * time.Second,
+			write:        105 * time.Second,
+			shutdown:     105 * time.Second,
 		},
 		{
 			name:         "capacity wait extends the enclosing deadlines",
 			capacityWait: 120 * time.Second,
-			request:      125 * time.Second,
-			write:        130 * time.Second,
-			shutdown:     130 * time.Second,
+			request:      190 * time.Second,
+			write:        195 * time.Second,
+			shutdown:     195 * time.Second,
 		},
 	}
 

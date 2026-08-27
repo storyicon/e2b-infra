@@ -100,7 +100,10 @@ func registerEdgeGRPCServices(server grpc.ServiceRegistrar, apiStore *handlers.A
 }
 
 func deriveServerTimeouts(capacityWait time.Duration) serverTimeouts {
-	request := max(defaultRequestTimeout, capacityWait+serverTimeoutGrace)
+	// Capacity waiting starts only after the request has completed its normal
+	// validation, persistence, and first placement attempt. Preserve the
+	// existing request budget for those stages, then add the configured wait.
+	request := defaultRequestTimeout + capacityWait
 
 	return serverTimeouts{
 		request:  request,
