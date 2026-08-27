@@ -8,6 +8,10 @@ on:
         description: "Whether to run ARM64 checks and tests"
         required: false
         default: true
+      same_repository:
+        type: boolean
+        description: "Whether the pull request head belongs to this repository"
+        required: true
     secrets:
       CODECOV_TOKEN: { required: false }
 
@@ -77,7 +81,7 @@ jobs:
     if: ${{ inputs.run-tests == true }}
     # Shards that only need Docker run on Blacksmith arm64. The orchestrator
     # shard stays on infra-runner-arm: it needs modprobe nbd.
-    runs-on: ${{ github.repository == 'e2b-dev/infra' && matrix.runner || 'ubuntu-24.04-arm' }}
+    runs-on: ${{ inputs.same_repository && matrix.runner || 'ubuntu-24.04-arm' }}
     timeout-minutes: 45
     env:
       GIN_MODE: test
@@ -134,11 +138,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Explain fork orchestrator test coverage
-        if: ${{ github.repository != 'e2b-dev/infra' && matrix.package == 'packages/orchestrator' }}
+        if: ${{ !inputs.same_repository && matrix.package == 'packages/orchestrator' }}
         run: echo "orchestrator runtime tests require the upstream KVM runner; cross-compilation still runs on forks"
 
       - name: Setup Go
-        if: ${{ github.repository == 'e2b-dev/infra' || matrix.package != 'packages/orchestrator' }}
+        if: ${{ inputs.same_repository || matrix.package != 'packages/orchestrator' }}
         uses: ./.github/actions/go-setup-cache
         with:
           cache-dependency-paths: |
@@ -147,7 +151,7 @@ jobs:
             ${{ matrix.package }}/go.sum
 
       - name: Reap orphaned Testcontainers from previous runs
-        if: ${{ github.repository == 'e2b-dev/infra' || matrix.package != 'packages/orchestrator' }}
+        if: ${{ inputs.same_repository || matrix.package != 'packages/orchestrator' }}
         # Persistent runner + Ryuk disabled: prune leftover containers
         # from SIGKILL/timeout/OOM in prior jobs.
         # Two `docker ps` calls because different filter keys AND inside
@@ -194,16 +198,16 @@ jobs:
           echo 'ACTION=="add|change", KERNEL=="nbd*", OPTIONS:="nowatch"' | sudo tee /etc/udev/rules.d/97-nbd-device.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger
-        if: matrix.package == 'packages/orchestrator' && github.repository == 'e2b-dev/infra'
+        if: matrix.package == 'packages/orchestrator' && inputs.same_repository
 
       - name: Install gotestsum
-        if: ${{ github.repository == 'e2b-dev/infra' || matrix.package != 'packages/orchestrator' }}
+        if: ${{ inputs.same_repository || matrix.package != 'packages/orchestrator' }}
         run: go install gotest.tools/gotestsum@v1.13.0
 
       - name: Compile test binaries
         working-directory: ${{ matrix.package }}
         run: sudo -E `which go` test -run '^$' ${{ matrix.test_path }}
-        if: matrix.sudo == true && (github.repository == 'e2b-dev/infra' || matrix.package != 'packages/orchestrator')
+        if: matrix.sudo == true && (inputs.same_repository || matrix.package != 'packages/orchestrator')
 
       # sudo strips PATH; pass it through so gotestsum/go resolve to the runner's
       # toolchain (1.26.6) instead of /usr/bin/go. Trap chowns reports back to
@@ -214,19 +218,19 @@ jobs:
           trap 'sudo chown "$(id -u):$(id -g)" coverage.txt junit.xml 2>/dev/null || true' EXIT
           sudo -E env "PATH=$PATH" gotestsum --junitfile=junit.xml --format=standard-verbose \
             -- -timeout 20m -coverprofile=coverage.txt -covermode=atomic ${{ matrix.test_path }}
-        if: matrix.sudo == true && (github.repository == 'e2b-dev/infra' || matrix.package != 'packages/orchestrator')
+        if: matrix.sudo == true && (inputs.same_repository || matrix.package != 'packages/orchestrator')
 
       - name: Compile test binaries
         working-directory: ${{ matrix.package }}
         run: go test -run '^$' ${{ matrix.test_path }}
-        if: matrix.sudo == false && (github.repository == 'e2b-dev/infra' || matrix.package != 'packages/orchestrator')
+        if: matrix.sudo == false && (inputs.same_repository || matrix.package != 'packages/orchestrator')
 
       - name: Run tests
         working-directory: ${{ matrix.package }}
         run: |
           gotestsum --junitfile=junit.xml --format=standard-verbose \
             -- -timeout 20m -coverprofile=coverage.txt -covermode=atomic ${{ matrix.test_path }}
-        if: matrix.sudo == false && (github.repository == 'e2b-dev/infra' || matrix.package != 'packages/orchestrator')
+        if: matrix.sudo == false && (inputs.same_repository || matrix.package != 'packages/orchestrator')
 
       - name: Run shared capacity benchmark tests
         if: matrix.package == 'packages/shared'
