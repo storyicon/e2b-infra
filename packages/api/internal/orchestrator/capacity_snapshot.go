@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/e2b-dev/infra/packages/api/internal/cfg"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand/startintent"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
@@ -29,6 +30,19 @@ func (o *Orchestrator) CapacitySnapshot(ctx context.Context, clusterIDRaw string
 	clusterID, err := uuid.Parse(clusterIDRaw)
 	if err != nil {
 		return CapacitySnapshot{}, fmt.Errorf("invalid cluster ID: %w", err)
+	}
+	if o.capacityDemandMode == cfg.SandboxCapacityDemandModeWorkloadV2 {
+		if o.workloadCounter == nil {
+			return CapacitySnapshot{}, errors.New("workload counter is not configured")
+		}
+		count, err := o.workloadCounter.Count(ctx, clusterID.String())
+		if err != nil {
+			o.recordWorkloadLifecycle(ctx, "count", "error")
+			return CapacitySnapshot{}, fmt.Errorf("count active workloads: %w", err)
+		}
+		o.recordWorkloadLifecycle(ctx, "count", "success")
+
+		return CapacitySnapshot{WorkloadCount: count}, nil
 	}
 	if o.startIntentStore == nil {
 		return CapacitySnapshot{}, errors.New("start intent store is not configured")
@@ -110,8 +124,46 @@ func (o *Orchestrator) CapacitySnapshot(ctx context.Context, clusterIDRaw string
 	if len(observedHandoffs) > 0 {
 		go o.cleanupObservedHandoffs(ctx, observedHandoffs)
 	}
+	if o.capacityDemandMode == cfg.SandboxCapacityDemandModeWorkloadV2Shadow {
+		o.compareShadowWorkloadCount(ctx, clusterID, snapshot.WorkloadCount)
+	}
 
 	return snapshot, nil
+}
+
+func (o *Orchestrator) compareShadowWorkloadCount(ctx context.Context, clusterID uuid.UUID, legacyCount uint64) {
+	if o.workloadCounter == nil {
+		o.recordWorkloadLifecycle(ctx, "shadow_count", "not_configured")
+		logger.L().Error(ctx, "workload shadow count unavailable", zap.String("cluster_id", clusterID.String()), zap.String("reason", "counter_not_configured"))
+
+		return
+	}
+
+	workloadCount, err := o.workloadCounter.Count(ctx, clusterID.String())
+	if err != nil {
+		o.recordWorkloadLifecycle(ctx, "shadow_count", "error")
+		logger.L().Error(ctx, "workload shadow count failed", zap.Error(err), zap.String("cluster_id", clusterID.String()))
+
+		return
+	}
+	o.recordWorkloadLifecycle(ctx, "shadow_count", "success")
+
+	relation := "equal"
+	difference := uint64(0)
+	if workloadCount > legacyCount {
+		relation = "workload_v2_higher"
+		difference = workloadCount - legacyCount
+	} else if workloadCount < legacyCount {
+		relation = "legacy_higher"
+		difference = legacyCount - workloadCount
+	}
+	logger.L().Info(ctx, "workload shadow count compared",
+		zap.String("cluster_id", clusterID.String()),
+		zap.String("relation", relation),
+		zap.Uint64("difference", difference),
+		zap.Uint64("legacy_count", legacyCount),
+		zap.Uint64("workload_v2_count", workloadCount),
+	)
 }
 
 func (o *Orchestrator) cleanupObservedHandoffs(requestCtx context.Context, intents []startintent.Record) {

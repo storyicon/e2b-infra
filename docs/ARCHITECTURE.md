@@ -122,7 +122,15 @@ The control-plane entry point (Gin, OpenAPI-generated from `spec/openapi.yml`, p
 - **Placement**: keeps a live map of orchestrator nodes (discovered via Nomad, Kubernetes, or a
   static list). Chooses a node per sandbox with a **best-of-K** algorithm
   (`internal/orchestrator/placement/`): sample K ready nodes, score by CPU
-  commitment/usage, pick the lowest; retry on exhausted nodes. In `start-intent-v1`, the unique
+  commitment/usage, pick the lowest; retry on exhausted nodes. Before sending `Sandbox.Create`,
+  each API replica atomically reserves one node-local create slot using the effective limit the
+  worker advertises through `InfoService`. A full candidate is excluded from that placement round;
+  if all compatible candidates are full, the request stays in the existing capacity wait under the
+  same start-intent owner. This reservation is early backpressure, not a distributed quota: multiple
+  API replicas can collectively exceed the advertised limit, so the worker remains the final
+  admission authority. During an orchestrator-first rolling upgrade, a missing/zero advertised
+  limit keeps legacy unbounded placement and records `legacy_unbounded` on the create span; the API
+  never guesses a default. In `start-intent-v1`, the unique
   reservation owner writes an expiring, cluster-scoped intent after metadata validation and before
   the first placement attempt. The owner heartbeats that lease while placement waits for capacity.
   Success changes it to a short handoff lease until the running index is visible; failure,
@@ -131,10 +139,27 @@ The control-plane entry point (Gin, OpenAPI-generated from `spec/openapi.yml`, p
   explicit `dual-write` migration mode also maintains the legacy failure ledger, but the controller
   always reads exactly one configured source and never falls back automatically. The API derives
   its request, HTTP write, and graceful-shutdown deadlines from the configured capacity-wait budget;
-  upstream proxies must have a longer timeout. Tunable live via feature flags.
+  upstream proxies must have a longer timeout. Three consecutive Create RPCs returning
+  `Unavailable` make that node unroutable in the observing API replica until a complete node sync
+  succeeds; one transient failure does not remove capacity. An orchestrator guest-readiness timeout
+  is returned as `DeadlineExceeded` with a machine-readable retry-safe detail only after its cleanup
+  succeeds. Placement permits one additional node attempt (two total) without writing capacity
+  demand. Cleanup failures and unknown create failures remain fail-closed.
+  Tunable live via feature flags.
 - **State**: writes sandbox records to Redis (source of truth for *running* sandboxes) and the
   sandbox→node **routing catalog** in Redis that client-proxy reads. Persistent entities
   (templates, builds, snapshots, teams) live in Postgres.
+- **Workload-v2 capacity demand** (explicit opt-in): keeps one execution-fenced record per Sandbox
+  in a Redis HASH and its expiry in a same-slot ZSET. Placement acquires a short `starting` lease and
+  renews it while waiting. After the worker is ready, the API extends the lease to `EndTime`, promotes
+  it to `running`, then persists the running record and routing catalog before notifying creation
+  observers. Autoscaling reads only Redis `TIME + ZCOUNT`, so the hot path does not scan Sandbox
+  payloads. Expired records stop counting immediately and a one-minute, 256-record bounded sweeper
+  removes both indexes. `workload-v2-shadow` dual-writes while the legacy snapshot remains the sole
+  ASG input; `workload-v2` reads only the ledger and fails explicitly on Redis errors. Neither mode
+  falls back automatically. Kill, pause, expiry, and failed create remove the ledger only after
+  worker/product cleanup is confirmed, so uncertain cleanup can temporarily overcount but cannot
+  silently undercount live capacity.
 - **Secrets**: `/secrets` is the only public surface for secret management (create, list, get,
   update, delete). The API authenticates the caller with the customer alternatives above, converts
   the authenticated team UUID to the project UUID the backend knows, checks the `customer-secrets`
@@ -163,7 +188,8 @@ gRPC services on :5008 (`pkg/server/`, `pkg/service/`, `pkg/template/server/`, `
 
 - **SandboxService** — `Create`, `Update`, `List`, `Delete`, `Pause`, `Checkpoint`.
 - **TemplateService** — `TemplateCreate`, `TemplateBuildStatus`, `TemplateBuildDelete` (template-manager role only).
-- **InfoService** — node identity, roles, capacity, health status (used by API node discovery).
+- **InfoService** — node identity, roles, capacity, health status, and the worker's current effective
+  concurrent Sandbox create limit (used by API node discovery and early create backpressure).
 - **ChunkService / VolumeService** — peer-to-peer template chunk serving; persistent volumes.
 
 Key mechanisms (all under `pkg/sandbox/`):
@@ -173,7 +199,8 @@ Key mechanisms (all under `pkg/sandbox/`):
   same value but can be lowered independently to protect node startup reliability without changing
   eventual capacity. An atomic in-flight reservation closes the race between the live sandbox
   count check and insertion into the running map, so concurrent creates cannot exceed that
-  configured node limit.
+  configured node limit. This worker-side admission is the final authority across all API replicas;
+  API-side reservations only prevent avoidable request herding before the RPC reaches the worker.
 
 - **Firecracker** (`fc/`): each sandbox is one Firecracker process in its own cgroup and network
   namespace. The FC HTTP API (unix socket) configures machine, drives, network, and snapshots.
@@ -337,6 +364,12 @@ The API blocks on the gRPC `Create`, which itself blocks on envd's `/init` — w
 gets a response, the sandbox is fully usable. Fresh creates are internally a *resume* of the
 template's base snapshot (cold boots happen for filesystem-only templates and builds, or when
 an explicit resume requests one — see pause and resume below; template creates never do).
+If the transport returns `Unavailable` three times consecutively, the API locally quarantines that
+node until a successful full sync proves recovery. If envd never becomes ready, the orchestrator
+returns `DeadlineExceeded` with an exact retry-safe detail only after cleanup succeeds; placement
+may try one other node, for at most two guest-readiness attempts, without creating autoscaler
+demand. Cleanup failures are terminal. Firecracker exits, template errors, and unknown failures
+retain their existing hard-failure behavior.
 
 ### Sandbox traffic
 

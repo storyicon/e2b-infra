@@ -75,6 +75,19 @@ func TestBenchmarkRunHashFromMetadataIsScopedAndDoesNotLogRawIdentifier(t *testi
 	require.False(t, ok)
 }
 
+func TestCapacityAdmissionMessageMatchesDemandAuthority(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "sandbox workload lease admitted", capacityAdmissionMessage(cfg.SandboxCapacityDemandModeWorkloadV2))
+	for _, mode := range []cfg.SandboxCapacityDemandMode{
+		cfg.SandboxCapacityDemandModeDualWrite,
+		cfg.SandboxCapacityDemandModeStartIntentV1,
+		cfg.SandboxCapacityDemandModeWorkloadV2Shadow,
+	} {
+		require.Equal(t, "sandbox start intent admitted", capacityAdmissionMessage(mode))
+	}
+}
+
 func newMemorySandboxStorage() *memorySandboxStorage {
 	return &memorySandboxStorage{items: make(map[string]sandbox.Sandbox)}
 }
@@ -238,7 +251,7 @@ func newStartIntentTestOrchestratorWithReservation(t *testing.T) (*Orchestrator,
 
 	reservations := newMemoryReservation()
 	store := sandbox.NewStore(newMemorySandboxStorage(), reservations, sandbox.Callbacks{
-		AddSandboxToRoutingTable: func(context.Context, sandbox.Sandbox) {},
+		AddSandboxToRoutingTable: func(context.Context, sandbox.Sandbox) error { return nil },
 		AsyncNewlyCreatedSandbox: func(context.Context, sandbox.Sandbox, sandbox.CreationMetadata) {},
 	})
 	o := &Orchestrator{
@@ -574,6 +587,33 @@ func TestDualWriteUsesStartIntentAndLegacyLedgerWithoutChangingControllerReadMod
 	require.Len(t, legacyStore.upserted, 1, "dual-write must populate the isolated legacy demand namespace")
 	require.Len(t, legacyStore.fulfilled, 1, "legacy demand must be completed after placement succeeds")
 	require.Empty(t, legacyStore.removed)
+}
+
+func TestStartIntentCapacityRetriesSlotsFullWithOneOwner(t *testing.T) {
+	t.Parallel()
+
+	store := newFakeStartIntentStore()
+	intent := startintent.Intent{
+		ClusterID: "cluster", SandboxID: "sandbox", OwnerToken: "owner",
+		VCPU: 2, MemoryMiB: 512, Compatibility: "single-pool-v1",
+	}
+	lease, err := beginStartIntent(t.Context(), store, intent, time.Minute, time.Hour, time.Minute)
+	require.NoError(t, err)
+	defer lease.Remove(t.Context())
+
+	o := &Orchestrator{capacityWaitTimeout: time.Second, capacityRetryInterval: time.Millisecond}
+	attempts := 0
+	err = o.waitForCapacity(lease.Context(), cfg.SandboxCapacityDemandModeStartIntentV1, intent, func(context.Context) error {
+		attempts++
+		if attempts <= 3 {
+			return placement.NoNodesAvailableError{}
+		}
+
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, 4, attempts)
+	require.Equal(t, []string{"upsert"}, store.snapshotHistory(), "reservation retries must reuse the existing start-intent owner")
 }
 
 type cancelBlockingHeartbeatStore struct {

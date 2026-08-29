@@ -25,9 +25,11 @@ const (
 	// orchestrator on macOS, where neither Nomad nor Kubernetes is available.
 	ServiceDiscoveryProviderLocal = "local"
 
-	SandboxCapacityDemandModeLegacy        SandboxCapacityDemandMode = "legacy-failure-ledger"
-	SandboxCapacityDemandModeDualWrite     SandboxCapacityDemandMode = "dual-write"
-	SandboxCapacityDemandModeStartIntentV1 SandboxCapacityDemandMode = "start-intent-v1"
+	SandboxCapacityDemandModeLegacy           SandboxCapacityDemandMode = "legacy-failure-ledger"
+	SandboxCapacityDemandModeDualWrite        SandboxCapacityDemandMode = "dual-write"
+	SandboxCapacityDemandModeStartIntentV1    SandboxCapacityDemandMode = "start-intent-v1"
+	SandboxCapacityDemandModeWorkloadV2Shadow SandboxCapacityDemandMode = "workload-v2-shadow"
+	SandboxCapacityDemandModeWorkloadV2       SandboxCapacityDemandMode = "workload-v2"
 )
 
 type SandboxCapacityDemandMode string
@@ -313,6 +315,8 @@ func Parse() (Config, error) {
 		SandboxCapacityDemandModeLegacy,
 		SandboxCapacityDemandModeDualWrite,
 		SandboxCapacityDemandModeStartIntentV1,
+		SandboxCapacityDemandModeWorkloadV2Shadow,
+		SandboxCapacityDemandModeWorkloadV2,
 	}, config.SandboxCapacityDemandMode) {
 		return config, fmt.Errorf("invalid SANDBOX_CAPACITY_DEMAND_MODE: %s", config.SandboxCapacityDemandMode)
 	}

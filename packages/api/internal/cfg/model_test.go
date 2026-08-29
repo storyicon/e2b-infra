@@ -99,13 +99,37 @@ func TestParse(t *testing.T) {
 	})
 
 	t.Run("start intent modes require a snapshot service token", func(t *testing.T) {
-		for _, mode := range []SandboxCapacityDemandMode{SandboxCapacityDemandModeDualWrite, SandboxCapacityDemandModeStartIntentV1} {
+		for _, mode := range []SandboxCapacityDemandMode{
+			SandboxCapacityDemandModeDualWrite,
+			SandboxCapacityDemandModeStartIntentV1,
+			SandboxCapacityDemandModeWorkloadV2Shadow,
+			SandboxCapacityDemandModeWorkloadV2,
+		} {
 			t.Run(string(mode), func(t *testing.T) {
 				t.Setenv("SANDBOX_CAPACITY_DEMAND_MODE", string(mode))
 				removeEnv(t, "CAPACITY_SNAPSHOT_SERVICE_TOKEN")
 
 				_, err := Parse()
 				assert.ErrorContains(t, err, "CAPACITY_SNAPSHOT_SERVICE_TOKEN")
+			})
+		}
+	})
+
+	t.Run("workload modes are parsed explicitly", func(t *testing.T) {
+		for _, mode := range []SandboxCapacityDemandMode{SandboxCapacityDemandModeWorkloadV2Shadow, SandboxCapacityDemandModeWorkloadV2} {
+			t.Run(string(mode), func(t *testing.T) {
+				t.Setenv("SANDBOX_CAPACITY_DEMAND_MODE", string(mode))
+				t.Setenv("CAPACITY_SNAPSHOT_SERVICE_TOKEN", "capacity-service-token")
+				t.Setenv("SANDBOX_CAPACITY_WAIT_TIMEOUT", "2m")
+				t.Setenv("SANDBOX_CAPACITY_POOL_VCPU", "2")
+				t.Setenv("SANDBOX_CAPACITY_POOL_MEMORY_MIB", "1024")
+				t.Setenv("SANDBOX_CAPACITY_POOL_CPU_ARCHITECTURE", "x86_64")
+				t.Setenv("SANDBOX_CAPACITY_POOL_CPU_FAMILY", "6")
+				t.Setenv("SANDBOX_CAPACITY_POOL_CPU_MODEL", "207")
+
+				result, err := Parse()
+				require.NoError(t, err)
+				assert.Equal(t, mode, result.SandboxCapacityDemandMode)
 			})
 		}
 	})
@@ -174,7 +198,12 @@ func TestParse(t *testing.T) {
 	})
 
 	t.Run("start intent modes require positive pool resources", func(t *testing.T) {
-		for _, mode := range []SandboxCapacityDemandMode{SandboxCapacityDemandModeDualWrite, SandboxCapacityDemandModeStartIntentV1} {
+		for _, mode := range []SandboxCapacityDemandMode{
+			SandboxCapacityDemandModeDualWrite,
+			SandboxCapacityDemandModeStartIntentV1,
+			SandboxCapacityDemandModeWorkloadV2Shadow,
+			SandboxCapacityDemandModeWorkloadV2,
+		} {
 			for _, tt := range []struct {
 				name      string
 				vcpu      string

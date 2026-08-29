@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -18,6 +19,8 @@ var errMaxInstanceLengthExceeded = errors.New("max instance length exceeded")
 
 func (o *Orchestrator) KeepAliveFor(ctx context.Context, teamID uuid.UUID, sandboxID string, duration time.Duration, allowShorter bool) (*sandbox.Sandbox, *api.APIError) {
 	now := time.Now()
+	deadlineChanged := false
+	deadlineExtended := false
 
 	updateFunc := func(sbx sandbox.Sandbox) (sandbox.Sandbox, error) {
 		if sbx.State != sandbox.StateRunning {
@@ -35,6 +38,13 @@ func (o *Orchestrator) KeepAliveFor(ctx context.Context, teamID uuid.UUID, sandb
 		if !allowShorter && endTime.Before(sbx.EndTime) {
 			// If shorter than the current end time, we don't extend, so we can return
 			return sbx, nil
+		}
+		deadlineChanged = !endTime.Equal(sbx.EndTime)
+		deadlineExtended = endTime.After(sbx.EndTime)
+		if deadlineExtended {
+			if err := o.updateWorkloadDeadline(ctx, sbx, endTime); err != nil {
+				return sbx, err
+			}
 		}
 
 		logger.L().Debug(ctx, "sandbox ttl updated", logger.WithSandboxID(sbx.SandboxID), logger.Time("end_time", endTime))
@@ -65,8 +75,32 @@ func (o *Orchestrator) KeepAliveFor(ctx context.Context, teamID uuid.UUID, sandb
 
 		return nil, &api.APIError{Code: http.StatusInternalServerError, ClientMsg: "Error when setting sandbox timeout", Err: err}
 	}
-
+	if deadlineChanged && !deadlineExtended {
+		if err := o.updateWorkloadDeadline(ctx, sbx, sbx.EndTime); err != nil {
+			return nil, &api.APIError{Code: http.StatusInternalServerError, ClientMsg: "Error when setting sandbox timeout", Err: err}
+		}
+	}
 	return &sbx, nil
+}
+
+func (o *Orchestrator) updateWorkloadDeadline(ctx context.Context, sbx sandbox.Sandbox, endTime time.Time) error {
+	if !usesWorkloadLedger(o.capacityDemandMode) {
+		return nil
+	}
+	if o.workloadLeaseStore == nil {
+		return errors.New("workload store is not configured")
+	}
+
+	now := time.Now().UTC()
+	updated, err := o.workloadLeaseStore.UpdateDeadline(ctx, sbx.ClusterID.String(), sbx.SandboxID, sbx.ExecutionID, now, endTime)
+	if err != nil {
+		return fmt.Errorf("update workload deadline: %w", err)
+	}
+	if !updated {
+		return errors.New("update workload deadline: lease is no longer owned by this execution")
+	}
+
+	return nil
 }
 
 // getMaxAllowedTTL calculates the maximum allowed TTL for a sandbox without exceeding its max instance length.

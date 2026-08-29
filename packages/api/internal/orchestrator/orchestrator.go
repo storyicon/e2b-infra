@@ -26,6 +26,7 @@ import (
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
 	capacitydemand "github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand"
 	"github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand/startintent"
+	"github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand/workload"
 	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
@@ -64,6 +65,7 @@ type Orchestrator struct {
 	createdSandboxesCounter       metric.Int64Counter
 	resumeOriginNodeRemapCounter  metric.Int64Counter
 	startIntentLifecycleCounter   metric.Int64Counter
+	workloadLifecycleCounter      metric.Int64Counter
 	teamMetricsObserver           *metrics.TeamObserver
 	accessTokenGenerator          *sandbox.AccessTokenGenerator
 	createdCounter                metric.Int64Counter
@@ -80,6 +82,8 @@ type Orchestrator struct {
 	startIntentHeartbeatInterval  time.Duration
 	startIntentHandoffTTL         time.Duration
 	runningSandboxReader          runningSandboxReader
+	workloadLeaseStore            workloadLeaseStore
+	workloadCounter               workloadCounter
 
 	snapshotUpsertSem *utils.AdjustableSemaphore
 	redisStorage      *redisbackend.Storage
@@ -176,6 +180,7 @@ func New(
 	// Local cluster is used for single-node setups instead
 	skipNomadSync := env.IsLocal()
 
+	workloadRedisStore := workload.NewRedisStore(redisClient)
 	o := Orchestrator{
 		httpClient:           httpClient,
 		analytics:            analyticsInstance,
@@ -211,6 +216,8 @@ func New(
 		startIntentHeartbeatInterval: defaultStartIntentHeartbeatInterval,
 		startIntentHandoffTTL:        defaultStartIntentHandoffTTL,
 		runningSandboxReader:         redisStorage,
+		workloadLeaseStore:           workloadRedisStore,
+		workloadCounter:              workloadRedisStore,
 
 		createdCounter: createdCounter,
 
@@ -253,6 +260,24 @@ func New(
 		logger.L().Error(ctx, "Failed to setup metrics", zap.Error(err))
 
 		return nil, fmt.Errorf("failed to setup metrics: %w", err)
+	}
+	if usesWorkloadLedger(config.SandboxCapacityDemandMode) {
+		go func() {
+			if err := workloadRedisStore.RunSweeper(ctx, time.Minute, 256, func(clusterID string, removed int64, err error) {
+				if err != nil {
+					o.recordWorkloadLifecycle(ctx, "sweep", "error")
+					logger.L().Warn(ctx, "failed to sweep expired workload leases", zap.Error(err), zap.String("cluster_id", clusterID))
+
+					return
+				}
+				o.recordWorkloadLifecycle(ctx, "sweep", "success")
+				if removed > 0 {
+					logger.L().Info(ctx, "expired workload leases swept", zap.String("cluster_id", clusterID), zap.Int64("removed", removed))
+				}
+			}); err != nil {
+				logger.L().Error(ctx, "workload lease sweeper stopped", zap.Error(err))
+			}
+		}()
 	}
 
 	go o.startStatusLogging(ctx)

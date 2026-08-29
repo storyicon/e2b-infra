@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/e2b-dev/infra/packages/api/internal/cfg"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand/startintent"
 )
@@ -16,6 +17,18 @@ import (
 type fakeRunningSandboxReader struct {
 	items []sandbox.Sandbox
 	err   error
+}
+
+type fakeWorkloadCounter struct {
+	count uint64
+	err   error
+	calls int
+}
+
+func (f *fakeWorkloadCounter) Count(context.Context, string) (uint64, error) {
+	f.calls++
+
+	return f.count, f.err
 }
 
 type cleanupStartIntentStore struct {
@@ -102,6 +115,71 @@ func TestCapacitySnapshotUnionsRunningAndActiveIntentIDs(t *testing.T) {
 	intentStore.mu.Lock()
 	defer intentStore.mu.Unlock()
 	require.Contains(t, intentStore.records, "intent-only")
+}
+
+func TestCapacitySnapshotWorkloadV2UsesOnlyLedgerCount(t *testing.T) {
+	t.Parallel()
+
+	counter := &fakeWorkloadCounter{count: 10_000}
+	o := &Orchestrator{
+		capacityDemandMode: cfg.SandboxCapacityDemandModeWorkloadV2,
+		workloadCounter:    counter,
+		startIntentStore:   nil,
+		runningSandboxReader: fakeRunningSandboxReader{
+			err: errors.New("legacy reader must not be called"),
+		},
+	}
+
+	snapshot, err := o.CapacitySnapshot(t.Context(), uuid.NewString())
+	require.NoError(t, err)
+	require.Equal(t, uint64(10_000), snapshot.WorkloadCount)
+	require.Equal(t, 1, counter.calls)
+}
+
+func TestCapacitySnapshotWorkloadV2FailsClosedWithoutLegacyFallback(t *testing.T) {
+	t.Parallel()
+
+	counter := &fakeWorkloadCounter{err: errors.New("ledger unavailable")}
+	o := &Orchestrator{
+		capacityDemandMode:   cfg.SandboxCapacityDemandModeWorkloadV2,
+		workloadCounter:      counter,
+		startIntentStore:     newFakeStartIntentStore(),
+		runningSandboxReader: fakeRunningSandboxReader{},
+	}
+
+	_, err := o.CapacitySnapshot(t.Context(), uuid.NewString())
+	require.ErrorContains(t, err, "ledger unavailable")
+	require.Equal(t, 1, counter.calls)
+}
+
+func TestCapacitySnapshotShadowKeepsLegacyInputWhenLedgerDiffersOrFails(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		counter *fakeWorkloadCounter
+	}{
+		{name: "different count", counter: &fakeWorkloadCounter{count: 99}},
+		{name: "ledger unavailable", counter: &fakeWorkloadCounter{err: errors.New("ledger unavailable")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			clusterID := uuid.New()
+			o := &Orchestrator{
+				capacityDemandMode:   cfg.SandboxCapacityDemandModeWorkloadV2Shadow,
+				workloadCounter:      tc.counter,
+				startIntentStore:     newFakeStartIntentStore(),
+				runningSandboxReader: fakeRunningSandboxReader{},
+			}
+			configureCapacitySnapshotPool(o)
+
+			snapshot, err := o.CapacitySnapshot(t.Context(), clusterID.String())
+			require.NoError(t, err)
+			require.Zero(t, snapshot.WorkloadCount, "shadow mode must preserve the legacy autoscaler input")
+			require.Equal(t, 1, tc.counter.calls)
+		})
+	}
 }
 
 func TestCapacitySnapshotRejectsRunningSandboxForDifferentPool(t *testing.T) {

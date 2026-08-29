@@ -223,7 +223,13 @@ func validateStartIntentPool(intent startintent.Intent, poolVCPU, poolMemoryMiB 
 }
 
 func usesStartIntents(mode cfg.SandboxCapacityDemandMode) bool {
-	return mode == cfg.SandboxCapacityDemandModeDualWrite || mode == cfg.SandboxCapacityDemandModeStartIntentV1
+	return mode == cfg.SandboxCapacityDemandModeDualWrite ||
+		mode == cfg.SandboxCapacityDemandModeStartIntentV1 ||
+		mode == cfg.SandboxCapacityDemandModeWorkloadV2Shadow
+}
+
+func usesWorkloadLedger(mode cfg.SandboxCapacityDemandMode) bool {
+	return mode == cfg.SandboxCapacityDemandModeWorkloadV2Shadow || mode == cfg.SandboxCapacityDemandModeWorkloadV2
 }
 
 func (o *Orchestrator) recordStartIntentLifecycle(ctx context.Context, stage, outcome string) {
@@ -238,12 +244,24 @@ func (o *Orchestrator) recordStartIntentLifecycle(ctx context.Context, stage, ou
 	))
 }
 
-func (o *Orchestrator) recordStartIntentAdmission(ctx context.Context, metadata map[string]string) {
+func capacityAdmissionMessage(mode cfg.SandboxCapacityDemandMode) string {
+	if mode == cfg.SandboxCapacityDemandModeWorkloadV2 {
+		return "sandbox workload lease admitted"
+	}
+
+	return "sandbox start intent admitted"
+}
+
+func (o *Orchestrator) recordCapacityAdmission(ctx context.Context, metadata map[string]string) {
 	fields := []zap.Field{zap.String("capacity_mode", string(o.capacityDemandMode))}
 	if runHash, ok := benchmarkRunHashFromMetadata(metadata); ok {
 		fields = append(fields, zap.String("benchmark_run_hash", runHash))
 	}
-	logger.L().Info(ctx, "sandbox start intent admitted", fields...)
+	logger.L().Info(ctx, capacityAdmissionMessage(o.capacityDemandMode), fields...)
+}
+
+func (o *Orchestrator) recordStartIntentAdmission(ctx context.Context, metadata map[string]string) {
+	o.recordCapacityAdmission(ctx, metadata)
 	o.recordStartIntentLifecycle(ctx, "intent_persisted", "success")
 }
 
@@ -291,7 +309,7 @@ func (o *Orchestrator) waitForCapacity(ctx context.Context, demandMode cfg.Sandb
 	switch demandMode {
 	case cfg.SandboxCapacityDemandModeLegacy, cfg.SandboxCapacityDemandModeDualWrite:
 		return o.capacityWaiter.Wait(ctx, capacityDemandFromStartIntent(demand), try)
-	case cfg.SandboxCapacityDemandModeStartIntentV1:
+	case cfg.SandboxCapacityDemandModeStartIntentV1, cfg.SandboxCapacityDemandModeWorkloadV2Shadow, cfg.SandboxCapacityDemandModeWorkloadV2:
 		return waitForStartIntentCapacity(ctx, o.capacityWaitTimeout, o.capacityRetryInterval, try)
 	default:
 		return fmt.Errorf("unsupported sandbox capacity demand mode %q", demandMode)
