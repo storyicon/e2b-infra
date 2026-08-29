@@ -33,6 +33,8 @@ type Metrics struct {
 }
 
 func (n *Node) UpdateMetricsFromServiceInfoResponse(info *orchestratorinfo.ServiceInfoResponse) {
+	n.PlacementMetrics.SetCreateConcurrencyLimit(info.GetSandboxCreateConcurrencyLimit())
+
 	n.metricsMu.Lock()
 	defer n.metricsMu.Unlock()
 

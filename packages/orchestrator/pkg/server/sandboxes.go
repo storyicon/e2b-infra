@@ -95,6 +95,31 @@ func filesystemBoot(meta metadata.Template, req *orchestrator.SandboxCreateReque
 	return meta.IsFilesystemOnly() || req.GetFilesystemBoot()
 }
 
+// sandboxCreateFailureError authorizes a bounded retry only when the worker
+// proves that a guest-readiness timeout was fully compensated. Cleanup and
+// unknown failures remain fail-closed.
+func sandboxCreateFailureError(err error) error {
+	message := fmt.Sprintf("failed to create sandbox: %s", err)
+	if errors.Is(err, sandbox.ErrSandboxCleanupFailed) {
+		return orchestrator.NewSandboxCreateError(
+			codes.Internal,
+			orchestrator.SandboxCreateCleanupFailedReason,
+			message,
+			false,
+		)
+	}
+	if errors.Is(err, sandbox.ErrWaitForEnvdTimeout) {
+		return orchestrator.NewSandboxCreateError(
+			codes.DeadlineExceeded,
+			orchestrator.SandboxGuestReadinessTimeoutReason,
+			message,
+			true,
+		)
+	}
+
+	return status.Error(codes.Internal, message)
+}
+
 // firecrackerSupports reports whether the sandbox's RUNNING Firecracker
 // carries a version-gated feature, per the given fcversion predicate. The
 // version is fixed at resume, so the answer cannot change under a running
@@ -345,7 +370,7 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 			logger.WithFirecrackerVersion(config.FirecrackerConfig.FirecrackerVersion),
 		)
 
-		return nil, status.Errorf(codes.Internal, "failed to create sandbox: %s", err)
+		return nil, sandboxCreateFailureError(err)
 	}
 
 	s.setupSandboxLifecycle(ctx, sbx)

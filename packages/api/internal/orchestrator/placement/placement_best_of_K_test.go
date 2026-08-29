@@ -75,13 +75,13 @@ func TestBestOfK_Score_WithPendingResources(t *testing.T) {
 	nodeNormal := nodemanager.NewTestNode("node-normal", api.NodeStatusReady, 0, 4)
 	nodeWithPending := nodemanager.NewTestNode("node-pending", api.NodeStatusReady, 0, 4)
 
-	// Inject InProgress resources into nodeWithPending using StartPlacing
+	// Inject in-progress resources into nodeWithPending through the same reservation path used by placement.
 	// This simulates a Sandbox that is currently being placed but hasn't fully started
 	pendingRes := nodemanager.SandboxResources{
 		CPUs:      2,
 		MiBMemory: 1024,
 	}
-	nodeWithPending.PlacementMetrics.StartPlacing("pending-sbx-1", pendingRes)
+	require.True(t, nodeWithPending.PlacementMetrics.TryReserve("pending-sbx-1", pendingRes))
 
 	reqResources := nodemanager.SandboxResources{
 		CPUs:      1,

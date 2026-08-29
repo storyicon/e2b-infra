@@ -418,3 +418,9 @@ func resolveNodeLimit(configured, featureFlag int) int {
 
 	return featureFlag
 }
+
+func (s *Server) SandboxCreateConcurrencyLimit() uint64 {
+	_, limit := s.startingSandboxes.Snapshot()
+
+	return uint64(limit)
+}

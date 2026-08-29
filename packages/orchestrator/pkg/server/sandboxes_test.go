@@ -3,6 +3,9 @@
 package server
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net"
 	"reflect"
 	"sync"
@@ -15,6 +18,9 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -25,6 +31,68 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
+
+func TestSandboxCreateFailureError(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		err           error
+		wantCode      codes.Code
+		wantReason    string
+		wantRetrySafe bool
+	}{
+		"envd readiness timeout after successful cleanup is explicitly retry safe": {
+			err: fmt.Errorf("failed to wait for sandbox start: %w",
+				fmt.Errorf("failed to init new envd: %w", errors.Join(context.Canceled, sandbox.ErrWaitForEnvdTimeout))),
+			wantCode:      codes.DeadlineExceeded,
+			wantReason:    orchestrator.SandboxGuestReadinessTimeoutReason,
+			wantRetrySafe: true,
+		},
+		"envd readiness timeout with failed cleanup is not retry safe": {
+			err: sandbox.JoinCreateAndCleanupErrors(
+				sandbox.ErrWaitForEnvdTimeout,
+				errors.New("failed to remove cgroup"),
+			),
+			wantCode:   codes.Internal,
+			wantReason: orchestrator.SandboxCreateCleanupFailedReason,
+		},
+		"firecracker exit stays an internal failure": {
+			err:      fmt.Errorf("failed to wait for sandbox start: %w", sandbox.ErrFcProcessExited),
+			wantCode: codes.Internal,
+		},
+		"unrelated create failure stays internal": {
+			err:      errors.New("failed to start firecracker"),
+			wantCode: codes.Internal,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rpcErr := sandboxCreateFailureError(tt.err)
+			st := status.Convert(rpcErr)
+			assert.Equal(t, tt.wantCode, st.Code())
+
+			var info *errdetails.ErrorInfo
+			for _, detail := range st.Details() {
+				if typed, ok := detail.(*errdetails.ErrorInfo); ok {
+					info = typed
+				}
+			}
+			if tt.wantReason == "" {
+				assert.Nil(t, info)
+
+				return
+			}
+
+			require.NotNil(t, info)
+			assert.Equal(t, orchestrator.SandboxCreateErrorDomain, info.GetDomain())
+			assert.Equal(t, tt.wantReason, info.GetReason())
+			assert.Equal(t, tt.wantRetrySafe, info.GetMetadata()[orchestrator.SandboxCreateRetrySafeMetadataKey] == "true")
+		})
+	}
+}
 
 func TestReserveSandboxStartIsAtomic(t *testing.T) {
 	t.Parallel()

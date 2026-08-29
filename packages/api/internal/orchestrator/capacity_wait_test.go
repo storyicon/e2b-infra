@@ -13,6 +13,7 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/placement"
 	capacitydemand "github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand"
+	orchestratorgrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 )
 
 type fakeCapacityDemandStore struct {
@@ -126,6 +127,33 @@ func TestCapacityWaiterQueuesTransientNodeUnavailable(t *testing.T) {
 	require.Empty(t, store.removed)
 }
 
+func TestCapacityWaiterDoesNotQueueOrRetryGuestReadinessTimeout(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeCapacityDemandStore{}
+	waiter := newCapacityWaiter(store, 100*time.Millisecond, time.Millisecond)
+	demand := capacitydemand.Demand{ClusterID: "cluster", SandboxID: "sandbox", VCPU: 1, MemoryMiB: 4096}
+	attempts := 0
+
+	wantErr := orchestratorgrpc.NewSandboxCreateError(
+		codes.DeadlineExceeded,
+		orchestratorgrpc.SandboxGuestReadinessTimeoutReason,
+		"guest readiness timed out",
+		true,
+	)
+	err := waiter.Wait(t.Context(), demand, func(context.Context) error {
+		attempts++
+
+		return placement.SandboxCreateError{Attempts: 1, LastErr: wantErr}
+	})
+
+	require.ErrorIs(t, err, wantErr)
+	require.Equal(t, 1, attempts)
+	require.Empty(t, store.upserted)
+	require.Empty(t, store.fulfilled)
+	require.Empty(t, store.removed)
+}
+
 func TestCapacityWaiterDoesNotQueueNonCapacityFailure(t *testing.T) {
 	t.Parallel()
 
@@ -138,6 +166,31 @@ func TestCapacityWaiterDoesNotQueueNonCapacityFailure(t *testing.T) {
 	}, func(context.Context) error { return wantErr })
 
 	require.ErrorIs(t, err, wantErr)
+	require.Empty(t, store.upserted)
+	require.Empty(t, store.removed)
+}
+
+func TestCapacityWaiterDoesNotRetryInternalCreateFailure(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeCapacityDemandStore{}
+	waiter := newCapacityWaiter(store, 100*time.Millisecond, time.Millisecond)
+	attempts := 0
+
+	err := waiter.Wait(t.Context(), capacitydemand.Demand{
+		ClusterID: "cluster", SandboxID: "sandbox", VCPU: 1, MemoryMiB: 4096,
+	}, func(context.Context) error {
+		attempts++
+
+		return placement.SandboxCreateError{
+			Attempts: 1,
+			LastErr:  status.Error(codes.Internal, "firecracker failed"),
+		}
+	})
+
+	var createErr placement.SandboxCreateError
+	require.ErrorAs(t, err, &createErr)
+	require.Equal(t, 1, attempts)
 	require.Empty(t, store.upserted)
 	require.Empty(t, store.removed)
 }

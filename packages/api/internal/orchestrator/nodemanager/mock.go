@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"math/rand"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,7 +16,6 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	infogrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator-info"
 	templatemanager "github.com/e2b-dev/infra/packages/shared/pkg/grpc/template-manager"
-	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
 )
 
 // TestNode is an alias for Node used in testing
@@ -231,15 +229,11 @@ func (n *TestNode) SetSandboxClient(client orchestrator.SandboxServiceClient) {
 // It uses a mock gRPC client and has simplified Status() method behavior
 func NewTestNode(id string, status api.NodeStatus, cpuAllocated int64, cpuCount uint32, options ...TestOptions) *TestNode {
 	node := &Node{
-		ID:            id,
-		ClusterID:     uuid.New(),
-		IPAddress:     "127.0.0.1",
-		SandboxDomain: nil,
-		PlacementMetrics: PlacementMetrics{
-			sandboxesInProgress: smap.New[SandboxResources](),
-			createSuccess:       atomic.Uint64{},
-			createFails:         atomic.Uint64{},
-		},
+		ID:               id,
+		ClusterID:        uuid.New(),
+		IPAddress:        "127.0.0.1",
+		SandboxDomain:    nil,
+		PlacementMetrics: newPlacementMetrics(),
 
 		client: newMockGRPCClient(),
 		status: StatusInfo{Status: status, ChangedAt: time.Now()},

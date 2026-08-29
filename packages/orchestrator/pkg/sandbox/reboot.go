@@ -206,7 +206,7 @@ func (f *Factory) RebootSandbox(
 	if err := sbx.WaitForEnvd(ctx, StartTypeReboot, rebootEnvdTimeout); err != nil {
 		closeErr := sbx.Close(context.WithoutCancel(ctx))
 
-		return nil, errors.Join(fmt.Errorf("wait for envd after reboot: %w", err), closeErr)
+		return nil, JoinCreateAndCleanupErrors(fmt.Errorf("wait for envd after reboot: %w", err), closeErr)
 	}
 
 	// deferMarkRunning: the caller promotes the sandbox to live itself after a
