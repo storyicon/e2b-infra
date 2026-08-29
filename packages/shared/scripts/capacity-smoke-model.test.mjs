@@ -461,6 +461,26 @@ test("post-baseline workload clock excludes observer barrier delay", () => {
   assert.equal(summary.timings.nomadReadyTargetToLastGuestReady, 10);
 });
 
+test("cross-system guest and Nomad barriers preserve signed observation skew", () => {
+  const summary = buildBenchmarkSummary({
+    runId: "run-1",
+    target: 500,
+    concurrency: 500,
+    maximumClientConcurrency: 500,
+    expectedNodes: 25,
+    perNode: 20,
+    completed: 500,
+    failed: 0,
+    clientEvents: [{ type: "guest_ready", elapsedMs: 35 }],
+    observerEvents: strictEvidence({ progressive: false }),
+    readyMs: { p50: 30, p90: 32, p95: 33, p99: 35, max: 35 },
+  });
+
+  assert.equal(summary.observerEvidenceComplete, true);
+  assert.equal(summary.targetCapacityObserved, true);
+  assert.equal(summary.timings.nomadReadyTargetToLastGuestReady, -5);
+});
+
 test("formal acceptance requires a checkpoint newer than terminal evidence", () => {
   const summary = buildBenchmarkSummary({
     runId: "run-1",

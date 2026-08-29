@@ -18,6 +18,7 @@ from typing import Iterable
 
 
 ADMISSION_MESSAGE = "sandbox start intent admitted"
+WORKLOAD_ADMISSION_MESSAGE = "sandbox workload lease admitted"
 CAPACITY_RECONCILED_MESSAGE = "capacity reconciled"
 CONTROLLER_AUDIT_MESSAGES = {
     "controller_started",
@@ -143,6 +144,7 @@ def parse_structured_fields(message: str) -> dict[str, str]:
     if fields.get("msg") is None:
         known_messages = [
             ADMISSION_MESSAGE,
+            WORKLOAD_ADMISSION_MESSAGE,
             CAPACITY_RECONCILED_MESSAGE,
             *CONTROLLER_AUDIT_MESSAGES,
         ]
@@ -165,9 +167,14 @@ def parse_api_admissions(
     target: int,
 ) -> Iterable[float]:
     admitted: list[float] = []
+    expected_message = (
+        WORKLOAD_ADMISSION_MESSAGE
+        if expected_capacity_mode == "workload-v2"
+        else ADMISSION_MESSAGE
+    )
     for timestamp_ms, message in parse_journal_jsonl(text, t0_epoch_ms):
         fields = parse_structured_fields(message)
-        if fields.get("msg") != ADMISSION_MESSAGE:
+        if fields.get("msg") != expected_message:
             continue
         observed_mode = fields.get("capacity_mode")
         if observed_mode != expected_capacity_mode:
@@ -686,7 +693,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--capacity-mode",
         required=True,
-        choices=("dual-write", "start-intent-v1"),
+        choices=("dual-write", "start-intent-v1", "workload-v2-shadow", "workload-v2"),
     )
     parser.add_argument("--interval-seconds", type=float, default=5.0)
     parser.add_argument("--baseline-timeout-seconds", type=float, default=30.0)

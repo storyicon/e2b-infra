@@ -752,6 +752,10 @@ export function buildBenchmarkSummary({
     if (end < start) throw new Error(`${name} has a negative duration`);
     return end - start;
   };
+  const signedDifference = (start, end) => {
+    if (start === undefined || start === null || end === undefined || end === null) return null;
+    return end - start;
+  };
   const missingObserverEvidence = [...observerEvidence.missingEvidence];
   if (!terminalAuditCheckpointObserved) missingObserverEvidence.push("terminalAuditCheckpoint");
 
@@ -791,7 +795,8 @@ export function buildBenchmarkSummary({
       allAdmittedToDesiredTarget: durationBetween("allAdmittedToDesiredTarget", observerEvidence.serverAdmittedAt, targetASGObservedAt),
       desiredTargetToInServiceTarget: durationBetween("desiredTargetToInServiceTarget", targetASGObservedAt, inServiceTargetAt),
       inServiceTargetToNomadReadyTarget: durationBetween("inServiceTargetToNomadReadyTarget", inServiceTargetAt, nomadTargetAt),
-      nomadReadyTargetToLastGuestReady: durationBetween("nomadReadyTargetToLastGuestReady", nomadTargetAt, lastGuestReadyAtOnObserverClock),
+      // These barriers come from independent observers and have no causal order.
+      nomadReadyTargetToLastGuestReady: signedDifference(nomadTargetAt, lastGuestReadyAtOnObserverClock),
     },
     missingObserverEvidence,
     readyMs,

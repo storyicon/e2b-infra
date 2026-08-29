@@ -39,6 +39,93 @@ class ObserveProgressTest(unittest.TestCase):
     def setUpClass(cls):
         cls.observer = load_observer_module()
 
+    def test_cli_accepts_workload_v2_shadow_admission_mode(self):
+        args = self.observer.build_parser().parse_args(
+            [
+                "--run-id",
+                "workload-v2-shadow-test",
+                "--t0",
+                "1787724000000",
+                "--output",
+                "observer.jsonl",
+                "--aws-region",
+                "us-west-2",
+                "--expected-aws-account",
+                "123456789012",
+                "--asg-name",
+                "benchmark-workers",
+                "--api-unit",
+                "benchmark-api.service",
+                "--controller-unit",
+                "benchmark-controller.service",
+                "--nomad-nodes-url",
+                "http://127.0.0.1:4646/v1/nodes",
+                "--credential-source",
+                "instance-role",
+                "--capacity-mode",
+                "workload-v2-shadow",
+            ]
+        )
+
+        self.assertEqual(args.capacity_mode, "workload-v2-shadow")
+
+    def test_cli_accepts_workload_v2_admission_mode(self):
+        args = self.observer.build_parser().parse_args(
+            [
+                "--run-id",
+                "workload-v2-test",
+                "--t0",
+                "1787724000000",
+                "--output",
+                "observer.jsonl",
+                "--aws-region",
+                "us-west-2",
+                "--expected-aws-account",
+                "123456789012",
+                "--asg-name",
+                "workers",
+                "--api-unit",
+                "benchmark-api.service",
+                "--controller-unit",
+                "benchmark-controller.service",
+                "--nomad-nodes-url",
+                "http://127.0.0.1:4646/v1/nodes",
+                "--credential-source",
+                "instance-role",
+                "--capacity-mode",
+                "workload-v2",
+            ]
+        )
+
+        self.assertEqual(args.capacity_mode, "workload-v2")
+
+    def test_parses_workload_v2_admission_marker(self):
+        run_hash = "4e65d3fbe8ad6535681b021b30785b12b6c0e3f8878859a4148b3f58b8835db0"
+        journal = json.dumps(
+            {
+                "__REALTIME_TIMESTAMP": "1787724000100000",
+                "MESSAGE": json.dumps(
+                    {
+                        "msg": "sandbox workload lease admitted",
+                        "capacity_mode": "workload-v2",
+                        "benchmark_run_hash": run_hash,
+                    }
+                ),
+            }
+        )
+
+        admitted = list(
+            self.observer.parse_api_admissions(
+                journal,
+                t0_epoch_ms=1787724000000,
+                expected_capacity_mode="workload-v2",
+                expected_run_hash=run_hash,
+                target=1,
+            )
+        )
+
+        self.assertEqual(admitted, [1787724000100.0])
+
     def test_collects_runner_jsonl_without_sensitive_identifiers(self):
         api_journal = "\n".join(
             [
