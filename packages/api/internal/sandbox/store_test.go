@@ -139,6 +139,7 @@ type MockStorage struct {
 
 type addOnlyStorage struct {
 	Storage
+
 	added bool
 }
 

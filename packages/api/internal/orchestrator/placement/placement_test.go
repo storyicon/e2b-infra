@@ -27,6 +27,7 @@ type mockAlgorithm struct {
 
 type contextBlockingSandboxClient struct {
 	orchestrator.SandboxServiceClient
+
 	started chan struct{}
 }
 

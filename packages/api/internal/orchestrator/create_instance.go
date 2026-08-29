@@ -447,7 +447,7 @@ func (o *Orchestrator) CreateSandbox(
 	workloadCommitted := false
 	workloadRetainOnFailure := false
 	if usesWorkloadLedger(o.capacityDemandMode) {
-		leaseCtx := ctx
+		leaseCtx := ctx //nolint:contextcheck // the optional intent lease context is derived from this request context
 		if intentLease != nil {
 			leaseCtx = intentLease.Context()
 		}
@@ -462,6 +462,7 @@ func (o *Orchestrator) CreateSandbox(
 		)
 		if err != nil {
 			o.recordWorkloadLifecycle(ctx, "acquire", "error")
+
 			return sandbox.Sandbox{}, startIntentAPIError("Failed to persist sandbox workload lease", err)
 		}
 		o.recordWorkloadLifecycle(ctx, "acquire", "success")

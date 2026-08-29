@@ -38,6 +38,7 @@ func (o *Orchestrator) CapacitySnapshot(ctx context.Context, clusterIDRaw string
 		count, err := o.workloadCounter.Count(ctx, clusterID.String())
 		if err != nil {
 			o.recordWorkloadLifecycle(ctx, "count", "error")
+
 			return CapacitySnapshot{}, fmt.Errorf("count active workloads: %w", err)
 		}
 		o.recordWorkloadLifecycle(ctx, "count", "success")

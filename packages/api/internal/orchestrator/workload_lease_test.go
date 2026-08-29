@@ -43,6 +43,7 @@ func (workloadTestCatalog) Close(context.Context) error { return nil }
 
 type workloadTestSandboxClient struct {
 	orchestratorgrpc.SandboxServiceClient
+
 	onDelete  func()
 	onUpdate  func()
 	deleteErr error

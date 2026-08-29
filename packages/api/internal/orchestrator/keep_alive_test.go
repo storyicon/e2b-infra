@@ -34,6 +34,7 @@ func (e *keepAliveEvents) snapshot() []string {
 
 type recordingSandboxStorage struct {
 	*memorySandboxStorage
+
 	onUpdate func()
 }
 

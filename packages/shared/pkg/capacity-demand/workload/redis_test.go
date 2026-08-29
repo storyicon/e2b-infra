@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRedisStoreLifecycleIsExecutionFenced(t *testing.T) {
+func TestRedisStoreLifecycleIsExecutionFenced(t *testing.T) { //nolint:paralleltest // Redis integration tests share one database
 	client := setupRedis(t)
 	store := NewRedisStore(client)
 	now := time.Now().UTC()
@@ -61,7 +61,7 @@ func TestRedisStoreLifecycleIsExecutionFenced(t *testing.T) {
 	require.Zero(t, count)
 }
 
-func TestRedisStoreExpiredExecutionCanBeReplacedWithoutABA(t *testing.T) {
+func TestRedisStoreExpiredExecutionCanBeReplacedWithoutABA(t *testing.T) { //nolint:paralleltest // Redis integration tests share one database
 	client := setupRedis(t)
 	store := NewRedisStore(client)
 	now := time.Now().UTC()
@@ -87,7 +87,7 @@ func TestRedisStoreExpiredExecutionCanBeReplacedWithoutABA(t *testing.T) {
 	require.Equal(t, uint64(1), count)
 }
 
-func TestRedisStoreUsesRedisTimeForExpiryDecisions(t *testing.T) {
+func TestRedisStoreUsesRedisTimeForExpiryDecisions(t *testing.T) { //nolint:paralleltest // Redis integration tests share one database
 	client := setupRedis(t)
 	store := NewRedisStore(client)
 	now := time.Now().UTC()
@@ -104,7 +104,7 @@ func TestRedisStoreUsesRedisTimeForExpiryDecisions(t *testing.T) {
 	require.ErrorContains(t, err, "expiry must be in the future", "a slow API clock must not create a lease Redis already considers expired")
 }
 
-func TestRedisStoreCountUsesDeadlineWithoutReadingPayload(t *testing.T) {
+func TestRedisStoreCountUsesDeadlineWithoutReadingPayload(t *testing.T) { //nolint:paralleltest // Redis integration tests share one database
 	client := setupRedis(t)
 	store := NewRedisStore(client)
 	now := time.Now().UTC()
@@ -126,7 +126,7 @@ func TestRedisStoreCountUsesDeadlineWithoutReadingPayload(t *testing.T) {
 	require.True(t, client.HExists(t.Context(), entriesKey("cluster-a"), "expired").Val())
 }
 
-func TestRedisStoreSweepExpiredHasHardBatchLimitAndCleansBothIndexes(t *testing.T) {
+func TestRedisStoreSweepExpiredHasHardBatchLimitAndCleansBothIndexes(t *testing.T) { //nolint:paralleltest // Redis integration tests share one database
 	client := setupRedis(t)
 	store := NewRedisStore(client)
 	now := time.Now().UTC()
@@ -145,7 +145,7 @@ func TestRedisStoreSweepExpiredHasHardBatchLimitAndCleansBothIndexes(t *testing.
 
 	removed, err := store.SweepExpired(t.Context(), "cluster-a", maxSweepBatch)
 	require.NoError(t, err)
-	require.Equal(t, int64(maxSweepBatch), removed)
+	require.Equal(t, maxSweepBatch, removed)
 	require.Equal(t, int64(10), client.HLen(t.Context(), entriesKey("cluster-a")).Val())
 	require.Equal(t, int64(10), client.ZCard(t.Context(), deadlinesKey("cluster-a")).Val())
 
@@ -156,7 +156,7 @@ func TestRedisStoreSweepExpiredHasHardBatchLimitAndCleansBothIndexes(t *testing.
 	require.Zero(t, client.ZCard(t.Context(), deadlinesKey("cluster-a")).Val())
 }
 
-func TestRedisStoreRunSweeperEventuallyConverges(t *testing.T) {
+func TestRedisStoreRunSweeperEventuallyConverges(t *testing.T) { //nolint:paralleltest // Redis integration tests share one database
 	client := setupRedis(t)
 	store := NewRedisStore(client)
 	now := time.Now().UTC()

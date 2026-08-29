@@ -158,10 +158,12 @@ func (o *Orchestrator) removeWorkloadLease(ctx context.Context, sbx sandbox.Sand
 	removed, err := o.workloadLeaseStore.Remove(ctx, sbx.ClusterID.String(), sbx.SandboxID, sbx.ExecutionID)
 	if err != nil {
 		o.recordWorkloadLifecycle(ctx, "remove", "error")
+
 		return err
 	}
 	if !removed {
 		o.recordWorkloadLifecycle(ctx, "remove", "fence_mismatch")
+
 		return fmt.Errorf("workload lease for execution %q was not removed", sbx.ExecutionID)
 	}
 	o.recordWorkloadLifecycle(ctx, "remove", "success")

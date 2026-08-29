@@ -24,13 +24,6 @@ const (
 	StateRunning  State = "running"
 )
 
-type persistedRecord struct {
-	SchemaVersion int    `json:"schema_version"`
-	ExecutionID   string `json:"execution_id"`
-	State         State  `json:"state"`
-	ExpiresAtMs   int64  `json:"expires_at_ms"`
-}
-
 var ErrInvalidTransition = errors.New("invalid workload state transition")
 
 func validateMutation(clusterID, sandboxID, executionID string, now, expiresAt time.Time) error {

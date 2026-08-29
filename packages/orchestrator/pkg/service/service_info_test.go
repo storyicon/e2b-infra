@@ -3,7 +3,6 @@
 package service
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -30,12 +29,12 @@ func TestServiceInfoPublishesCurrentSandboxCreateConcurrencyLimit(t *testing.T) 
 	provider := &mutableCreateLimitProvider{limit: 16}
 	server := NewInfoService(&ServiceInfo{}, sandbox.NewSandboxesMap(), metrics.NewHostMetrics(), provider)
 
-	response, err := server.ServiceInfo(context.Background(), &emptypb.Empty{})
+	response, err := server.ServiceInfo(t.Context(), &emptypb.Empty{})
 	require.NoError(t, err)
 	require.Equal(t, uint64(16), response.GetSandboxCreateConcurrencyLimit())
 
 	provider.limit = 8
-	response, err = server.ServiceInfo(context.Background(), &emptypb.Empty{})
+	response, err = server.ServiceInfo(t.Context(), &emptypb.Empty{})
 	require.NoError(t, err)
 	require.Equal(t, uint64(8), response.GetSandboxCreateConcurrencyLimit(), "ServiceInfo must read the effective runtime limit for each response")
 }
