@@ -441,6 +441,7 @@ func (r *Reconciler) reconcileCommitted(ctx context.Context, node NomadScaleInNo
 			return err
 		}
 		r.recordScaleInTransition(node.NodeID, operation, "complete", "success", "")
+
 		return nil
 	}
 	if operation.ActivityID == "" {
@@ -493,6 +494,7 @@ func (r *Reconciler) cancelOperation(ctx context.Context, node NomadScaleInNode,
 	if operation.Stage != "restoring" {
 		if err := r.scaleIn.inventory.RestoreDrain(ctx, node, operation); err != nil {
 			r.recordScaleInTransition(node.NodeID, operation, "restoring", "failed", err.Error())
+
 			return err
 		}
 		operation.Stage = "restoring"
@@ -500,9 +502,11 @@ func (r *Reconciler) cancelOperation(ctx context.Context, node NomadScaleInNode,
 	}
 	if err := r.finishCancel(ctx, node, operation); err != nil {
 		r.recordScaleInTransition(node.NodeID, operation, "restoring", "failed", err.Error())
+
 		return err
 	}
 	r.recordScaleInTransition(node.NodeID, operation, "complete", "cancelled", "")
+
 	return nil
 }
 
@@ -528,6 +532,7 @@ func (r *Reconciler) finishCancel(ctx context.Context, node NomadScaleInNode, op
 	if state.NodeID != node.NodeID || state.ServiceInstanceID == "" || !state.ScaleInProtocolSupport || state.ServiceStatus != "Healthy" {
 		return errors.New("worker scale-in cancel did not restore the expected protocol-capable Healthy service instance")
 	}
+
 	return r.scaleIn.inventory.CompleteRestore(ctx, node, operation)
 }
 
@@ -539,6 +544,7 @@ func activeScaleInOperations(nodes []NomadScaleInNode) []NomadScaleInNode {
 		}
 		result = append(result, node)
 	}
+
 	return result
 }
 
@@ -546,6 +552,7 @@ func hasActiveScaleInOperation(node NomadScaleInNode) bool {
 	if node.Operation == nil || node.Operation.Stage == "complete" {
 		return false
 	}
+
 	return node.Operation.Stage != "restored" || !node.Eligible || node.Draining
 }
 
@@ -563,6 +570,7 @@ func mergeScaleInNodes(now time.Time, nomadNodes []NomadScaleInNode, candidates 
 		instance, member := cloud.Instances[nomad.NodeID]
 		if !member && nomad.Operation != nil && nomad.Operation.Stage == "complete" {
 			seen[nomad.NodeID] = struct{}{}
+
 			continue
 		}
 		result = append(result, ScaleInNode{
@@ -587,6 +595,7 @@ func mergeScaleInNodes(now time.Time, nomadNodes []NomadScaleInNode, candidates 
 		}
 		result = append(result, ScaleInNode{NodeID: instanceID, LaunchTime: instance.LaunchTime, Terminating: instance.LifecycleState != "InService"})
 	}
+
 	return result
 }
 
@@ -604,6 +613,7 @@ func findNomadNode(nodes []NomadScaleInNode, nodeID string) (NomadScaleInNode, b
 			return node, true
 		}
 	}
+
 	return NomadScaleInNode{}, false
 }
 
