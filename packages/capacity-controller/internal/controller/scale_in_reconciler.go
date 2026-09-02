@@ -568,9 +568,7 @@ func mergeScaleInNodes(now time.Time, nomadNodes []NomadScaleInNode, candidates 
 	for _, nomad := range nomadNodes {
 		candidate, observed := byNodeID[nomad.NodeID]
 		instance, member := cloud.Instances[nomad.NodeID]
-		if !member && nomad.Operation != nil && nomad.Operation.Stage == "complete" {
-			seen[nomad.NodeID] = struct{}{}
-
+		if !member {
 			continue
 		}
 		result = append(result, ScaleInNode{

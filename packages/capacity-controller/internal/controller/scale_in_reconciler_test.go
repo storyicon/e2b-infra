@@ -1001,13 +1001,18 @@ func TestOperationFailureDoesNotBlockOpeningAnotherSafeDrain(t *testing.T) {
 	require.Equal(t, 1, workers.beginCalls)
 }
 
-func TestCompletedDepartedNomadNodeDoesNotConsumeDisruptionBudget(t *testing.T) {
+func TestDepartedNomadNodesDoNotConsumeDisruptionBudget(t *testing.T) {
 	t.Parallel()
 
 	now := time.Unix(1000, 0)
 	complete := NomadScaleInOperation{OperationID: "op-complete", ServiceInstanceID: "service-old", Stage: "complete"}
+	terminating := NomadScaleInOperation{OperationID: "op-terminating", ServiceInstanceID: "service-leaving", Stage: "terminating"}
 	nodes := mergeScaleInNodes(now,
-		[]NomadScaleInNode{{NodeID: "i-departed", Ready: true, Draining: true, Operation: &complete}},
+		[]NomadScaleInNode{
+			{NodeID: "i-stale", Ready: false, Eligible: true},
+			{NodeID: "i-complete", Ready: false, Draining: true, Operation: &complete},
+			{NodeID: "i-terminating", Ready: false, Draining: true, Operation: &terminating},
+		},
 		nil,
 		ScaleInASGSnapshot{Instances: map[string]ScaleInASGInstance{}},
 	)
