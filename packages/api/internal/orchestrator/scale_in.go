@@ -20,6 +20,7 @@ var (
 )
 
 type ScaleInCandidate = nodemanager.ScaleInCandidate
+
 type WorkerScaleInState = nodemanager.WorkerScaleInState
 
 func (o *Orchestrator) ListScaleInCandidates(_ context.Context, clusterIDRaw string) ([]ScaleInCandidate, error) {

@@ -3,7 +3,6 @@
 package service
 
 import (
-	"context"
 	"sync"
 	"testing"
 
@@ -57,7 +56,7 @@ func TestAdmissionAndDrainAreLinearized(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			info.SetStatus(context.Background(), orchestratorinfo.ServiceInfoStatus_Draining)
+			info.SetStatus(t.Context(), orchestratorinfo.ServiceInfoStatus_Draining)
 		}()
 
 		close(start)

@@ -17,6 +17,7 @@ import (
 
 type scriptedScaleInInfoClient struct {
 	orchestratorinfo.InfoServiceClient
+
 	mu        sync.Mutex
 	responses []*orchestratorinfo.ServiceInfoResponse
 	calls     int
@@ -40,6 +41,7 @@ func (c *scriptedScaleInInfoClient) ServiceInfo(context.Context, *emptypb.Empty,
 
 type scriptedScaleInSandboxClient struct {
 	orchestrator.SandboxServiceClient
+
 	response *orchestrator.SandboxListResponse
 	calls    int
 }

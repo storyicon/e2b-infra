@@ -193,7 +193,10 @@ func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, worklo
 			state, verifyErr := r.scaleIn.workers.VerifyWorkerScaleIn(ctx, r.config.ClusterID, node.NodeID, operation.ServiceInstanceID)
 			if verifyErr != nil {
 				if cancelErr := r.cancelOperation(ctx, node, operation); cancelErr != nil && firstOperationErr == nil {
-					firstOperationErr = fmt.Errorf("verify scale-in %q failed and restore failed: %v; %w", operation.OperationID, verifyErr, cancelErr)
+					firstOperationErr = errors.Join(
+						fmt.Errorf("verify scale-in %q: %w", operation.OperationID, verifyErr),
+						fmt.Errorf("restore scale-in %q: %w", operation.OperationID, cancelErr),
+					)
 				} else if firstOperationErr == nil {
 					firstOperationErr = fmt.Errorf("verify scale-in %q: %w", operation.OperationID, verifyErr)
 				}
@@ -272,8 +275,15 @@ func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, worklo
 		nomadNode.Operation = &operation
 		state, err := r.scaleIn.workers.BeginWorkerScaleIn(ctx, r.config.ClusterID, candidate.NodeID, candidate.ServiceInstanceID)
 		if err != nil || !workerIdentityMatches(state, candidate.NodeID, candidate.ServiceInstanceID) {
+			beginErr := err
+			if beginErr == nil {
+				beginErr = errors.New("worker identity changed while beginning scale-in")
+			}
 			if cancelErr := r.cancelOperation(ctx, nomadNode, operation); cancelErr != nil {
-				return result, fmt.Errorf("begin worker drain failed and rollback failed for %q: %v; %w", operation.OperationID, err, cancelErr)
+				return result, errors.Join(
+					fmt.Errorf("begin worker drain for %q: %w", operation.OperationID, beginErr),
+					fmt.Errorf("rollback failed for worker drain %q: %w", operation.OperationID, cancelErr),
+				)
 			}
 			continue
 		}
@@ -290,7 +300,10 @@ func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, worklo
 		if err := r.scaleIn.inventory.MarkOperationStage(ctx, nomadNode, operation); err != nil {
 			r.recordScaleInTransition(candidate.NodeID, operation, "worker_draining", "failed", err.Error())
 			if cancelErr := r.cancelOperation(ctx, nomadNode, operation); cancelErr != nil {
-				return result, fmt.Errorf("persist worker drain stage failed and rollback failed for %q: %v; %w", operation.OperationID, err, cancelErr)
+				return result, errors.Join(
+					fmt.Errorf("persist worker drain stage for %q: %w", operation.OperationID, err),
+					fmt.Errorf("rollback failed for worker drain %q: %w", operation.OperationID, cancelErr),
+				)
 			}
 			if firstOperationErr == nil {
 				firstOperationErr = fmt.Errorf("persist worker drain stage for %q: %w", operation.OperationID, err)
@@ -313,7 +326,7 @@ func (r *Reconciler) resumeNomadMarked(ctx context.Context, node NomadScaleInNod
 			cause = errors.New("worker identity changed while resuming Nomad-marked scale-in")
 		}
 		if cancelErr := r.cancelOperation(ctx, node, operation); cancelErr != nil {
-			return fmt.Errorf("%v; cancel scale-in: %w", cause, cancelErr)
+			return errors.Join(cause, fmt.Errorf("cancel scale-in: %w", cancelErr))
 		}
 
 		return cause
@@ -321,7 +334,10 @@ func (r *Reconciler) resumeNomadMarked(ctx context.Context, node NomadScaleInNod
 	operation.Stage = "worker_draining"
 	if err := r.scaleIn.inventory.MarkOperationStage(ctx, node, operation); err != nil {
 		if cancelErr := r.cancelOperation(ctx, node, operation); cancelErr != nil {
-			return fmt.Errorf("persist worker drain stage: %v; cancel scale-in: %w", err, cancelErr)
+			return errors.Join(
+				fmt.Errorf("persist worker drain stage: %w", err),
+				fmt.Errorf("cancel scale-in: %w", cancelErr),
+			)
 		}
 
 		return fmt.Errorf("persist worker drain stage: %w", err)
@@ -400,7 +416,7 @@ func (r *Reconciler) commitTermination(ctx context.Context, now time.Time, node 
 
 func (r *Reconciler) cancelBeforeTermination(ctx context.Context, node NomadScaleInNode, operation NomadScaleInOperation, cause error) error {
 	if err := r.cancelOperation(ctx, node, operation); err != nil {
-		return fmt.Errorf("%w; cancel scale-in: %v", cause, err)
+		return errors.Join(cause, fmt.Errorf("cancel scale-in: %w", err))
 	}
 
 	return cause

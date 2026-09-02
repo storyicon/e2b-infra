@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 	"testing"
 	"time"
@@ -124,9 +125,7 @@ func (w *rollingScaleInWorld) Snapshot(context.Context, string) (ScaleInASGSnaps
 	defer w.mu.Unlock()
 
 	instances := make(map[string]ScaleInASGInstance, len(w.instances))
-	for id, instance := range w.instances {
-		instances[id] = instance
-	}
+	maps.Copy(instances, w.instances)
 
 	return ScaleInASGSnapshot{Name: "workers", MinSize: 0, DesiredCapacity: int32(len(instances)), Instances: instances}, nil
 }
@@ -189,7 +188,7 @@ func TestFiveHundredEmptyWorkersConvergeInRollingBatches(t *testing.T) {
 	}, nil, &fakeCapacitySnapshotReader{}, &fakeNodeCounter{}, &fakeScaleTarget{}, world, world, world)
 	r.scaleIn.stabilizer.firstObservedAt = now.Add(-time.Minute)
 
-	for iteration := 0; iteration < 120; iteration++ {
+	for range 120 {
 		_, err := r.reconcileScaleIn(t.Context(), now, 0, Result{})
 		require.NoError(t, err)
 		world.mu.Lock()
@@ -225,11 +224,13 @@ func (f *scaleInTestInventory) Inventory(context.Context, string) ([]NomadScaleI
 	f.inventoryCalls++
 	return f.nodes, f.err
 }
+
 func (f *scaleInTestInventory) MarkDrain(context.Context, NomadScaleInNode, NomadScaleInOperation) error {
 	f.markDrainCalls++
 
 	return f.markDrainErr
 }
+
 func (f *scaleInTestInventory) MarkOperationStage(context.Context, NomadScaleInNode, NomadScaleInOperation) error {
 	index := f.markStageCalls
 	f.markStageCalls++
@@ -238,15 +239,18 @@ func (f *scaleInTestInventory) MarkOperationStage(context.Context, NomadScaleInN
 	}
 	return nil
 }
+
 func (f *scaleInTestInventory) RestoreDrain(context.Context, NomadScaleInNode, NomadScaleInOperation) error {
 	f.restoreCalls++
 
 	return f.restoreErr
 }
+
 func (f *scaleInTestInventory) CompleteRestore(context.Context, NomadScaleInNode, NomadScaleInOperation) error {
 	f.completeCalls++
 	return nil
 }
+
 func (f *scaleInTestInventory) CompleteTermination(context.Context, NomadScaleInNode, NomadScaleInOperation) error {
 	f.completeTerminationCalls++
 	return nil
@@ -269,13 +273,16 @@ func (f *scaleInTestWorkers) ListScaleInCandidates(context.Context, string) ([]S
 	f.listCalls++
 	return f.candidates, nil
 }
+
 func (f *scaleInTestWorkers) BeginWorkerScaleIn(context.Context, string, string, string) (WorkerScaleInState, error) {
 	f.beginCalls++
 	return f.begin, f.beginErr
 }
+
 func (f *scaleInTestWorkers) VerifyWorkerScaleIn(context.Context, string, string, string) (WorkerScaleInState, error) {
 	return f.verify, f.verifyErr
 }
+
 func (f *scaleInTestWorkers) CancelWorkerScaleIn(_ context.Context, _ string, nodeID, serviceID string) (WorkerScaleInState, error) {
 	f.cancelCalls++
 	if f.cancelErr != nil {
@@ -498,6 +505,7 @@ func TestObserveMixedWorkerVersionsNeverMutatesCapacity(t *testing.T) {
 	require.Zero(t, workers.beginCalls)
 	require.Zero(t, infrastructure.terminateCalls)
 }
+
 func (f *scaleInTestInfrastructure) TerminateInstance(context.Context, string) (ScaleInTerminationReceipt, error) {
 	f.terminateCalls++
 	return f.receipt, f.terminationErr
@@ -719,6 +727,7 @@ func TestCommittedReconciliationIsVisibleAndCompletesDepartedInstance(t *testing
 	require.NoError(t, r.reconcileCommitted(t.Context(), node, operation, ScaleInASGSnapshot{Instances: map[string]ScaleInASGInstance{}}))
 	require.Equal(t, 1, inventory.completeTerminationCalls)
 }
+
 func (f *scaleInTestInfrastructure) Activity(context.Context, string, string) (*ScaleInActivity, error) {
 	return f.activity, f.activityErr
 }

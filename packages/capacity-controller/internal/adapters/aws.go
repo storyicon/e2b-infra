@@ -28,8 +28,11 @@ type EC2Client interface {
 }
 
 type ASGInstance = controller.ScaleInASGInstance
+
 type ASGSnapshot = controller.ScaleInASGSnapshot
+
 type TerminationReceipt = controller.ScaleInTerminationReceipt
+
 type ScalingActivity = controller.ScaleInActivity
 
 type TerminationReconciliation string
