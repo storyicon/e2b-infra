@@ -374,7 +374,7 @@ func (r *Reconciler) commitTermination(ctx context.Context, now time.Time, node 
 	}
 	freshNode, found := findNomadNode(nomadNodes, node.NodeID)
 	if !found || freshNode.Operation == nil || freshNode.Operation.OperationID != operation.OperationID || !freshNode.Draining {
-		return false, r.cancelBeforeTermination(ctx, node, operation, errors.New("Nomad scale-in ownership changed before termination"))
+		return false, r.cancelBeforeTermination(ctx, node, operation, errors.New("nomad scale-in ownership changed before termination"))
 	}
 	candidates, err := r.scaleIn.workers.ListScaleInCandidates(ctx, r.config.ClusterID)
 	if err != nil {
@@ -642,5 +642,6 @@ func scaleInTerminationBlock(snapshot ScaleInASGSnapshot, instanceID string) str
 	if instance.LifecycleState != "InService" || instance.HealthStatus != "Healthy" || instance.ProtectedFromScaleIn {
 		return "instance_not_safe"
 	}
+
 	return ""
 }

@@ -222,6 +222,7 @@ type scaleInTestInventory struct {
 
 func (f *scaleInTestInventory) Inventory(context.Context, string) ([]NomadScaleInNode, error) {
 	f.inventoryCalls++
+
 	return f.nodes, f.err
 }
 
@@ -237,6 +238,7 @@ func (f *scaleInTestInventory) MarkOperationStage(context.Context, NomadScaleInN
 	if index < len(f.markStageErrors) {
 		return f.markStageErrors[index]
 	}
+
 	return nil
 }
 
@@ -248,11 +250,13 @@ func (f *scaleInTestInventory) RestoreDrain(context.Context, NomadScaleInNode, N
 
 func (f *scaleInTestInventory) CompleteRestore(context.Context, NomadScaleInNode, NomadScaleInOperation) error {
 	f.completeCalls++
+
 	return nil
 }
 
 func (f *scaleInTestInventory) CompleteTermination(context.Context, NomadScaleInNode, NomadScaleInOperation) error {
 	f.completeTerminationCalls++
+
 	return nil
 }
 
@@ -271,11 +275,13 @@ type scaleInTestWorkers struct {
 
 func (f *scaleInTestWorkers) ListScaleInCandidates(context.Context, string) ([]ScaleInCandidateObservation, error) {
 	f.listCalls++
+
 	return f.candidates, nil
 }
 
 func (f *scaleInTestWorkers) BeginWorkerScaleIn(context.Context, string, string, string) (WorkerScaleInState, error) {
 	f.beginCalls++
+
 	return f.begin, f.beginErr
 }
 
@@ -291,6 +297,7 @@ func (f *scaleInTestWorkers) CancelWorkerScaleIn(_ context.Context, _ string, no
 	if f.cancelState != nil {
 		return *f.cancelState, nil
 	}
+
 	return WorkerScaleInState{NodeID: nodeID, ServiceInstanceID: serviceID, ServiceStatus: "Healthy", ScaleInProtocolSupport: true}, nil
 }
 
@@ -402,6 +409,8 @@ func TestNewDrainSkipsInfrastructureBlockedCandidatesBeforeMutation(t *testing.T
 		{name: "instance refresh active", refreshActive: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
 			inventory := &scaleInTestInventory{nodes: []NomadScaleInNode{
 				{NomadNodeID: "nomad-target", NodeID: "i-target", NodePool: "workers", Ready: true, Eligible: true, CreateIndex: 2},
 				{NomadNodeID: "nomad-keeper", NodeID: "i-keeper", NodePool: "workers", Ready: true, Eligible: true, CreateIndex: 1},
@@ -449,6 +458,7 @@ type scaleInTestInfrastructure struct {
 
 func (f *scaleInTestInfrastructure) Snapshot(context.Context, string) (ScaleInASGSnapshot, error) {
 	f.snapshotCalls++
+
 	return f.snapshot, nil
 }
 
@@ -508,6 +518,7 @@ func TestObserveMixedWorkerVersionsNeverMutatesCapacity(t *testing.T) {
 
 func (f *scaleInTestInfrastructure) TerminateInstance(context.Context, string) (ScaleInTerminationReceipt, error) {
 	f.terminateCalls++
+
 	return f.receipt, f.terminationErr
 }
 
@@ -530,6 +541,8 @@ func TestCandidateObservationFreshnessFailsClosed(t *testing.T) {
 		{name: "missing"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
 			candidate := base
 			candidate.ObservedAt = test.observedAt
 			nodes := mergeScaleInNodes(now, nomad, []ScaleInCandidateObservation{candidate}, cloud)
@@ -551,12 +564,34 @@ func TestFinishCancelRequiresHealthyProtocolCapableIdentity(t *testing.T) {
 		ok    bool
 	}{
 		{name: "valid", state: valid, ok: true},
-		{name: "healthy replacement", state: func() WorkerScaleInState { value := valid; value.ServiceInstanceID = "service-2"; return value }(), ok: true},
-		{name: "wrong status", state: func() WorkerScaleInState { value := valid; value.ServiceStatus = "Draining"; return value }()},
-		{name: "protocol missing", state: func() WorkerScaleInState { value := valid; value.ScaleInProtocolSupport = false; return value }()},
-		{name: "missing identity", state: func() WorkerScaleInState { value := valid; value.ServiceInstanceID = ""; return value }()},
+		{name: "healthy replacement", state: func() WorkerScaleInState {
+			value := valid
+			value.ServiceInstanceID = "service-2"
+
+			return value
+		}(), ok: true},
+		{name: "wrong status", state: func() WorkerScaleInState {
+			value := valid
+			value.ServiceStatus = "Draining"
+
+			return value
+		}()},
+		{name: "protocol missing", state: func() WorkerScaleInState {
+			value := valid
+			value.ScaleInProtocolSupport = false
+
+			return value
+		}()},
+		{name: "missing identity", state: func() WorkerScaleInState {
+			value := valid
+			value.ServiceInstanceID = ""
+
+			return value
+		}()},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
 			inventory := &scaleInTestInventory{}
 			workers := &scaleInTestWorkers{cancelState: &test.state}
 			r := NewWithScaleIn(&Config{ClusterID: "cluster-1"}, nil, nil, nil, nil, inventory, workers, &scaleInTestInfrastructure{})
@@ -769,6 +804,8 @@ func TestScaleOutCompensatesOnlyUncommittedTerminatingOperations(t *testing.T) {
 		{name: "ambiguous termination", want: 6},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
 			operation := NomadScaleInOperation{
 				OperationID:       "op-1",
 				ServiceInstanceID: "service-1",
@@ -821,6 +858,8 @@ func TestCommitTerminationRestoresOnlyAfterExplicitAWSRejection(t *testing.T) {
 		{name: "ambiguous transport outcome", outcome: ScaleInTerminationAmbiguous, wantRestored: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
 			now := time.Unix(100, 0)
 			operation := NomadScaleInOperation{OperationID: "op-1", ServiceInstanceID: "service-1", StartedAt: now, Stage: "worker_draining"}
 			targetNode := NomadScaleInNode{NomadNodeID: "nomad-target", NodeID: "i-target", NodePool: "workers", Ready: true, Draining: true, Operation: &operation}
