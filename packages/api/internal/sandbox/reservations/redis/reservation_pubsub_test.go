@@ -33,7 +33,7 @@ func testSandbox(teamID uuid.UUID, sandboxID string) sandboxtypes.Sandbox {
 
 // setupReservationStorageWithoutSubManager wires the reservation store so that
 // PubSub messages are never delivered in-process. Used to exercise the safety-net path.
-func setupReservationStorageWithoutSubManager(t *testing.T) (*ReservationStorage, goredis.UniversalClient) {
+func setupReservationStorageWithoutSubManager(t *testing.T) (*testReservationStorage, goredis.UniversalClient) {
 	t.Helper()
 
 	client := redis_utils.SetupInstance(t)
@@ -41,7 +41,7 @@ func setupReservationStorageWithoutSubManager(t *testing.T) (*ReservationStorage
 	storageInstance := newTestSandboxStorage(t, client)
 	t.Cleanup(func() { storageInstance.Close(context.WithoutCancel(t.Context())) })
 
-	storage := NewReservationStorage(client, storageInstance.Notifier())
+	storage := &testReservationStorage{ReservationStorage: NewReservationStorage(client, storageInstance.Notifier())}
 
 	return storage, client
 }
@@ -53,7 +53,8 @@ func TestWaitForStart_WokenByFinishStartPublish(t *testing.T) {
 	teamID := uuid.New()
 	sbxID := "pubsub-finish"
 
-	finishStart, _, err := storage.Reserve(t.Context(), teamID, sbxID, 10)
+	owner := testReservationOwner("pubsub-release-owner")
+	finishStart, _, err := storage.Reserve(t.Context(), teamID, sbxID, 10, owner)
 	require.NoError(t, err)
 	require.NotNil(t, finishStart)
 
@@ -93,8 +94,9 @@ func TestWaitForStart_WokenByReleasePublish(t *testing.T) {
 	storage, _ := setupTestReservationStorage(t)
 	teamID := uuid.New()
 	sbxID := "pubsub-release"
+	owner := testReservationOwner("pubsub-release-owner")
 
-	finishStart, _, err := storage.Reserve(t.Context(), teamID, sbxID, 10)
+	finishStart, _, err := storage.Reserve(t.Context(), teamID, sbxID, 10, owner)
 	require.NoError(t, err)
 	require.NotNil(t, finishStart)
 
@@ -110,7 +112,7 @@ func TestWaitForStart_WokenByReleasePublish(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	start := time.Now()
-	require.NoError(t, storage.Release(t.Context(), teamID, sbxID))
+	require.NoError(t, storage.releaseOwned(t.Context(), teamID, sbxID, owner.Token))
 
 	select {
 	case err := <-waiterErr:
@@ -143,9 +145,11 @@ func TestWaitForStart_FallbackTickerWhenPubSubMissed(t *testing.T) {
 	resultData, err := encodeResult(testSandbox(teamID, sbxID), nil)
 	require.NoError(t, err)
 	teamIDStr := teamID.String()
-	err = finishStartScript.Run(t.Context(), storage.redisClient,
-		[]string{getPendingSetKey(teamIDStr), getResultKey(teamIDStr, sbxID)},
-		sbxID, resultData, int(resultTTL.Seconds()),
+	ownerToken := storage.redisClient.HGet(t.Context(), getOwnersHashKey(teamIDStr), sbxID).Val()
+	require.NotEmpty(t, ownerToken)
+	err = finishOwnedStartScript.Run(t.Context(), storage.redisClient,
+		[]string{getPendingSetKey(teamIDStr), getResultKey(teamIDStr, sbxID), getOwnersHashKey(teamIDStr)},
+		sbxID, ownerToken, resultData, int(resultTTL.Seconds()),
 	).Err()
 	require.NoError(t, err)
 
@@ -332,7 +336,7 @@ func TestWaitForStart_RedisOpsBounded(t *testing.T) {
 	go storageInstance.Start(t.Context())
 	t.Cleanup(func() { storageInstance.Close(context.WithoutCancel(t.Context())) })
 
-	storage := NewReservationStorage(client, storageInstance.Notifier())
+	storage := &testReservationStorage{ReservationStorage: NewReservationStorage(client, storageInstance.Notifier())}
 
 	teamID := uuid.New()
 	sbxID := "pubsub-bounded"

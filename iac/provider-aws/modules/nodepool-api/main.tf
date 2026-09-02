@@ -22,6 +22,33 @@ resource "aws_iam_policy" "api_node_policy" {
   policy = data.aws_iam_policy_document.api_node_policy.json
 }
 
+resource "aws_iam_policy" "capacity_autoscaler" {
+  count = var.capacity_autoscaler_enabled ? 1 : 0
+
+  name   = "${var.prefix}capacity-autoscaler"
+  policy = data.aws_iam_policy_document.capacity_autoscaler[0].json
+}
+
+data "aws_iam_policy_document" "capacity_autoscaler" {
+  count = var.capacity_autoscaler_enabled ? 1 : 0
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "autoscaling:DescribeAutoScalingGroups",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "autoscaling:SetDesiredCapacity",
+    ]
+    resources = [var.client_autoscaling_group_arn]
+  }
+}
+
 data "aws_iam_policy_document" "api_node_policy" {
   statement {
     effect = "Allow"
@@ -48,6 +75,13 @@ resource "aws_iam_role_policy_attachment" "api" {
 
   role       = aws_iam_role.api.name
   policy_arn = each.value
+}
+
+resource "aws_iam_role_policy_attachment" "capacity_autoscaler" {
+  count = var.capacity_autoscaler_enabled ? 1 : 0
+
+  role       = aws_iam_role.api.name
+  policy_arn = aws_iam_policy.capacity_autoscaler[0].arn
 }
 
 resource "aws_iam_instance_profile" "api" {

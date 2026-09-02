@@ -54,10 +54,12 @@ func placementAPIError(err error) *api.APIError {
 	}
 
 	var (
-		timeoutErr    placement.PlacementTimeoutError
-		noNodesErr    placement.NoNodesAvailableError
-		noEligibleErr placement.FailedToPlaceSandboxError
-		createErr     placement.SandboxCreateError
+		timeoutErr       placement.PlacementTimeoutError
+		capacityWaitErr  CapacityWaitTimeoutError
+		capacityStoreErr CapacityDemandStoreError
+		noNodesErr       placement.NoNodesAvailableError
+		noEligibleErr    placement.FailedToPlaceSandboxError
+		createErr        placement.SandboxCreateError
 	)
 
 	switch {
@@ -67,6 +69,10 @@ func placementAPIError(err error) *api.APIError {
 		}
 
 		return apiErr(http.StatusGatewayTimeout, errCodePlacementTimeout, fmt.Sprintf("%s: placement timed out after %d attempt(s), please retry", placementMessagePrefix, timeoutErr.Attempts))
+	case errors.As(err, &capacityWaitErr):
+		return apiErr(http.StatusGatewayTimeout, errCodePlacementTimeout, placementMessagePrefix+": capacity did not become available before the wait deadline, please retry")
+	case errors.As(err, &capacityStoreErr):
+		return apiErr(http.StatusServiceUnavailable, errCodeCapacityUnavailable, placementMessagePrefix+": capacity management is temporarily unavailable, please retry shortly")
 	case errors.As(err, &noNodesErr):
 		return apiErr(http.StatusServiceUnavailable, errCodeCapacityUnavailable, placementMessagePrefix+": not enough capacity for the requested resources right now, please retry shortly")
 	case errors.As(err, &noEligibleErr):

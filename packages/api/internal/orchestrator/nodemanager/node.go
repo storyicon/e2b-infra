@@ -18,7 +18,6 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/machineinfo"
-	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
 )
 
 const UnknownNomadNodeShortID = "unknown"
@@ -57,6 +56,9 @@ type Node struct {
 	meta        NodeMetadata
 
 	PlacementMetrics PlacementMetrics
+	// consecutiveCreateUnavailable is replica-local passive health evidence.
+	// A complete successful sync or create resets it.
+	consecutiveCreateUnavailable atomic.Uint32
 
 	mutex sync.RWMutex
 }
@@ -108,11 +110,7 @@ func New(
 		status: StatusInfo{Status: nodeStatus, ChangedAt: nodeStatusChangedAt},
 		meta:   nodeMetadata,
 
-		PlacementMetrics: PlacementMetrics{
-			sandboxesInProgress: smap.New[SandboxResources](),
-			createSuccess:       atomic.Uint64{},
-			createFails:         atomic.Uint64{},
-		},
+		PlacementMetrics: newPlacementMetrics(),
 	}
 
 	n.UpdateMetricsFromServiceInfoResponse(nodeInfo)
@@ -142,13 +140,9 @@ func NewClusterNode(ctx context.Context, client *clusters.GRPCClient, clusterID 
 		ID:               i.NodeID,
 		// API control-plane calls still use the cluster gRPC proxy, but edge/client
 		// proxies need the node IP address for data-plane sandbox traffic.
-		IPAddress:     i.LocalIPAddress,
-		SandboxDomain: sandboxDomain,
-		PlacementMetrics: PlacementMetrics{
-			sandboxesInProgress: smap.New[SandboxResources](),
-			createSuccess:       atomic.Uint64{},
-			createFails:         atomic.Uint64{},
-		},
+		IPAddress:        i.LocalIPAddress,
+		SandboxDomain:    sandboxDomain,
+		PlacementMetrics: newPlacementMetrics(),
 
 		client: client,
 		status: StatusInfo{Status: status, ChangedAt: info.StatusChangedAt},

@@ -25,6 +25,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"google.golang.org/grpc"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
@@ -59,13 +60,14 @@ const (
 
 	maxReadHeaderTimeout = 5 * time.Second
 	maxReadTimeout       = 10 * time.Second
-	maxWriteTimeout      = 75 * time.Second
 
-	// requestTimeout is the context deadline applied to each request.
-	// Must be less than maxWriteTimeout so the context cancels before the
+	// defaultRequestTimeout is the context deadline applied to each request
+	// when capacity waiting does not require a longer enclosing deadline.
+	// It must be less than the derived write timeout so the context cancels before the
 	// server's write deadline kills the connection (WriteTimeout does NOT
 	// cancel r.Context(); see https://github.com/golang/go/issues/59602).
-	requestTimeout = 70 * time.Second
+	defaultRequestTimeout = 70 * time.Second
+	serverTimeoutGrace    = 5 * time.Second
 
 	// This timeout should be > 600 (GCP LB upstream idle timeout) to prevent race condition
 	// https://cloud.google.com/load-balancing/docs/https#timeouts_and_retries%23:~:text=The%20load%20balancer%27s%20backend%20keepalive,is%20greater%20than%20600%20seconds
@@ -78,27 +80,44 @@ const (
 	// us off active backends.
 	shutdownDrainWait = 15 * time.Second
 
-	// shutdownTimeout caps how long s.Shutdown waits for in-flight
-	// requests to complete. Must be >= requestTimeout so a request, that
-	// arrived before load balancer stopped sending new traffic,
-	// has its full deadline to finish
-	// (e.g. a slow sandbox pause / snapshot RPC).
-	//
-	// Also caps grpc.Server.GracefulStop. After this we
-	// fall back to Stop() so a stuck stream cannot block the process
-	// past Nomad's kill_timeout.
-	shutdownTimeout = requestTimeout + 5*time.Second
-
 	// pprofShutdownTimeout is a best-effort bound for pprof drain.
 	pprofShutdownTimeout = 5 * time.Second
 )
+
+type serverTimeouts struct {
+	request  time.Duration
+	write    time.Duration
+	shutdown time.Duration
+}
+
+func registerInternalGRPCServices(server grpc.ServiceRegistrar, apiStore *handlers.APIStore, capacityToken string) {
+	proxygrpc.RegisterSandboxServiceServer(server, handlers.NewSandboxService(apiStore, false, nil))
+	proxygrpc.RegisterCapacityServiceServer(server, handlers.NewCapacityService(apiStore, capacityToken))
+}
+
+func registerEdgeGRPCServices(server grpc.ServiceRegistrar, apiStore *handlers.APIStore, verifier oauth.Verifier) {
+	proxygrpc.RegisterSandboxServiceServer(server, handlers.NewSandboxService(apiStore, true, verifier))
+}
+
+func deriveServerTimeouts(capacityWait time.Duration) serverTimeouts {
+	// Capacity waiting starts only after the request has completed its normal
+	// validation, persistence, and first placement attempt. Preserve the
+	// existing request budget for those stages, then add the configured wait.
+	request := defaultRequestTimeout + capacityWait
+
+	return serverTimeouts{
+		request:  request,
+		write:    request + serverTimeoutGrace,
+		shutdown: request + serverTimeoutGrace,
+	}
+}
 
 var (
 	commitSHA                  string
 	expectedMigrationTimestamp string
 )
 
-func NewGinServer(ctx context.Context, config cfg.Config, tel *telemetry.Client, l logger.Logger, apiStore *handlers.APIStore, redisClient redis.UniversalClient, ff *featureflags.Client, swagger *openapi3.T, port int) *http.Server {
+func NewGinServer(ctx context.Context, config cfg.Config, tel *telemetry.Client, l logger.Logger, apiStore *handlers.APIStore, redisClient redis.UniversalClient, ff *featureflags.Client, swagger *openapi3.T, port int, timeouts serverTimeouts) *http.Server {
 	// Clear out the servers array in the swagger spec, that skips validating
 	// that server names match. We don't know how this thing will be run.
 	swagger.Servers = nil
@@ -158,7 +177,7 @@ func NewGinServer(ctx context.Context, config cfg.Config, tel *telemetry.Client,
 			},
 		}),
 		gin.Recovery(),
-		sharedmiddleware.RequestTimeout(requestTimeout), //nolint:contextcheck // Gin middleware sets context via c.Request.WithContext
+		sharedmiddleware.RequestTimeout(timeouts.request), //nolint:contextcheck // Gin middleware sets context via c.Request.WithContext
 	)
 
 	r.Use(customMiddleware.CORS())
@@ -232,7 +251,7 @@ func NewGinServer(ctx context.Context, config cfg.Config, tel *telemetry.Client,
 		// Configure request timeouts.
 		ReadHeaderTimeout: maxReadHeaderTimeout,
 		ReadTimeout:       maxReadTimeout,
-		WriteTimeout:      maxWriteTimeout,
+		WriteTimeout:      timeouts.write,
 
 		// Configure timeouts to be greater than the proxy timeouts.
 		IdleTimeout: idleTimeout,
@@ -325,6 +344,7 @@ func run() int {
 
 		logger.L().Fatal(ctx, "Error parsing config", fields...)
 	}
+	timeouts := deriveServerTimeouts(config.SandboxCapacityWaitTimeout)
 
 	err = sqlcdb.CheckMigrationVersion(ctx, config.PostgresConnectionString, expectedMigration)
 	if err != nil {
@@ -440,7 +460,7 @@ func run() int {
 	}
 
 	grpcServer := e2bgrpc.NewGRPCServer(tel)
-	proxygrpc.RegisterSandboxServiceServer(grpcServer, handlers.NewSandboxService(apiStore, false, nil))
+	registerInternalGRPCServices(grpcServer, apiStore, config.CapacitySnapshotServiceToken)
 
 	edgeGrpcAddr := fmt.Sprintf("0.0.0.0:%d", config.APIEdgeGrpcPort)
 	edgeGrpcListener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", edgeGrpcAddr)
@@ -456,10 +476,10 @@ func run() int {
 	if !oauth.Configured(config.ClientProxyOIDCIssuerURL) {
 		l.Warn(ctx, "client proxy OIDC is not configured; edge proxy gRPC requests will be rejected")
 	}
-	proxygrpc.RegisterSandboxServiceServer(edgeGrpcServer, handlers.NewSandboxService(apiStore, true, clientProxyOAuthVerifier))
+	registerEdgeGRPCServices(edgeGrpcServer, apiStore, clientProxyOAuthVerifier)
 
 	// Pass ctx so in-flight requests survive the serve goroutines' exit during graceful shutdown.
-	s := NewGinServer(ctx, config, tel, l, apiStore, redisClient, featureFlags, swagger, port)
+	s := NewGinServer(ctx, config, tel, l, apiStore, redisClient, featureFlags, swagger, port, timeouts)
 
 	// ////////////////////////
 	//
@@ -563,7 +583,7 @@ func run() int {
 		drainWG := &sync.WaitGroup{}
 
 		drainWG.Go(func() {
-			httpShutdownCtx, httpShutdownCancel := context.WithTimeout(ctx, shutdownTimeout)
+			httpShutdownCtx, httpShutdownCancel := context.WithTimeout(ctx, timeouts.shutdown)
 			defer httpShutdownCancel()
 			if err := s.Shutdown(httpShutdownCtx); err != nil {
 				exitCode.Add(1)
@@ -575,13 +595,13 @@ func run() int {
 		// stuck stream would block past Nomad's kill_timeout. Fall back to
 		// Stop() after the budget elapses.
 		drainWG.Go(func() {
-			if !e2bgrpc.GracefulStopWithTimeout(grpcServer, shutdownTimeout) {
-				l.Warn(ctx, "internal gRPC forced stop after graceful timeout", zap.Duration("budget", shutdownTimeout))
+			if !e2bgrpc.GracefulStopWithTimeout(grpcServer, timeouts.shutdown) {
+				l.Warn(ctx, "internal gRPC forced stop after graceful timeout", zap.Duration("budget", timeouts.shutdown))
 			}
 		})
 		drainWG.Go(func() {
-			if !e2bgrpc.GracefulStopWithTimeout(edgeGrpcServer, shutdownTimeout) {
-				l.Warn(ctx, "edge gRPC forced stop after graceful timeout", zap.Duration("budget", shutdownTimeout))
+			if !e2bgrpc.GracefulStopWithTimeout(edgeGrpcServer, timeouts.shutdown) {
+				l.Warn(ctx, "edge gRPC forced stop after graceful timeout", zap.Duration("budget", timeouts.shutdown))
 			}
 		})
 		drainWG.Wait()

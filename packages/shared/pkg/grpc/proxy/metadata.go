@@ -11,6 +11,8 @@ const (
 	MetadataAuthorization = "authorization"
 	// ScopeSandboxLifecycle authorizes client-proxy sandbox lifecycle operations.
 	ScopeSandboxLifecycle = "sandboxes:lifecycle"
+	// ScopeCapacitySnapshot authorizes capacity-controller snapshot reads.
+	ScopeCapacitySnapshot = "capacity:snapshot"
 	// MetadataEnvdHTTPAccessToken is the HTTP header used by envd for access token authentication.
 	MetadataEnvdHTTPAccessToken = "X-Access-Token"
 )

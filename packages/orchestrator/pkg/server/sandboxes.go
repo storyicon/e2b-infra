@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -92,6 +93,31 @@ const (
 // memory restore of a snapshot that has none.
 func filesystemBoot(meta metadata.Template, req *orchestrator.SandboxCreateRequest) bool {
 	return meta.IsFilesystemOnly() || req.GetFilesystemBoot()
+}
+
+// sandboxCreateFailureError authorizes a bounded retry only when the worker
+// proves that a guest-readiness timeout was fully compensated. Cleanup and
+// unknown failures remain fail-closed.
+func sandboxCreateFailureError(err error) error {
+	message := fmt.Sprintf("failed to create sandbox: %s", err)
+	if errors.Is(err, sandbox.ErrSandboxCleanupFailed) {
+		return orchestrator.NewSandboxCreateError(
+			codes.Internal,
+			orchestrator.SandboxCreateCleanupFailedReason,
+			message,
+			false,
+		)
+	}
+	if errors.Is(err, sandbox.ErrWaitForEnvdTimeout) {
+		return orchestrator.NewSandboxCreateError(
+			codes.DeadlineExceeded,
+			orchestrator.SandboxGuestReadinessTimeoutReason,
+			message,
+			true,
+		)
+	}
+
+	return status.Error(codes.Internal, message)
 }
 
 // firecrackerSupports reports whether the sandbox's RUNNING Firecracker
@@ -194,13 +220,24 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		}
 	}
 
-	maxRunningSandboxesPerNode := s.featureFlags.IntFlag(ctx, featureflags.MaxSandboxesPerNode)
-
-	runningSandboxes := s.sandboxFactory.Sandboxes.Count()
-	if runningSandboxes >= maxRunningSandboxesPerNode {
+	maxRunningSandboxesPerNode := s.config.MaxSandboxesPerNode
+	var admitted, reservedStart bool
+	if maxRunningSandboxesPerNode > 0 {
+		admitted, reservedStart = reserveSandboxAdmission(&s.sandboxStartsInFlight, s.sandboxFactory.Sandboxes.Count, maxRunningSandboxesPerNode, 0)
+	} else {
+		// Preserve the legacy feature-flag path when the static autoscaling
+		// limit is disabled: it checks running sandboxes only and lets the
+		// independent starting semaphore govern concurrent starts.
+		maxRunningSandboxesPerNode = s.featureFlags.IntFlag(ctx, featureflags.MaxSandboxesPerNode)
+		admitted, reservedStart = reserveSandboxAdmission(&s.sandboxStartsInFlight, s.sandboxFactory.Sandboxes.Count, 0, maxRunningSandboxesPerNode)
+	}
+	if !admitted {
 		telemetry.ReportEvent(ctx, "max number of running sandboxes reached")
 
 		return nil, status.Errorf(codes.ResourceExhausted, "max number of running sandboxes on node reached (%d), please retry", maxRunningSandboxesPerNode)
+	}
+	if reservedStart {
+		defer s.sandboxStartsInFlight.Add(-1)
 	}
 
 	// Check if we've reached the max number of starting instances on this node
@@ -333,7 +370,7 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 			logger.WithFirecrackerVersion(config.FirecrackerConfig.FirecrackerVersion),
 		)
 
-		return nil, status.Errorf(codes.Internal, "failed to create sandbox: %s", err)
+		return nil, sandboxCreateFailureError(err)
 	}
 
 	s.setupSandboxLifecycle(ctx, sbx)
@@ -409,6 +446,34 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		// value whenever the flag moves.
 		ResolvedFirecrackerVersion: resolvedFCVersion,
 	}, nil
+}
+
+// reserveSandboxStart atomically accounts for creates that passed admission
+// but are not visible in the running sandbox map yet. A successful create is
+// added to that map before its in-flight reservation is released, so the sum
+// never opens a transient slot above the configured node limit.
+func reserveSandboxStart(inFlight *atomic.Int64, runningCount func() int, limit int) bool {
+	if limit <= 0 {
+		return false
+	}
+
+	for {
+		current := inFlight.Load()
+		if int64(runningCount())+current >= int64(limit) {
+			return false
+		}
+		if inFlight.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+func reserveSandboxAdmission(inFlight *atomic.Int64, runningCount func() int, staticLimit, legacyLimit int) (admitted, reservedStart bool) {
+	if staticLimit > 0 {
+		return reserveSandboxStart(inFlight, runningCount, staticLimit), true
+	}
+
+	return runningCount() < legacyLimit, false
 }
 
 func createVolumeMountModelsFromAPI(volumeMounts []*orchestrator.SandboxVolumeMount) ([]sandbox.VolumeMountConfig, error) {

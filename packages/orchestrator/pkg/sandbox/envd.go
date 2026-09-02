@@ -454,7 +454,7 @@ func (s *Sandbox) convertMounts(mounts []VolumeMountConfig) []envd.VolumeMount {
 	return results
 }
 
-func (s *Sandbox) initEnvd(ctx context.Context, startType StartType, recordMetrics bool) (e error) {
+func (s *Sandbox) initEnvd(ctx context.Context, startType StartType, recordMetrics bool) (attempts int64, e error) {
 	ctx, span := tracer.Start(ctx, "envd-init", trace.WithAttributes(telemetry.WithEnvdVersion(s.Config.Envd.Version)))
 	defer func() {
 		if e != nil {
@@ -498,7 +498,7 @@ func (s *Sandbox) initEnvd(ctx context.Context, startType StartType, recordMetri
 			envdInitCalls.Add(ctx, count, metric.WithAttributes(callAttributes(exit)...))
 		}
 
-		return fmt.Errorf("failed to init envd: %w", err)
+		return count, fmt.Errorf("failed to init envd: %w", err)
 	}
 
 	if recordMetrics && count > 1 {
@@ -535,7 +535,7 @@ func (s *Sandbox) initEnvd(ctx context.Context, startType StartType, recordMetri
 	}
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		return fmt.Errorf("failed to read envd init response body: %w", err)
+		return count, fmt.Errorf("failed to read envd init response body: %w", err)
 	}
 
 	if response.StatusCode != http.StatusNoContent {
@@ -546,7 +546,7 @@ func (s *Sandbox) initEnvd(ctx context.Context, startType StartType, recordMetri
 			zap.String("response_body", utils.Truncate(string(body), 100)),
 		)
 
-		return fmt.Errorf("unexpected status code: %d", response.StatusCode)
+		return count, fmt.Errorf("unexpected status code: %d", response.StatusCode)
 	}
 
 	logger.L().Debug(ctx, "succeeded to init envd",
@@ -558,5 +558,5 @@ func (s *Sandbox) initEnvd(ctx context.Context, startType StartType, recordMetri
 
 	span.SetStatus(codes.Ok, fmt.Sprintf("envd init returned %d", response.StatusCode))
 
-	return nil
+	return count, nil
 }

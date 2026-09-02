@@ -55,6 +55,29 @@ func (s *Storage) Add(ctx context.Context, sbx sandboxtypes.Sandbox) error {
 	return nil
 }
 
+// AddCapacity preserves the legacy Add behavior and then confirms the
+// expiration index after the record exists. This closes the narrow window in
+// which the expiration sweeper can remove the pre-written member as an orphan.
+func (s *Storage) AddCapacity(ctx context.Context, sbx sandboxtypes.Sandbox) error {
+	if err := s.Add(ctx, sbx); err != nil {
+		return err
+	}
+
+	if err := s.redisClient.ZAdd(ctx, globalExpirationSet, redis.Z{
+		Score:  float64(sbx.EndTime.UnixMilli()),
+		Member: sandboxExpirationMember(sbx),
+	}).Err(); err != nil {
+		indexErr := fmt.Errorf("failed to confirm sandbox in global expiration index: %w", err)
+		if rollbackErr := s.Remove(context.WithoutCancel(ctx), sbx.TeamID, sbx.SandboxID); rollbackErr != nil {
+			return errors.Join(indexErr, fmt.Errorf("rollback sandbox after capacity index failure: %w", rollbackErr))
+		}
+
+		return indexErr
+	}
+
+	return nil
+}
+
 // Get retrieves a sandbox from Redis
 func (s *Storage) Get(ctx context.Context, teamID uuid.UUID, sandboxID string) (sandboxtypes.Sandbox, error) {
 	key := getSandboxKey(teamID.String(), sandboxID)

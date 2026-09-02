@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,10 +22,14 @@ const (
 	// PubSub wakeup arrives
 	fallbackPollInterval = 1 * time.Second
 
-	// staleTTL is the maximum age of a pending entry before it is considered stale
-	// and cleaned up. This handles the case where an API instance crashes mid-creation.
-	// 90 seconds is well beyond any realistic sandbox creation time.
+	// staleTTL is the maximum age of a pending entry without an owner heartbeat
+	// before it is considered stale and cleaned up. This handles an API instance
+	// crashing mid-creation without limiting legitimate capacity waits.
 	staleTTL = 90 * time.Second
+
+	// reservationHeartbeatInterval keeps an active owner's reservation younger
+	// than staleTTL while a start waits for infrastructure capacity.
+	reservationHeartbeatInterval = staleTTL / 3
 )
 
 var _ sandboxtypes.ReservationStorage = (*ReservationStorage)(nil)
@@ -36,38 +41,71 @@ type Notifier interface {
 }
 
 type ReservationStorage struct {
-	redisClient redis.UniversalClient
-	notifier    Notifier
+	redisClient       redis.UniversalClient
+	notifier          Notifier
+	heartbeatInterval time.Duration
 }
 
 func NewReservationStorage(redisClient redis.UniversalClient, notifier Notifier) *ReservationStorage {
 	return &ReservationStorage{
-		redisClient: redisClient,
-		notifier:    notifier,
+		redisClient:       redisClient,
+		notifier:          notifier,
+		heartbeatInterval: reservationHeartbeatInterval,
 	}
 }
 
 func (s *ReservationStorage) Reserve(ctx context.Context, teamID uuid.UUID, sandboxID string, limit int) (finishStart func(sandboxtypes.Sandbox, error), waitForStart func(ctx context.Context) (sandboxtypes.Sandbox, error), err error) {
 	teamIDStr := teamID.String()
-	storageIndexKey := getStorageIndexKey(teamIDStr)
-	pendingSetKey := getPendingSetKey(teamIDStr)
-	resultKeyStr := getResultKey(teamIDStr, sandboxID)
-
-	now := float64(time.Now().Unix())
-	staleCutoff := float64(time.Now().Add(-staleTTL).Unix())
-
 	result, err := reserveScript.Run(ctx, s.redisClient,
-		[]string{storageIndexKey, pendingSetKey, resultKeyStr},
-		sandboxID, limit, now, staleCutoff,
+		[]string{getStorageIndexKey(teamIDStr), getPendingSetKey(teamIDStr), getResultKey(teamIDStr, sandboxID), getOwnersHashKey(teamIDStr)},
+		sandboxID, limit, float64(time.Now().Unix()), float64(time.Now().Add(-staleTTL).Unix()),
 	).Int()
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to run reserve script: %w", err)
 	}
 
+	return s.reservationResult(ctx, teamID, sandboxID, result, s.createFinishStart(ctx, teamID, sandboxID))
+}
+
+func (s *ReservationStorage) ReserveOwned(ctx context.Context, teamID uuid.UUID, sandboxID string, limit int, owner sandboxtypes.ReservationOwner) (finishStart func(sandboxtypes.Sandbox, error), waitForStart func(ctx context.Context) (sandboxtypes.Sandbox, error), err error) {
+	if owner.Token == "" || owner.CancelCause == nil {
+		return nil, nil, errors.New("reservation owner token and cancel cause are required")
+	}
+
+	teamIDStr := teamID.String()
+	storageIndexKey := getStorageIndexKey(teamIDStr)
+	pendingSetKey := getPendingSetKey(teamIDStr)
+	ownersHashKey := getOwnersHashKey(teamIDStr)
+	resultKeyStr := getResultKey(teamIDStr, sandboxID)
+
+	now := float64(time.Now().Unix())
+	staleCutoff := float64(time.Now().Add(-staleTTL).Unix())
+
+	result, err := reserveOwnedScript.Run(ctx, s.redisClient,
+		[]string{storageIndexKey, pendingSetKey, resultKeyStr, ownersHashKey},
+		sandboxID, limit, now, staleCutoff, owner.Token,
+	).Int()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to run reserve script: %w", err)
+	}
+
+	if result == reserveResultReserved {
+		stopHeartbeat := s.startReservationHeartbeat(ctx, teamID, sandboxID, owner)
+		finishOwned := s.createFinishOwnedStart(ctx, teamID, sandboxID, owner.Token)
+
+		return func(sbx sandboxtypes.Sandbox, startErr error) {
+			stopHeartbeat()
+			finishOwned(sbx, startErr)
+		}, nil, nil
+	}
+
+	return s.reservationResult(ctx, teamID, sandboxID, result, nil)
+}
+
+func (s *ReservationStorage) reservationResult(_ context.Context, teamID uuid.UUID, sandboxID string, result int, finishStart func(sandboxtypes.Sandbox, error)) (func(sandboxtypes.Sandbox, error), func(context.Context) (sandboxtypes.Sandbox, error), error) {
 	switch result {
 	case reserveResultReserved:
-		return s.createFinishStart(ctx, teamID, sandboxID), nil, nil
-
+		return finishStart, nil, nil
 	case reserveResultAlreadyInStorage:
 		return nil, nil, sandboxtypes.ErrAlreadyExists
 
@@ -82,13 +120,73 @@ func (s *ReservationStorage) Reserve(ctx context.Context, teamID uuid.UUID, sand
 	}
 }
 
+// startReservationHeartbeat refreshes an active owner's lease until creation
+// finishes or the owner context is cancelled. The Redis script is deliberately
+// update-only: a heartbeat can never resurrect a reservation removed by a
+// finish, release, or stale cleanup.
+func (s *ReservationStorage) startReservationHeartbeat(ctx context.Context, teamID uuid.UUID, sandboxID string, owner sandboxtypes.ReservationOwner) func() {
+	heartbeatCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		ticker := time.NewTicker(s.heartbeatInterval)
+		defer ticker.Stop()
+
+		pendingSetKey := getPendingSetKey(teamID.String())
+		ownersHashKey := getOwnersHashKey(teamID.String())
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case now := <-ticker.C:
+				refreshed, err := heartbeatOwnedScript.Run(
+					heartbeatCtx,
+					s.redisClient,
+					[]string{pendingSetKey, ownersHashKey},
+					sandboxID,
+					owner.Token,
+					float64(now.Unix()),
+				).Int()
+				if err != nil {
+					if heartbeatCtx.Err() == nil {
+						logger.L().Error(ctx, "failed to refresh sandbox reservation heartbeat",
+							zap.Error(err),
+							logger.WithSandboxID(sandboxID),
+						)
+						owner.CancelCause(fmt.Errorf("reservation heartbeat failed: %w", err))
+					}
+
+					return
+				}
+				if refreshed == 0 {
+					owner.CancelCause(errors.New("reservation lease is no longer owned by this request"))
+
+					return
+				}
+			}
+		}
+	}()
+
+	var stopOnce sync.Once
+
+	return func() {
+		stopOnce.Do(func() {
+			cancel()
+			<-done
+		})
+	}
+}
+
 func (s *ReservationStorage) Release(ctx context.Context, teamID uuid.UUID, sandboxID string) error {
 	teamIDStr := teamID.String()
 	pendingSetKey := getPendingSetKey(teamIDStr)
+	ownersHashKey := getOwnersHashKey(teamIDStr)
 	resultKeyStr := getResultKey(teamIDStr, sandboxID)
 
 	err := releaseScript.Run(ctx, s.redisClient,
-		[]string{pendingSetKey, resultKeyStr},
+		[]string{pendingSetKey, resultKeyStr, ownersHashKey},
 		sandboxID,
 	).Err()
 	if err != nil {
@@ -101,11 +199,58 @@ func (s *ReservationStorage) Release(ctx context.Context, teamID uuid.UUID, sand
 	return nil
 }
 
-// createFinishStart returns a callback that completes the reservation.
+func (s *ReservationStorage) releaseOwned(ctx context.Context, teamID uuid.UUID, sandboxID, ownerToken string) error {
+	teamIDStr := teamID.String()
+	err := releaseOwnedScript.Run(ctx, s.redisClient,
+		[]string{getPendingSetKey(teamIDStr), getResultKey(teamIDStr, sandboxID), getOwnersHashKey(teamIDStr)},
+		sandboxID, ownerToken,
+	).Err()
+	if err != nil {
+		return fmt.Errorf("failed to run owned release script: %w", err)
+	}
+
+	s.notifier.Publish(ctx, getReservationRoutingKey(teamIDStr, sandboxID))
+
+	return nil
+}
+
+// createFinishStart returns a callback that completes a legacy reservation.
 func (s *ReservationStorage) createFinishStart(ctx context.Context, teamID uuid.UUID, sandboxID string) func(sandboxtypes.Sandbox, error) {
 	return func(sbx sandboxtypes.Sandbox, startErr error) {
 		teamIDStr := teamID.String()
 		pendingSetKey := getPendingSetKey(teamIDStr)
+		resultKeyStr := getResultKey(teamIDStr, sandboxID)
+		routingKey := getReservationRoutingKey(teamIDStr, sandboxID)
+		bgCtx := context.WithoutCancel(ctx)
+
+		resultData, encodeErr := encodeResult(sbx, startErr)
+		if encodeErr != nil {
+			logger.L().Error(ctx, "failed to encode reservation result", zap.Error(encodeErr), logger.WithSandboxID(sandboxID))
+			_ = s.redisClient.ZRem(bgCtx, pendingSetKey, sandboxID).Err()
+			s.notifier.Publish(bgCtx, routingKey)
+
+			return
+		}
+
+		if err := finishStartScript.Run(bgCtx, s.redisClient,
+			[]string{pendingSetKey, resultKeyStr},
+			sandboxID, resultData, int(resultTTL.Seconds()),
+		).Err(); err != nil {
+			logger.L().Error(ctx, "failed to run finishStart script", zap.Error(err), logger.WithSandboxID(sandboxID))
+
+			return
+		}
+
+		s.notifier.Publish(bgCtx, routingKey)
+	}
+}
+
+// createFinishOwnedStart returns a callback that completes an owned reservation.
+func (s *ReservationStorage) createFinishOwnedStart(ctx context.Context, teamID uuid.UUID, sandboxID, ownerToken string) func(sandboxtypes.Sandbox, error) {
+	return func(sbx sandboxtypes.Sandbox, startErr error) {
+		teamIDStr := teamID.String()
+		pendingSetKey := getPendingSetKey(teamIDStr)
+		ownersHashKey := getOwnersHashKey(teamIDStr)
 		resultKeyStr := getResultKey(teamIDStr, sandboxID)
 		routingKey := getReservationRoutingKey(teamIDStr, sandboxID)
 
@@ -119,7 +264,10 @@ func (s *ReservationStorage) createFinishStart(ctx context.Context, teamID uuid.
 			)
 
 			// Still try to remove from pending even if encoding fails.
-			_ = s.redisClient.ZRem(bgCtx, pendingSetKey, sandboxID).Err()
+			_ = releaseOwnedScript.Run(bgCtx, s.redisClient,
+				[]string{pendingSetKey, resultKeyStr, ownersHashKey},
+				sandboxID, ownerToken,
+			).Err()
 
 			// Wake waiters so they can observe that the reservation is gone.
 			s.notifier.Publish(bgCtx, routingKey)
@@ -128,15 +276,20 @@ func (s *ReservationStorage) createFinishStart(ctx context.Context, teamID uuid.
 		}
 
 		ttlSeconds := int(resultTTL.Seconds())
-		err := finishStartScript.Run(bgCtx, s.redisClient,
-			[]string{pendingSetKey, resultKeyStr},
-			sandboxID, resultData, ttlSeconds,
-		).Err()
+		finished, err := finishOwnedStartScript.Run(bgCtx, s.redisClient,
+			[]string{pendingSetKey, resultKeyStr, ownersHashKey},
+			sandboxID, ownerToken, resultData, ttlSeconds,
+		).Int()
 		if err != nil {
 			logger.L().Error(ctx, "failed to run finishStart script",
 				zap.Error(err),
 				logger.WithSandboxID(sandboxID),
 			)
+
+			return
+		}
+		if finished == 0 {
+			logger.L().Warn(ctx, "reservation finish ignored after ownership changed", logger.WithSandboxID(sandboxID))
 
 			return
 		}

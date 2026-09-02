@@ -32,6 +32,25 @@ func TestBasicAcquireTryRelease(t *testing.T) {
 	require.True(t, got, "TryAcquire should succeed after Release")
 }
 
+func TestAdjustableSemaphoreSnapshotTracksCurrentState(t *testing.T) {
+	t.Parallel()
+
+	s, err := NewAdjustableSemaphore(16)
+	require.NoError(t, err)
+
+	used, limit := s.Snapshot()
+	require.Equal(t, int64(0), used)
+	require.Equal(t, int64(16), limit)
+
+	require.True(t, s.TryAcquire(12))
+	require.NoError(t, s.SetLimit(8))
+
+	used, limit = s.Snapshot()
+	require.Equal(t, int64(12), used, "lowering the limit must not cancel existing usage")
+	require.Equal(t, int64(8), limit)
+	require.False(t, s.TryAcquire(1), "new usage must wait until the semaphore converges below its new limit")
+}
+
 // -----------------------------------------------------------------------------
 // Acquire with limit changes
 // -----------------------------------------------------------------------------

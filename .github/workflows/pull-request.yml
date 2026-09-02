@@ -78,7 +78,10 @@ jobs:
             openapi-inputs:
               - 'spec/openapi*.yml'
               - 'packages/envd/spec/envd.yaml'
-              - '.github/**'
+              # Only validation-specific CI changes affect OpenAPI linting.
+              # Unrelated test/lint workflow edits must not expose baseline
+              # spec failures as regressions in those changes.
+              - '.github/workflows/validate-openapi.yml'
               - '.tool-versions'
 
       # dorny/paths-filter can't express "packages but not CHANGELOG" (it OR's
@@ -121,6 +124,7 @@ jobs:
     uses: ./.github/workflows/pr-tests.yml
     with:
       run-tests: ${{ contains(fromJSON(needs.detect-changes.outputs.changed-scopes), 'test-inputs') && needs.detect-changes.outputs.docs-only != 'true' }}
+      use_specialized_runners: ${{ github.repository == 'e2b-dev/infra' }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
   terraform-validation:
@@ -133,6 +137,7 @@ jobs:
     uses: ./.github/workflows/pr-tests-arm64.yml
     with:
       run-tests: ${{ contains(fromJSON(needs.detect-changes.outputs.changed-scopes), 'test-inputs') && needs.detect-changes.outputs.docs-only != 'true' }}
+      use_specialized_runners: ${{ github.repository == 'e2b-dev/infra' }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
   integration-tests:
@@ -141,7 +146,9 @@ jobs:
     with:
       # Only publish the results for same-repo PRs
       publish: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
-      run-tests: ${{ contains(fromJSON(needs.detect-changes.outputs.changed-scopes), 'integration-inputs') && needs.detect-changes.outputs.docs-only != 'true' }}
+      # The integration suite requires the upstream repository's dedicated KVM
+      # runner. Forks validate portable unit, lint, and cross-compile coverage.
+      run-tests: ${{ github.repository == 'e2b-dev/infra' && contains(fromJSON(needs.detect-changes.outputs.changed-scopes), 'integration-inputs') && needs.detect-changes.outputs.docs-only != 'true' }}
       # PRs shard the full-suite uncompressed config across parallel runners
       # for wall time (the compressed configs run their allow-list unsharded
       # either way); push to main runs all three configs unsharded.

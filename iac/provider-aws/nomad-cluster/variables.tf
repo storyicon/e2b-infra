@@ -143,6 +143,19 @@ variable "client_cluster_size" {
   type = number
 }
 
+variable "client_cluster_min_size" {
+  type = number
+}
+
+variable "client_cluster_max_size" {
+  type = number
+}
+
+variable "capacity_autoscaler_enabled" {
+  type    = bool
+  default = false
+}
+
 variable "client_machine_type" {
   type = string
 }

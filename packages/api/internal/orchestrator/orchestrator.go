@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -23,9 +24,13 @@ import (
 	redisreservations "github.com/e2b-dev/infra/packages/api/internal/sandbox/reservations/redis"
 	redisbackend "github.com/e2b-dev/infra/packages/api/internal/sandbox/storage/redis"
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
+	capacitydemand "github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand"
+	"github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand/startintent"
+	"github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand/workload"
 	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/machineinfo"
 	e2bcatalog "github.com/e2b-dev/infra/packages/shared/pkg/sandbox-catalog"
 	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
@@ -59,10 +64,26 @@ type Orchestrator struct {
 	sandboxCountGaugeRegistration metric.Registration
 	createdSandboxesCounter       metric.Int64Counter
 	resumeOriginNodeRemapCounter  metric.Int64Counter
+	startIntentLifecycleCounter   metric.Int64Counter
+	workloadLifecycleCounter      metric.Int64Counter
 	teamMetricsObserver           *metrics.TeamObserver
 	accessTokenGenerator          *sandbox.AccessTokenGenerator
 	createdCounter                metric.Int64Counter
 	snapshotCache                 SnapshotCacheInvalidator
+	capacityWaiter                *capacityWaiter
+	capacityDemandMode            cfg.SandboxCapacityDemandMode
+	capacityWaitTimeout           time.Duration
+	capacityRetryInterval         time.Duration
+	capacityPoolVCPU              int64
+	capacityPoolMemoryMiB         int64
+	capacityPoolCPU               machineinfo.MachineInfo
+	startIntentStore              startIntentStore
+	startIntentLeaseTTL           time.Duration
+	startIntentHeartbeatInterval  time.Duration
+	startIntentHandoffTTL         time.Duration
+	runningSandboxReader          runningSandboxReader
+	workloadLeaseStore            workloadLeaseStore
+	workloadCounter               workloadCounter
 
 	snapshotUpsertSem *utils.AdjustableSemaphore
 	redisStorage      *redisbackend.Storage
@@ -96,6 +117,12 @@ type Orchestrator struct {
 	// same string, and nesting Do calls for the same key on the same Group would
 	// block forever.
 	discoveryGroup singleflight.Group
+
+	// capacityRefreshes bounds on-demand discovery to one completed or active
+	// refresh per cluster and retry interval. singleflight alone only merges
+	// callers whose requests overlap in time.
+	capacityRefreshMu sync.Mutex
+	capacityRefreshes map[string]time.Time
 }
 
 func New(
@@ -153,6 +180,7 @@ func New(
 	// Local cluster is used for single-node setups instead
 	skipNomadSync := env.IsLocal()
 
+	workloadRedisStore := workload.NewRedisStore(redisClient)
 	o := Orchestrator{
 		httpClient:           httpClient,
 		analytics:            analyticsInstance,
@@ -168,6 +196,28 @@ func New(
 		tel:                  tel,
 		clusters:             clusters,
 		redisStorage:         redisStorage,
+		capacityWaiter: newCapacityWaiter(
+			capacitydemand.NewRedisStore(redisClient),
+			config.SandboxCapacityWaitTimeout,
+			config.SandboxCapacityRetryInterval,
+		),
+		capacityDemandMode:    config.SandboxCapacityDemandMode,
+		capacityWaitTimeout:   config.SandboxCapacityWaitTimeout,
+		capacityRetryInterval: config.SandboxCapacityRetryInterval,
+		capacityPoolVCPU:      config.SandboxCapacityPoolVCPU,
+		capacityPoolMemoryMiB: config.SandboxCapacityPoolMemoryMiB,
+		capacityPoolCPU: machineinfo.MachineInfo{
+			CPUArchitecture: config.SandboxCapacityPoolCPUArch,
+			CPUFamily:       config.SandboxCapacityPoolCPUFamily,
+			CPUModel:        config.SandboxCapacityPoolCPUModel,
+		},
+		startIntentStore:             startintent.NewRedisStore(redisClient),
+		startIntentLeaseTTL:          defaultStartIntentLeaseTTL,
+		startIntentHeartbeatInterval: defaultStartIntentHeartbeatInterval,
+		startIntentHandoffTTL:        defaultStartIntentHandoffTTL,
+		runningSandboxReader:         redisStorage,
+		workloadLeaseStore:           workloadRedisStore,
+		workloadCounter:              workloadRedisStore,
 
 		createdCounter: createdCounter,
 
@@ -210,6 +260,24 @@ func New(
 		logger.L().Error(ctx, "Failed to setup metrics", zap.Error(err))
 
 		return nil, fmt.Errorf("failed to setup metrics: %w", err)
+	}
+	if usesWorkloadLedger(config.SandboxCapacityDemandMode) {
+		go func() {
+			if err := workloadRedisStore.RunSweeper(ctx, time.Minute, 256, func(clusterID string, removed int64, err error) {
+				if err != nil {
+					o.recordWorkloadLifecycle(ctx, "sweep", "error")
+					logger.L().Warn(ctx, "failed to sweep expired workload leases", zap.Error(err), zap.String("cluster_id", clusterID))
+
+					return
+				}
+				o.recordWorkloadLifecycle(ctx, "sweep", "success")
+				if removed > 0 {
+					logger.L().Info(ctx, "expired workload leases swept", zap.String("cluster_id", clusterID), zap.Int64("removed", removed))
+				}
+			}); err != nil {
+				logger.L().Error(ctx, "workload lease sweeper stopped", zap.Error(err))
+			}
+		}()
 	}
 
 	go o.startStatusLogging(ctx)

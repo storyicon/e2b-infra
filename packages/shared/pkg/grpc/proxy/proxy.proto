@@ -18,7 +18,27 @@ message SandboxResumeResponse {
   string orchestrator_ip = 1;
 }
 
+// Request for the cluster-scoped sandbox workload used by the capacity
+// controller. This service is registered on the private internal gRPC listener.
+message CapacitySnapshotRequest {
+  string cluster_id = 1;
+}
+
+// Aggregated counts deliberately omit sandbox IDs and customer metadata.
+message CapacitySnapshotResponse {
+  uint64 workload_count = 1;
+  uint64 running_count = 2;
+  uint64 active_intent_count = 3;
+  uint64 overlap_count = 4;
+}
+
 // SandboxService is used by the client-proxy to resume sandboxes.
 service SandboxService {
   rpc ResumeSandbox(SandboxResumeRequest) returns (SandboxResumeResponse);
+}
+
+// CapacityService exposes the minimum private contract required for node
+// scale-out reconciliation.
+service CapacityService {
+  rpc GetCapacitySnapshot(CapacitySnapshotRequest) returns (CapacitySnapshotResponse);
 }

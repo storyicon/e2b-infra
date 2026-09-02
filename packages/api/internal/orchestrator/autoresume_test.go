@@ -33,7 +33,7 @@ func newTestAutoResumeOrchestrator(t *testing.T) *Orchestrator {
 			storage,
 			redisreservations.NewReservationStorage(client, storage.Notifier()),
 			sandbox.Callbacks{
-				AddSandboxToRoutingTable: func(context.Context, sandbox.Sandbox) {},
+				AddSandboxToRoutingTable: func(context.Context, sandbox.Sandbox) error { return nil },
 				AsyncNewlyCreatedSandbox: func(context.Context, sandbox.Sandbox, sandbox.CreationMetadata) {},
 			},
 		),

@@ -48,6 +48,7 @@ jobs:
     uses: ./.github/workflows/pr-tests.yml
     with:
       run-tests: ${{ contains(fromJSON(needs.detect-changes.outputs.changed-scopes), 'test-inputs') }}
+      use_specialized_runners: ${{ github.repository == 'e2b-dev/infra' }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
   terraform-validation:

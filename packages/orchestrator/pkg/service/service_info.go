@@ -21,16 +21,22 @@ import (
 type Server struct {
 	orchestratorinfo.UnimplementedInfoServiceServer
 
-	info        *ServiceInfo
-	sandboxes   *sandbox.Map
-	hostMetrics *metrics.HostMetrics
+	info                *ServiceInfo
+	sandboxes           *sandbox.Map
+	hostMetrics         *metrics.HostMetrics
+	createLimitProvider SandboxCreateLimitProvider
 }
 
-func NewInfoService(info *ServiceInfo, sandboxes *sandbox.Map, hostMetrics *metrics.HostMetrics) *Server {
+type SandboxCreateLimitProvider interface {
+	SandboxCreateConcurrencyLimit() uint64
+}
+
+func NewInfoService(info *ServiceInfo, sandboxes *sandbox.Map, hostMetrics *metrics.HostMetrics, createLimitProvider SandboxCreateLimitProvider) *Server {
 	return &Server{
-		info:        info,
-		sandboxes:   sandboxes,
-		hostMetrics: hostMetrics,
+		info:                info,
+		sandboxes:           sandboxes,
+		hostMetrics:         hostMetrics,
+		createLimitProvider: createLimitProvider,
 	}
 }
 
@@ -70,10 +76,11 @@ func (s *Server) ServiceInfo(ctx context.Context, _ *emptypb.Empty) (*orchestrat
 	serviceStatus := info.GetStatus()
 
 	return &orchestratorinfo.ServiceInfoResponse{
-		NodeId:                 info.ClientId,
-		ServiceId:              info.ServiceId,
-		ServiceStatus:          serviceStatus.Status,
-		ServiceStatusChangedAt: timestamppb.New(serviceStatus.ChangedAt),
+		NodeId:                        info.ClientId,
+		ServiceId:                     info.ServiceId,
+		ServiceStatus:                 serviceStatus.Status,
+		ServiceStatusChangedAt:        timestamppb.New(serviceStatus.ChangedAt),
+		SandboxCreateConcurrencyLimit: s.createLimitProvider.SandboxCreateConcurrencyLimit(),
 
 		ServiceVersion: info.SourceVersion,
 		ServiceCommit:  info.SourceCommit,
