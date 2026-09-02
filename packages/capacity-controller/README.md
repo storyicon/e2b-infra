@@ -1,8 +1,9 @@
 # Capacity controller
 
-The capacity controller scales an AWS Auto Scaling group out from E2B's
-cluster-scoped sandbox workload. It does not scale in and it does not accept
-public traffic. `CAPACITY_DEMAND_MODE` selects exactly one input:
+The capacity controller scales an AWS Auto Scaling group from E2B's
+cluster-scoped sandbox workload. Scale-out is always available. Safe scale-in
+is separately gated and disabled by default. The process accepts no public
+traffic. `CAPACITY_DEMAND_MODE` selects exactly one input:
 
 - `legacy-failure-ledger` reads pending, fulfilled, and direct-success state
   from Redis.
@@ -42,6 +43,46 @@ Current ASG desired includes nodes that are starting but not yet Nomad ready,
 so low ready count does not request the same nodes twice. This mode has no
 process-local burst baseline and recomputes the same target after restart.
 
+## Safe scale-in
+
+Safe scale-in is available only with `start-intent-v1` and has three explicit
+modes:
+
+- `off` performs no scale-in reads or writes and is the default.
+- `observe` calculates candidates and budgets without changing Nomad, workers,
+  or AWS.
+- `enforce` runs a bounded, recoverable drain transaction.
+
+The controller retains workload headroom and requires excess accepting capacity
+to remain stable before opening a drain. Candidate summaries are only a cheap
+filter. Each transaction then binds the Nomad node, EC2 instance, and worker
+service-instance identity and follows this order:
+
+```text
+owned Nomad drain -> worker Draining -> live empty verification
+                  -> final workload/Nomad/worker/ASG re-read
+                  -> exact EC2 instance termination
+```
+
+The worker rejects new create/resume admissions once Draining wins its admission
+lock. It reports `shutdown_ready` only after live sandboxes, starts/resumes,
+lifecycle cleanup, and snapshot uploads all reach zero. The API additionally
+requires a fresh `Sandbox.List` to be empty. The controller never migrates or
+kills a sandbox to make a node empty.
+
+At most 50 owned operations may be active. Empty workers may use that rolling
+window; non-empty graceful drains are additionally limited to 10% of ready
+workers. A demand increase stops new drains and restores enough uncommitted
+workers in Nomad-before-worker order. Scale-out keeps its existing raw workload
+formula if any scale-in observation fails.
+
+The irreversible write is
+`TerminateInstanceInAutoScalingGroup(ShouldDecrementDesiredCapacity=true)` for
+the exact verified instance. The SDK does not retry it, and there is no
+`SetDesiredCapacity` scale-in fallback. Explicit AWS rejection restores the
+owned drain; an ambiguous transport outcome stays isolated and is reconciled by
+ASG membership and scaling-activity reads.
+
 Run one controller replica. Legacy burst state remains process-local for the
 explicit rollback mode.
 
@@ -73,14 +114,22 @@ Optional:
 - `MIN_NODES` (default `1`)
 - `MAX_NODES` (default `30`)
 - `RECONCILE_INTERVAL` (default `1s`)
+- `SCALE_IN_MODE` (`off`, `observe`, or `enforce`; default `off`)
+- `SCALE_IN_HEADROOM_PERCENT` (default `10`)
+- `SCALE_IN_STABILIZATION_DURATION` (default `2m`)
+- `SCALE_IN_MIN_NODE_AGE` (default `10m`)
+- `SCALE_IN_DRAIN_TIMEOUT` (default `15m`)
 
 Nomad configuration uses the standard Nomad client environment variables,
 including `NOMAD_ADDR`, `NOMAD_TOKEN`, `NOMAD_CACERT`, `NOMAD_CLIENT_CERT`, and
 `NOMAD_CLIENT_KEY`. AWS credentials use the default AWS SDK credential chain;
 no credential is accepted as a controller-specific setting.
 
-The runtime role only needs read access to the configured ASG plus
-`autoscaling:SetDesiredCapacity` for that exact group. Redis authentication
+The runtime role needs ASG/EC2 describe access plus
+`autoscaling:SetDesiredCapacity` for the exact configured ASG. Terraform adds
+`autoscaling:TerminateInstanceInAutoScalingGroup` for that group only when
+`SCALE_IN_MODE=enforce`; off and observe deployments do not receive it.
+The Nomad token needs node write access to the configured node pool. Redis authentication
 must use TLS; the shared Redis factory rejects a plaintext password. The
 capacity snapshot address must resolve to the API's private internal gRPC
 listener. The service token is sent as bearer metadata and is never logged.

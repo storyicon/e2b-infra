@@ -70,3 +70,12 @@ func TestSandboxCreateErrorInfoRejectsAnotherDomain(t *testing.T) {
 	_, ok := SandboxCreateErrorInfo(st.Err())
 	require.False(t, ok)
 }
+
+func TestSandboxNodeDrainingRequiresStructuredResourceExhaustedDetail(t *testing.T) {
+	t.Parallel()
+
+	err := NewSandboxCreateError(codes.ResourceExhausted, SandboxNodeDrainingReason, "node is draining", true)
+	require.True(t, IsSandboxNodeDraining(err))
+	require.False(t, IsSandboxNodeDraining(status.Error(codes.ResourceExhausted, "node_draining")))
+	require.False(t, IsSandboxNodeDraining(NewSandboxCreateError(codes.Internal, SandboxNodeDrainingReason, "node is draining", false)))
+}

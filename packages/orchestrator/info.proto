@@ -53,6 +53,8 @@ message ServiceInfoResponse {
   // Effective concurrent Sandbox.Create limit enforced by this worker.
   // Zero means the worker predates this field and did not advertise a limit.
   uint64 sandbox_create_concurrency_limit = 57;
+  // Safe scale-in fields are authoritative only when this capability is true.
+  bool safe_scale_in_supported = 58;
 
   int64 metric_vcpu_used = 101 [deprecated = true];
   int64 metric_memory_used_mb = 102 [deprecated = true];
@@ -80,10 +82,17 @@ message ServiceInfoResponse {
   uint64 metric_hugepages_used = 115;
   uint64 metric_hugepages_reserved = 116;
   uint64 metric_hugepage_size_bytes = 117;
+
+  uint64 sandbox_starts_in_flight = 118;
+  uint64 lifecycle_cleanups_in_flight = 119;
+  uint64 snapshot_uploads_in_flight = 120;
+  bool shutdown_ready = 121;
 }
 
 message ServiceStatusChangeRequest {
   ServiceInfoStatus service_status = 2;
+  // When set, the worker changes status only if this process identity matches.
+  string expected_service_id = 3;
 }
 
 service InfoService {

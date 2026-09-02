@@ -31,8 +31,8 @@ type MapSubscriber interface {
 //     sandbox from MarkRunning until MarkStopping. It serves the API/proxy
 //     lookup paths (Get, Items, Count).
 //   - lifecycles: keyed by sandboxID/lifecycleID, holds every lifecycle whose
-//     cleanup is still outstanding, from MarkRunning until MarkStopped in
-//     Close. During checkpoint/resume an old lifecycle can still be cleaning
+//     cleanup is still outstanding, from TrackLifecycle (or MarkRunning) until
+//     MarkStopped in Close. During checkpoint/resume an old lifecycle can still be cleaning
 //     up while a new lifecycle with the same sandboxID is already live, so a
 //     sandboxID can map to multiple lifecycle entries. Shutdown uses this set
 //     (WaitLifecycles, LifecycleItems) to wait for cleanup to finish, not
@@ -41,6 +41,8 @@ type MapSubscriber interface {
 //     NetworkReleased, serving GetByHostPort lookups.
 //
 // Invariant: live is a subset of lifecycles; MarkRunning inserts into both.
+// TrackLifecycle may insert into lifecycles before a deferred-registration
+// sandbox is safe to expose through live routing.
 // The live and lifecycles maps could later be merged into a single registry
 // keyed by sandboxID/lifecycleID with a running/stopping state per entry;
 // they are kept separate for now to stay close to the pre-existing live-map
@@ -92,6 +94,11 @@ func (m *Map) Items() map[string]*Sandbox {
 
 func (m *Map) Count() int {
 	return m.live.Count()
+}
+
+// LifecycleCount includes live and asynchronously stopping sandbox lifecycles.
+func (m *Map) LifecycleCount() int {
+	return m.lifecycles.Count()
 }
 
 func (m *Map) Get(sandboxID string) (*Sandbox, bool) {
@@ -155,9 +162,17 @@ func (m *Map) AssignNetwork(ctx context.Context, sbx *Sandbox) {
 	)
 }
 
-func (m *Map) trackLifecycle(ctx context.Context, sbx *Sandbox) {
+// TrackLifecycle records cleanup ownership without making the sandbox live or
+// routable. It is used by deferred-registration resume paths before post-init
+// work that may fail and require asynchronous teardown.
+func (m *Map) TrackLifecycle(ctx context.Context, sbx *Sandbox) {
 	m.lifecycleMu.Lock()
-	m.lifecycles.Insert(sandboxLifecycleKey(sbx.Runtime.SandboxID, sbx.LifecycleID), sbx)
+	inserted := m.lifecycles.InsertIfAbsent(sandboxLifecycleKey(sbx.Runtime.SandboxID, sbx.LifecycleID), sbx)
+	if !inserted {
+		m.lifecycleMu.Unlock()
+
+		return
+	}
 	m.notifyLifecycleChangeLocked()
 	m.lifecycleMu.Unlock()
 
@@ -174,7 +189,7 @@ func (m *Map) MarkRunning(ctx context.Context, sbx *Sandbox) {
 		return
 	}
 
-	m.trackLifecycle(ctx, sbx)
+	m.TrackLifecycle(ctx, sbx)
 
 	m.trigger(ctx, func(ctx context.Context, s MapSubscriber) {
 		s.OnInsert(ctx, sbx)

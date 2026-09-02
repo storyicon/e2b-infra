@@ -25,18 +25,51 @@ type Server struct {
 	sandboxes           *sandbox.Map
 	hostMetrics         *metrics.HostMetrics
 	createLimitProvider SandboxCreateLimitProvider
+	shutdownActivity    ShutdownActivityProvider
 }
 
 type SandboxCreateLimitProvider interface {
 	SandboxCreateConcurrencyLimit() uint64
 }
 
-func NewInfoService(info *ServiceInfo, sandboxes *sandbox.Map, hostMetrics *metrics.HostMetrics, createLimitProvider SandboxCreateLimitProvider) *Server {
+type ShutdownActivityProvider interface {
+	SnapshotUploadsInFlight() uint64
+}
+
+type ShutdownState struct {
+	ServiceStatus         ServiceStatus
+	LiveSandboxes         uint64
+	SandboxStartsInFlight uint64
+	LifecycleCleanups     uint64
+	SnapshotUploads       uint64
+	Ready                 bool
+}
+
+func SnapshotShutdownState(info *ServiceInfo, sandboxes *sandbox.Map, activity ShutdownActivityProvider) ShutdownState {
+	admission := info.GetAdmissionState()
+	state := ShutdownState{
+		ServiceStatus:         admission.Status,
+		LiveSandboxes:         uint64(sandboxes.Count()),
+		SandboxStartsInFlight: admission.SandboxStartsInFlight,
+		LifecycleCleanups:     uint64(sandboxes.LifecycleCount()),
+		SnapshotUploads:       activity.SnapshotUploadsInFlight(),
+	}
+	state.Ready = admission.Status.Status == orchestratorinfo.ServiceInfoStatus_Draining &&
+		state.LiveSandboxes == 0 &&
+		state.SandboxStartsInFlight == 0 &&
+		state.LifecycleCleanups == 0 &&
+		state.SnapshotUploads == 0
+
+	return state
+}
+
+func NewInfoService(info *ServiceInfo, sandboxes *sandbox.Map, hostMetrics *metrics.HostMetrics, createLimitProvider SandboxCreateLimitProvider, shutdownActivity ShutdownActivityProvider) *Server {
 	return &Server{
 		info:                info,
 		sandboxes:           sandboxes,
 		hostMetrics:         hostMetrics,
 		createLimitProvider: createLimitProvider,
+		shutdownActivity:    shutdownActivity,
 	}
 }
 
@@ -73,14 +106,19 @@ func (s *Server) ServiceInfo(ctx context.Context, _ *emptypb.Empty) (*orchestrat
 		sandboxDiskAllocated += uint64(item.Config.TotalDiskSizeMB) * 1024 * 1024
 	}
 
-	serviceStatus := info.GetStatus()
+	shutdownState := SnapshotShutdownState(info, s.sandboxes, s.shutdownActivity)
 
 	return &orchestratorinfo.ServiceInfoResponse{
 		NodeId:                        info.ClientId,
 		ServiceId:                     info.ServiceId,
-		ServiceStatus:                 serviceStatus.Status,
-		ServiceStatusChangedAt:        timestamppb.New(serviceStatus.ChangedAt),
+		ServiceStatus:                 shutdownState.ServiceStatus.Status,
+		ServiceStatusChangedAt:        timestamppb.New(shutdownState.ServiceStatus.ChangedAt),
 		SandboxCreateConcurrencyLimit: s.createLimitProvider.SandboxCreateConcurrencyLimit(),
+		SafeScaleInSupported:          true,
+		SandboxStartsInFlight:         shutdownState.SandboxStartsInFlight,
+		LifecycleCleanupsInFlight:     shutdownState.LifecycleCleanups,
+		SnapshotUploadsInFlight:       shutdownState.SnapshotUploads,
+		ShutdownReady:                 shutdownState.Ready,
 
 		ServiceVersion: info.SourceVersion,
 		ServiceCommit:  info.SourceCommit,
@@ -94,7 +132,7 @@ func (s *Server) ServiceInfo(ctx context.Context, _ *emptypb.Empty) (*orchestrat
 		MetricCpuAllocated:         sandboxVCpuAllocated,
 		MetricMemoryAllocatedBytes: sandboxMemoryAllocated,
 		MetricDiskAllocatedBytes:   sandboxDiskAllocated,
-		MetricSandboxesRunning:     uint32(s.sandboxes.Count()),
+		MetricSandboxesRunning:     uint32(shutdownState.LiveSandboxes),
 
 		// Host system usage metrics
 		MetricCpuPercent:      uint32(cpuMetrics.UsedPercent),
@@ -149,8 +187,12 @@ func convertMachineInfo(machineInfo machineinfo.MachineInfo) *orchestratorinfo.M
 
 func (s *Server) ServiceStatusOverride(ctx context.Context, req *orchestratorinfo.ServiceStatusChangeRequest) (*emptypb.Empty, error) {
 	logger.L().Info(ctx, "service status override request received", zap.String("status", req.GetServiceStatus().String()))
-	if !s.info.OverrideStatus(ctx, req.GetServiceStatus()) {
-		return nil, status.Error(codes.FailedPrecondition, "cannot change node status from draining to standby")
+	applied, identityMatched := s.info.OverrideStatusForService(ctx, req.GetServiceStatus(), req.GetExpectedServiceId())
+	if !identityMatched {
+		return nil, status.Error(codes.FailedPrecondition, "service instance identity changed")
+	}
+	if !applied {
+		return nil, status.Error(codes.FailedPrecondition, "service status transition is no longer valid")
 	}
 
 	return &emptypb.Empty{}, nil

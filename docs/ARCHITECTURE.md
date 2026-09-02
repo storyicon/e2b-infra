@@ -44,7 +44,7 @@ flowchart TB
         API["API<br/>REST :80, gRPC :5009/:5109"]
         DashAPI["dashboard-api :3010"]
         CP["client-proxy<br/>:3002"]
-        CC["capacity-controller<br/>AWS scale-out only"]
+        CC["capacity-controller<br/>AWS scale-out + safe scale-in"]
     end
 
     subgraph datastores["State"]
@@ -81,6 +81,9 @@ flowchart TB
     API -->|"start-intent leases"| RD
     CC -->|"authenticated capacity snapshot"| API
     CC -->|"SetDesiredCapacity"| ASG["AWS client-node ASG"]
+    CC -->|"private drain/verify RPC"| API
+    CC -->|"owned drain metadata"| ORCH
+    CC -->|"exact instance termination"| ASG
     DashAPI --> PG & CH
     ORCH --> OS & CH
     TM --> OS
@@ -96,7 +99,7 @@ flowchart TB
 | Client proxy | `packages/client-proxy` | API nodes | Edge router: sandbox URL → correct node |
 | Envd | `packages/envd` | inside every VM | In-VM agent: process/filesystem API for SDKs |
 | Dashboard API | `packages/dashboard-api` | API nodes | Backend for the web dashboard (teams, builds, admin) |
-| Capacity controller | `packages/capacity-controller` | one API node allocation (AWS, optional) | Converts the API's de-duplicated running + start-intent workload snapshot into scale-out-only client ASG capacity |
+| Capacity controller | `packages/capacity-controller` | one API node allocation (AWS, optional) | Scales the client ASG out from de-duplicated workload and optionally reclaims verified-empty workers through an owned drain transaction |
 
 Supporting packages: `packages/shared` (protos, telemetry, storage clients, feature flags),
 `packages/auth` (authentication library), `packages/db` (Postgres migrations + sqlc queries),
@@ -189,7 +192,9 @@ gRPC services on :5008 (`pkg/server/`, `pkg/service/`, `pkg/template/server/`, `
 - **SandboxService** — `Create`, `Update`, `List`, `Delete`, `Pause`, `Checkpoint`.
 - **TemplateService** — `TemplateCreate`, `TemplateBuildStatus`, `TemplateBuildDelete` (template-manager role only).
 - **InfoService** — node identity, roles, capacity, health status, and the worker's current effective
-  concurrent Sandbox create limit (used by API node discovery and early create backpressure).
+  concurrent Sandbox create limit (used by API node discovery and early create backpressure). New
+  workers also advertise safe-scale-in support and one authoritative shutdown snapshot: live
+  Sandboxes, admitted starts/resumes, lifecycle cleanups, snapshot uploads, and `shutdown_ready`.
 - **ChunkService / VolumeService** — peer-to-peer template chunk serving; persistent volumes.
 
 Key mechanisms (all under `pkg/sandbox/`):
@@ -201,6 +206,13 @@ Key mechanisms (all under `pkg/sandbox/`):
   count check and insertion into the running map, so concurrent creates cannot exceed that
   configured node limit. This worker-side admission is the final authority across all API replicas;
   API-side reservations only prevent avoidable request herding before the RPC reaches the worker.
+
+  Safe scale-in changes the worker from Healthy to Draining under the same synchronization boundary
+  used by create/resume admission. A request admitted first is included in the worker's in-flight
+  count; a drain that wins first rejects the request before VM or network allocation with the
+  structured retry-safe reason `NODE_DRAINING`. `shutdown_ready` becomes true only while Draining
+  and when live Sandboxes, admitted starts/resumes, lifecycle cleanups, and snapshot uploads are all
+  zero. Missing capability fields and contradictory counts fail closed.
 
 - **Firecracker** (`fc/`): each sandbox is one Firecracker process in its own cgroup and network
   namespace. The FC HTTP API (unix socket) configures machine, drives, network, and snapshots.
@@ -537,7 +549,7 @@ flowchart TB
     LB --> apipool
     AJ -->|gRPC| OJ & TJ
     CCJ -->|private authenticated gRPC| AJ
-    CCJ -->|SetDesiredCapacity on named ASG| clientpool
+    CCJ -->|scale out or terminate an exact verified instance| clientpool
     NS -.->|schedules jobs| apipool & clientpool & buildpool & chpool
 ```
 
@@ -553,9 +565,29 @@ flowchart TB
   `max(currentDesired, ceil(workloadCount / slotsPerNode))`, clamps it to explicit min/max, and only
   raises the named client ASG. Snapshot errors produce no ASG write and no automatic legacy
   fallback. Ready Nomad count is diagnostic: already-requested but not-ready EC2 capacity is covered
-  by ASG desired and is not requested twice. The controller has no listener or public route and
-  never scales in. The legacy failure-ledger reader remains isolated for explicit operational
-  rollback until the migration observation period is complete.
+  by ASG desired and is not requested twice.
+
+  Safe scale-in is a separate `off` (default), `observe`, or `enforce` path available only with
+  `start-intent-v1`. It retains configured headroom above current workload, waits for a stable
+  surplus, and selects protocol-capable low-occupancy workers older than the minimum EC2 instance
+  age. The controller writes an owned Nomad drain marker before asking the exact worker service
+  instance to enter Draining. Empty workers can use the global rolling window; non-empty workers
+  also consume a 10% graceful-drain budget while their Sandboxes end naturally. It never migrates
+  or kills a Sandbox to reduce capacity.
+
+  Before each irreversible action the controller re-reads workload, Nomad ownership, worker
+  identity and shutdown state, ASG membership/health/protection, active instance refresh state, and
+  the ASG minimum. It then calls `TerminateInstanceInAutoScalingGroup` for that exact instance with
+  desired-capacity decrement enabled; it never substitutes a generic desired-capacity reduction.
+  Demand growth cancels uncommitted owned drains in Nomad-before-worker order, while scale-out keeps
+  priority if scale-in observations fail. Transport-ambiguous AWS outcomes remain isolated and are
+  reconciled by reads rather than retried. The controller has no listener or public route. The
+  exact-termination IAM action is present only in enforce mode and remains resource-scoped to the
+  named client ASG. The controller currently shares the API-node instance role and Nomad cluster
+  token with other colocated jobs; process-specific cloud/Nomad identity would require a separate
+  workload-identity mechanism and is not claimed by this deployment.
+  The legacy failure-ledger reader remains isolated for explicit operational rollback until the
+  migration observation period is complete.
 - **Sandbox ("client") nodes** run the orchestrator as a Nomad *system* job via `raw_exec`
   (it needs root for Firecracker, namespaces, NBD, cgroups). Configured with hugepages and local
   template caches. Autoscaled.
@@ -577,7 +609,7 @@ packages/
   client-proxy/         Edge router for sandbox traffic
   envd/                 In-VM agent (bump pkg/version.go on behavior change!)
   dashboard-api/        Web-dashboard backend
-  capacity-controller/  Optional AWS pending-demand to client-ASG scale-out controller
+  capacity-controller/  Optional AWS client-ASG scale-out and verified-empty scale-in controller
   shared/               Protos, telemetry, storage clients, proxy engine, feature flags
   auth/                 AuthN library (API keys, JWT/OIDC) used by api + dashboard-api
   db/                   Postgres migrations (goose) + queries (sqlc)

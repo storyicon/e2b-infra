@@ -256,6 +256,7 @@ module "api" {
   loki_bucket_arn                   = data.aws_s3_bucket.loki_bucket.arn
 
   capacity_autoscaler_enabled  = var.capacity_autoscaler_enabled
+  capacity_scale_in_enforced   = var.capacity_scale_in_enforced
   client_autoscaling_group_arn = module.client.autoscaling_group_arn
 
 }

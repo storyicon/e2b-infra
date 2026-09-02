@@ -59,30 +59,43 @@ type Config struct {
 	BatchIdleDuration time.Duration
 	BatchMaxDuration  time.Duration
 	ReconcileTimeout  time.Duration
+	ScaleInMode       ScaleInMode
+	ScaleInHeadroom   int
+	ScaleInStableFor  time.Duration
+	ScaleInMinimumAge time.Duration
+	ScaleInTimeout    time.Duration
 }
 
 type Result struct {
-	Mode               Mode
-	WorkloadCount      int64
-	PendingSandboxes   int64
-	TotalFulfilled     int64
-	TotalDirectSuccess int64
-	BurstDemand        int64
-	ReadyNodes         int32
-	ReadyNodesObserved bool
-	ReadyNodesError    error
-	DesiredNodes       int32
-	TargetNodes        int32
-	Capped             bool
-	Scaled             bool
-	Aggregating        bool
-	BatchTrigger       string
+	Mode                Mode
+	WorkloadCount       int64
+	PendingSandboxes    int64
+	TotalFulfilled      int64
+	TotalDirectSuccess  int64
+	BurstDemand         int64
+	ReadyNodes          int32
+	ReadyNodesObserved  bool
+	ReadyNodesError     error
+	DesiredNodes        int32
+	TargetNodes         int32
+	Capped              bool
+	Scaled              bool
+	Aggregating         bool
+	BatchTrigger        string
+	ScaleInSafeRequired int64
+	ScaleInAccepting    int32
+	ScaleInExcess       int32
+	ScaleInDraining     int32
+	ScaleInCancelled    int32
+	ScaleInTerminated   int32
+	ScaleInStable       bool
+	ScaleInReadError    error
 }
 
-// Reconciler deliberately supports scale-out only. The legacy mode keeps its
-// process-local burst accounting for explicit rollback. Start-intent mode is
-// level-triggered from an external workload snapshot and ASG desired capacity,
-// so it does not carry burst state across reconciliations.
+// The legacy mode keeps its process-local burst accounting for explicit
+// rollback. Start-intent mode is level-triggered from an external workload
+// snapshot and ASG desired capacity, so it does not carry burst state across
+// reconciliations. Scale-in is an optional, independently fail-closed path.
 type Reconciler struct {
 	config   *Config
 	demand   DemandReader
@@ -97,6 +110,7 @@ type Reconciler struct {
 	mu               sync.Mutex
 	burst            burst
 	startIntentBatch startIntentBatch
+	scaleIn          *scaleInRuntime
 }
 
 type startIntentBatch struct {
@@ -194,6 +208,20 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time) (R
 	result.DesiredNodes = desired
 
 	required := ceilDiv(snapshot.WorkloadCount, int64(r.config.SlotsPerNode))
+	if r.config.ScaleInMode == ScaleInModeEnforce {
+		compensatedRequired, scaleInErr := r.scaleOutRequiredForEnforce(ctx, now, snapshot.WorkloadCount, required)
+		if scaleInErr != nil {
+			// Scale-in observations may only increase a scale-out target. If they
+			// are unavailable, reset stabilization and preserve the authoritative
+			// pre-existing raw scale-out formula instead of blocking demand.
+			if r.scaleIn != nil {
+				r.scaleIn.stabilizer.Reset()
+			}
+			result.ScaleInReadError = scaleInErr
+		} else {
+			required = compensatedRequired
+		}
+	}
 	uncapped := max(int64(desired), required, int64(r.config.MinNodes))
 	result.Capped = uncapped > int64(r.config.MaxNodes)
 	target := clampInt32(uncapped, r.config.MinNodes, r.config.MaxNodes)
@@ -228,7 +256,12 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time) (R
 		r.startIntentBatch = startIntentBatch{}
 	}
 
-	return r.observeReadyNodes(ctx, result)
+	result, err = r.observeReadyNodes(ctx, result)
+	if err != nil || result.Scaled || result.Aggregating {
+		return result, err
+	}
+
+	return r.reconcileScaleIn(ctx, now, snapshot.WorkloadCount, result)
 }
 
 func (r *Reconciler) setDesiredCapacity(ctx context.Context, audit ScaleAuditEvent) error {

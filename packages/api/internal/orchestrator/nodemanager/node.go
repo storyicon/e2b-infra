@@ -54,6 +54,7 @@ type Node struct {
 	machineInfo machineinfo.MachineInfo
 	labels      map[string]struct{}
 	meta        NodeMetadata
+	scaleIn     scaleInObservation
 
 	PlacementMetrics PlacementMetrics
 	// consecutiveCreateUnavailable is replica-local passive health evidence.
@@ -114,6 +115,7 @@ func New(
 	}
 
 	n.UpdateMetricsFromServiceInfoResponse(nodeInfo)
+	n.updateScaleInObservation(nodeInfo)
 	n.setMachineInfo(nodeInfo.GetMachineInfo())
 	n.setLabels(nodeInfo.GetLabels())
 
@@ -158,6 +160,7 @@ func NewClusterNode(ctx context.Context, client *clusters.GRPCClient, clusterID 
 	}
 
 	n.UpdateMetricsFromServiceInfoResponse(nodeInfo)
+	n.updateScaleInObservation(nodeInfo)
 	n.setMachineInfo(nodeInfo.GetMachineInfo())
 	n.setLabels(nodeInfo.GetLabels())
 

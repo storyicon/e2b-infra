@@ -352,11 +352,12 @@ func (s *Server) DrainSandboxes(ctx context.Context) error {
 	lastLoggedAt := startedAt
 
 	for {
-		remaining := s.sandboxFactory.Sandboxes.Count()
-		if remaining == 0 {
+		state := service.SnapshotShutdownState(s.info, s.sandboxFactory.Sandboxes, s)
+		remaining := int(state.LiveSandboxes)
+		if state.Ready {
 			logger.L().Info(ctx, "graceful sandbox drain complete", zap.Int("live_sandboxes", remaining))
 
-			return s.waitSandboxLifecycles(ctx)
+			return nil
 		}
 
 		select {
@@ -382,8 +383,13 @@ func (s *Server) DrainSandboxes(ctx context.Context) error {
 	}
 }
 
-func (s *Server) waitSandboxLifecycles(ctx context.Context) error {
-	return s.sandboxFactory.Sandboxes.WaitLifecycles(ctx)
+func (s *Server) SnapshotUploadsInFlight() uint64 {
+	value := s.uploadsInFlight.Load()
+	if value < 0 {
+		return 0
+	}
+
+	return uint64(value)
 }
 
 func (s *Server) refreshStartingSandboxesLimit(ctx context.Context) {

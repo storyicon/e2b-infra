@@ -9,8 +9,12 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/cfg"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/service"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/service/machineinfo"
+	orchestratorinfo "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator-info"
 )
 
 func TestDrainSandboxesReturnsWhenEmpty(t *testing.T) {
@@ -77,10 +81,14 @@ func TestDrainSandboxesCompletesAfterSandboxLeaves(t *testing.T) {
 }
 
 func drainTestServer() *Server {
+	info := service.NewInfoContainer("test", "test", "test", "test", machineinfo.MachineInfo{}, cfg.Config{})
+	info.SetStatus(context.Background(), orchestratorinfo.ServiceInfoStatus_Draining)
+
 	return &Server{
 		sandboxFactory: &sandbox.Factory{
 			Sandboxes: sandbox.NewSandboxesMap(),
 		},
+		info: info,
 	}
 }
 

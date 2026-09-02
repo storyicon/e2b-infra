@@ -13,6 +13,7 @@ const (
 	AuditEventScaleWriteStarted  = "scale_write_started"
 	AuditEventScaleWriteFinished = "scale_write_finished"
 	AuditEventCheckpoint         = "audit_checkpoint"
+	AuditEventScaleInTransition  = "scale_in_transition"
 )
 
 type ScaleWriteMetadata struct {
@@ -38,6 +39,11 @@ type ScaleAuditEvent struct {
 	Error                 string
 	AuditDroppedTotal     uint64
 	CheckpointGeneratedAt time.Time
+	ScaleInOperationID    string
+	ScaleInNodeID         string
+	ScaleInStage          string
+	ScaleInReason         string
+	ASGActivityID         string
 }
 
 // AuditSink has no error return so evidence collection cannot change a scale

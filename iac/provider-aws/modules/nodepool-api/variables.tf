@@ -92,6 +92,12 @@ variable "capacity_autoscaler_enabled" {
   default     = false
 }
 
+variable "capacity_scale_in_enforced" {
+  type        = bool
+  description = "Whether the capacity controller may terminate an exact client ASG instance"
+  default     = false
+}
+
 variable "client_autoscaling_group_arn" {
   type        = string
   description = "ARN of the client Auto Scaling group managed by the capacity autoscaler"

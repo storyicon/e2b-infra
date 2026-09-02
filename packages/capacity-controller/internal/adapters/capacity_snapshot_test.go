@@ -20,6 +20,22 @@ type fakeCapacityServiceClient struct {
 	metadata metadata.MD
 }
 
+func (f *fakeCapacityServiceClient) ListScaleInCandidates(context.Context, *proxygrpc.ListScaleInCandidatesRequest, ...grpc.CallOption) (*proxygrpc.ListScaleInCandidatesResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeCapacityServiceClient) BeginWorkerScaleIn(context.Context, *proxygrpc.WorkerScaleInRequest, ...grpc.CallOption) (*proxygrpc.WorkerScaleInState, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeCapacityServiceClient) VerifyWorkerScaleIn(context.Context, *proxygrpc.WorkerScaleInRequest, ...grpc.CallOption) (*proxygrpc.WorkerScaleInState, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeCapacityServiceClient) CancelWorkerScaleIn(context.Context, *proxygrpc.WorkerScaleInRequest, ...grpc.CallOption) (*proxygrpc.WorkerScaleInState, error) {
+	return nil, errors.New("not implemented")
+}
+
 func (f *fakeCapacityServiceClient) GetCapacitySnapshot(
 	ctx context.Context,
 	request *proxygrpc.CapacitySnapshotRequest,
