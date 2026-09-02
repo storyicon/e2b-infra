@@ -195,6 +195,7 @@ func TestNomadCompleteRestorePersistsTerminalMarker(t *testing.T) {
 			Meta: func() map[string]string {
 				previous := operation
 				previous.Stage = "worker_draining"
+
 				return nomadOperationMeta(previous)
 			}(),
 		},

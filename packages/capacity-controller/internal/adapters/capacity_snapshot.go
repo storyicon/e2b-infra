@@ -68,16 +68,19 @@ func (a *CapacitySnapshot) ListScaleInCandidates(ctx context.Context, clusterID 
 
 func (a *CapacitySnapshot) BeginWorkerScaleIn(ctx context.Context, clusterID, nodeID, serviceInstanceID string) (controller.WorkerScaleInState, error) {
 	response, err := a.client.BeginWorkerScaleIn(a.authenticatedContext(ctx), scaleInRequest(clusterID, nodeID, serviceInstanceID))
+
 	return workerScaleInState(response, err, "begin worker scale-in")
 }
 
 func (a *CapacitySnapshot) VerifyWorkerScaleIn(ctx context.Context, clusterID, nodeID, serviceInstanceID string) (controller.WorkerScaleInState, error) {
 	response, err := a.client.VerifyWorkerScaleIn(a.authenticatedContext(ctx), scaleInRequest(clusterID, nodeID, serviceInstanceID))
+
 	return workerScaleInState(response, err, "verify worker scale-in")
 }
 
 func (a *CapacitySnapshot) CancelWorkerScaleIn(ctx context.Context, clusterID, nodeID, serviceInstanceID string) (controller.WorkerScaleInState, error) {
 	response, err := a.client.CancelWorkerScaleIn(a.authenticatedContext(ctx), scaleInRequest(clusterID, nodeID, serviceInstanceID))
+
 	return workerScaleInState(response, err, "cancel worker scale-in")
 }
 
@@ -85,6 +88,7 @@ func (a *CapacitySnapshot) authenticatedContext(ctx context.Context) context.Con
 	md, _ := metadata.FromOutgoingContext(ctx)
 	md = md.Copy()
 	md.Set(proxygrpc.MetadataAuthorization, "Bearer "+a.serviceToken)
+
 	return metadata.NewOutgoingContext(ctx, md)
 }
 

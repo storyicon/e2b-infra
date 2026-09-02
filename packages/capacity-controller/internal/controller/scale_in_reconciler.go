@@ -82,6 +82,7 @@ func (r *Reconciler) scaleOutRequiredForEnforce(ctx context.Context, now time.Ti
 	for _, node := range activeScaleInOperations(nomadNodes) {
 		if node.Operation.Stage != "terminating" {
 			unavailableOwned++
+
 			continue
 		}
 		// A terminating worker that is still an ASG member remains unavailable
@@ -106,6 +107,7 @@ func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, worklo
 	nomadNodes, err := r.scaleIn.inventory.Inventory(ctx, r.config.NodePool)
 	if err != nil {
 		r.scaleIn.stabilizer.Reset()
+
 		return result, fmt.Errorf("read scale-in Nomad inventory: %w", err)
 	}
 	workerCandidates, err := r.scaleIn.workers.ListScaleInCandidates(ctx, r.config.ClusterID)
@@ -115,6 +117,7 @@ func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, worklo
 			_, cancelErr := r.cancelUncommitted(ctx, nomadNodes, maxScaleInProgressPerReconcile)
 			err = errors.Join(err, cancelErr)
 		}
+
 		return result, fmt.Errorf("read worker scale-in candidates: %w", err)
 	}
 	cloud, err := r.scaleIn.infrastructure.Snapshot(ctx, r.config.ASGName)

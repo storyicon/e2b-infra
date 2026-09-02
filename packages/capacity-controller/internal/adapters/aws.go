@@ -111,6 +111,7 @@ func (a *ASG) Snapshot(ctx context.Context, asgName string) (ASGSnapshot, error)
 	for _, refresh := range refreshes.InstanceRefreshes {
 		if instanceRefreshIsActive(refresh.Status) {
 			snapshot.ActiveInstanceRefresh = true
+
 			break
 		}
 	}
@@ -167,6 +168,7 @@ func (a *ASG) TerminateInstance(ctx context.Context, instanceID string) (Termina
 			// A complete 4xx response is an authoritative API rejection.
 			outcome = controller.ScaleInTerminationRejected
 		}
+
 		return TerminationReceipt{}, &controller.ScaleInTerminationError{
 			Outcome: outcome,
 			Err:     fmt.Errorf("terminate instance in Auto Scaling group: %w", err),
