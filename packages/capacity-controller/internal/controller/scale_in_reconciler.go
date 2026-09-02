@@ -127,6 +127,7 @@ func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, worklo
 			_, cancelErr := r.cancelUncommitted(ctx, nomadNodes, maxScaleInProgressPerReconcile)
 			err = errors.Join(err, cancelErr)
 		}
+
 		return result, fmt.Errorf("read scale-in ASG snapshot: %w", err)
 	}
 
@@ -134,6 +135,7 @@ func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, worklo
 	plan, err := BuildScaleInPlan(workloadCount, r.config.SlotsPerNode, r.config.MinNodes, r.config.ScaleInHeadroom, nodes)
 	if err != nil {
 		r.scaleIn.stabilizer.Reset()
+
 		return result, err
 	}
 	result.ScaleInSafeRequired = plan.SafeRequired
@@ -150,6 +152,7 @@ func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, worklo
 		deficit := int32(min(int64(^uint32(0)>>1), plan.SafeRequired)) - plan.AcceptingNodes
 		cancelled, cancelErr := r.cancelUncommitted(ctx, operations, min(deficit, maxScaleInProgressPerReconcile))
 		result.ScaleInCancelled += cancelled
+
 		return result, cancelErr
 	}
 
@@ -191,6 +194,7 @@ func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, worklo
 				} else if firstOperationErr == nil {
 					firstOperationErr = fmt.Errorf("cancel expired scale-in %q: %w", operation.OperationID, err)
 				}
+
 				continue
 			}
 			state, verifyErr := r.scaleIn.workers.VerifyWorkerScaleIn(ctx, r.config.ClusterID, node.NodeID, operation.ServiceInstanceID)
@@ -203,6 +207,7 @@ func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, worklo
 				} else if firstOperationErr == nil {
 					firstOperationErr = fmt.Errorf("verify scale-in %q: %w", operation.OperationID, verifyErr)
 				}
+
 				continue
 			}
 			if !workerIdentityMatches(state, node.NodeID, operation.ServiceInstanceID) {
@@ -211,6 +216,7 @@ func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, worklo
 				} else if firstOperationErr == nil {
 					firstOperationErr = fmt.Errorf("cancel identity-changed scale-in %q: %w", operation.OperationID, err)
 				}
+
 				continue
 			}
 			if workerShutdownReady(state) {
@@ -288,12 +294,14 @@ func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, worklo
 					fmt.Errorf("rollback failed for worker drain %q: %w", operation.OperationID, cancelErr),
 				)
 			}
+
 			continue
 		}
 		if !workerShutdownReady(state) && newNonEmpty >= budget.AllowedNonEmpty {
 			if cancelErr := r.cancelOperation(ctx, nomadNode, operation); cancelErr != nil {
 				return result, fmt.Errorf("rollback over-budget drain %q: %w", operation.OperationID, cancelErr)
 			}
+
 			continue
 		}
 		if !workerShutdownReady(state) {
@@ -311,6 +319,7 @@ func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, worklo
 			if firstOperationErr == nil {
 				firstOperationErr = fmt.Errorf("persist worker drain stage for %q: %w", operation.OperationID, err)
 			}
+
 			continue
 		}
 		r.recordScaleInTransition(candidate.NodeID, operation, "worker_draining", "success", "")
@@ -400,6 +409,7 @@ func (r *Reconciler) commitTermination(ctx context.Context, now time.Time, node 
 			// The request may have reached AWS. Keep the owned terminating marker;
 			// later reconciles use only membership/activity and never repeat it.
 			r.recordScaleInTransition(node.NodeID, operation, "terminating", "ambiguous", terminationErr.Error())
+
 			return false, nil
 		}
 		if terminationErr.Outcome == ScaleInTerminationRejected {
