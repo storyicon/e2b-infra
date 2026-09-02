@@ -1018,4 +1018,88 @@ func TestDepartedNomadNodesDoNotConsumeDisruptionBudget(t *testing.T) {
 	)
 
 	require.Empty(t, nodes)
+	require.Len(t, activeScaleInOperations([]NomadScaleInNode{
+		{NodeID: "i-stale", Ready: false, Eligible: true},
+		{NodeID: "i-complete", Ready: false, Draining: true, Operation: &complete},
+		{NodeID: "i-terminating", Ready: false, Draining: true, Operation: &terminating},
+	}), 1, "departed capacity is ignored without discarding its unfinished operation")
+}
+
+func TestCurrentASGInstanceWithoutNomadNodeConsumesDisruptionBudget(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1000, 0)
+	launchTime := now.Add(-time.Hour)
+	nodes := mergeScaleInNodes(now, nil, nil, ScaleInASGSnapshot{Instances: map[string]ScaleInASGInstance{
+		"i-unregistered": {
+			ID:             "i-unregistered",
+			HealthStatus:   "Healthy",
+			LifecycleState: "InService",
+			LaunchTime:     &launchTime,
+		},
+	}})
+
+	require.Equal(t, []ScaleInNode{{
+		NodeID:     "i-unregistered",
+		LaunchTime: &launchTime,
+	}}, nodes)
+	plan, err := BuildScaleInPlan(0, 20, 0, 0, nodes)
+	require.NoError(t, err)
+	require.Zero(t, plan.ReadyNodes)
+	require.Zero(t, plan.AcceptingNodes)
+	require.Equal(t, int32(1), plan.DisruptionUsed)
+	require.Zero(t, plan.Excess)
+}
+
+func TestDepartedNomadHistoryDoesNotCauseDrainCancellationChurn(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1000, 0)
+	old := now.Add(-time.Hour)
+	nomadNodes := []NomadScaleInNode{
+		{NomadNodeID: "nomad-target", NodeID: "i-target", NodePool: "workers", Ready: true, Eligible: true, CreateIndex: 2},
+		{NomadNodeID: "nomad-keeper", NodeID: "i-keeper", NodePool: "workers", Ready: true, Eligible: true, CreateIndex: 1},
+	}
+	for index := range 17 {
+		nomadNodes = append(nomadNodes, NomadScaleInNode{
+			NomadNodeID: fmt.Sprintf("nomad-stale-%02d", index),
+			NodeID:      fmt.Sprintf("i-stale-%02d", index),
+			NodePool:    "workers",
+			Eligible:    true,
+		})
+	}
+	inventory := &scaleInTestInventory{nodes: nomadNodes}
+	workers := &scaleInTestWorkers{
+		begin: WorkerScaleInState{
+			NodeID: "i-target", ServiceInstanceID: "service-target", ServiceStatus: "Draining",
+			ScaleInProtocolSupport: true,
+		},
+		candidates: []ScaleInCandidateObservation{
+			{NodeID: "i-target", ServiceInstanceID: "service-target", ServiceStatus: "ready", ScaleInProtocolSupport: true, ObservedAt: now},
+			{NodeID: "i-keeper", ServiceInstanceID: "service-keeper", ServiceStatus: "ready", ScaleInProtocolSupport: true, ObservedAt: now},
+		},
+	}
+	infrastructure := &scaleInTestInfrastructure{snapshot: ScaleInASGSnapshot{
+		Name: "workers", DesiredCapacity: 2, MinSize: 1,
+		Instances: map[string]ScaleInASGInstance{
+			"i-target": {ID: "i-target", HealthStatus: "Healthy", LifecycleState: "InService", LaunchTime: &old},
+			"i-keeper": {ID: "i-keeper", HealthStatus: "Healthy", LifecycleState: "InService", LaunchTime: &old},
+		},
+	}}
+	r := NewWithScaleIn(&Config{
+		ClusterID: "cluster-1", NodePool: "workers", ASGName: "workers", SlotsPerNode: 20, MinNodes: 1,
+		ScaleInMode: ScaleInModeEnforce, ScaleInStableFor: time.Second,
+		ScaleInMinimumAge: 10 * time.Minute, ScaleInTimeout: 15 * time.Minute,
+	}, nil, &fakeCapacitySnapshotReader{}, &fakeNodeCounter{}, &fakeScaleTarget{}, inventory, workers, infrastructure)
+	r.scaleIn.stabilizer.firstObservedAt = now.Add(-time.Minute)
+
+	result, err := r.reconcileScaleIn(t.Context(), now, 0, Result{})
+
+	require.NoError(t, err)
+	require.Equal(t, int32(1), result.ScaleInDraining)
+	require.Zero(t, result.ScaleInCancelled)
+	require.Equal(t, 1, inventory.markDrainCalls)
+	require.Equal(t, 1, inventory.markStageCalls)
+	require.Zero(t, inventory.restoreCalls)
+	require.Zero(t, workers.cancelCalls)
 }
