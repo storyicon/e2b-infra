@@ -18,7 +18,7 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/machineinfo"
-	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
+	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
 )
 
 // nodeSource is the discovery source a node came from. The zero value is
@@ -34,6 +34,8 @@ const (
 
 type NodePlaneInstance struct {
 	WorkloadID string
+	// NomadNodeID is the full Nomad node UUID used for exact scale-in ownership.
+	NomadNodeID string
 
 	OrchestratorAddress string
 	IPAddress           string
@@ -46,6 +48,8 @@ type Node struct {
 	// WorkloadID is set only by the node plane; the cluster registry keys on
 	// the machine instead.
 	WorkloadID string
+	// NomadNodeID is set only for instances discovered from Nomad.
+	NomadNodeID string
 
 	ID            string
 	ClusterID     uuid.UUID
@@ -71,8 +75,12 @@ type Node struct {
 	machineInfo machineinfo.MachineInfo
 	labels      map[string]struct{}
 	meta        NodeMetadata
+	scaleIn     scaleInObservation
 
 	PlacementMetrics PlacementMetrics
+	// consecutiveCreateUnavailable is replica-local passive health evidence.
+	// A complete successful sync or create resets it.
+	consecutiveCreateUnavailable atomic.Uint32
 
 	mutex sync.RWMutex
 }
@@ -116,6 +124,7 @@ func New(
 	n := &Node{
 		source:        sourceNodePlane,
 		WorkloadID:    discoveredNode.WorkloadID,
+		NomadNodeID:   discoveredNode.NomadNodeID,
 		ClusterID:     consts.LocalClusterID,
 		ID:            nodeInfo.GetNodeId(),
 		IPAddress:     discoveredNode.IPAddress,
@@ -126,14 +135,11 @@ func New(
 		status: StatusInfo{Status: nodeStatus, ChangedAt: nodeStatusChangedAt},
 		meta:   nodeMetadata,
 
-		PlacementMetrics: PlacementMetrics{
-			sandboxesInProgress: smap.New[SandboxResources](),
-			createSuccess:       atomic.Uint64{},
-			createFails:         atomic.Uint64{},
-		},
+		PlacementMetrics: newPlacementMetrics(),
 	}
 
 	n.UpdateMetricsFromServiceInfoResponse(nodeInfo)
+	n.updateScaleInObservation(nodeInfo)
 	n.setMachineInfo(nodeInfo.GetMachineInfo())
 	n.setLabels(nodeInfo.GetLabels())
 
@@ -161,13 +167,9 @@ func NewClusterNode(ctx context.Context, client *clusters.GRPCClient, clusterID 
 		ID:        i.NodeID,
 		// API control-plane calls still use the cluster gRPC proxy, but edge/client
 		// proxies need the node IP address for data-plane sandbox traffic.
-		IPAddress:     i.LocalIPAddress,
-		SandboxDomain: sandboxDomain,
-		PlacementMetrics: PlacementMetrics{
-			sandboxesInProgress: smap.New[SandboxResources](),
-			createSuccess:       atomic.Uint64{},
-			createFails:         atomic.Uint64{},
-		},
+		IPAddress:        i.LocalIPAddress,
+		SandboxDomain:    sandboxDomain,
+		PlacementMetrics: newPlacementMetrics(),
 
 		client: client,
 		status: StatusInfo{Status: status, ChangedAt: info.StatusChangedAt},
@@ -183,6 +185,7 @@ func NewClusterNode(ctx context.Context, client *clusters.GRPCClient, clusterID 
 	}
 
 	n.UpdateMetricsFromServiceInfoResponse(nodeInfo)
+	n.updateScaleInObservation(nodeInfo)
 	n.setMachineInfo(nodeInfo.GetMachineInfo())
 	n.setLabels(nodeInfo.GetLabels())
 
@@ -213,6 +216,12 @@ func (n *Node) GetClient(ctx context.Context) (*clusters.GRPCClient, context.Con
 // membership against a fresh listing, so only it may evict on absence.
 func (n *Node) DiscoveredByNodePlane() bool {
 	return n.source == sourceNodePlane
+}
+
+// IsNomadManaged reports whether Nomad supplied the full node identity needed
+// to own and reconcile a scale-in drain.
+func (n *Node) IsNomadManaged() bool {
+	return n.source == sourceNodePlane && n.Backend == servicediscovery.BackendNomad && n.NomadNodeID != ""
 }
 
 func (n *Node) IsClusterNode() bool {

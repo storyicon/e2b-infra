@@ -57,7 +57,7 @@ func NewCallbackTracker(expectedCalls int) *CallbackTracker {
 
 // Track returns a callback function that tracks invocations
 func (ct *CallbackTracker) Track(name string) InsertCallback {
-	return func(_ context.Context, sbx Sandbox) {
+	return func(_ context.Context, sbx Sandbox) error {
 		ct.mu.Lock()
 		ct.calls[name] = append(ct.calls[name], sbx)
 		ct.mu.Unlock()
@@ -67,6 +67,8 @@ func (ct *CallbackTracker) Track(name string) InsertCallback {
 				close(ct.done)
 			})
 		}
+
+		return nil
 	}
 }
 
@@ -119,6 +121,10 @@ func (n *NoOpReservationStorage) Reserve(_ context.Context, _ uuid.UUID, _ strin
 	return nil, nil, nil
 }
 
+func (n *NoOpReservationStorage) ReserveOwned(_ context.Context, _ uuid.UUID, _ string, _ int, _ ReservationOwner) (func(Sandbox, error), func(ctx context.Context) (Sandbox, error), error) {
+	return nil, nil, nil
+}
+
 func (n *NoOpReservationStorage) Release(_ context.Context, _ uuid.UUID, _ string) error {
 	return nil
 }
@@ -129,6 +135,22 @@ type MockStorage struct {
 
 	addError error
 	mu       sync.Mutex
+}
+
+type addOnlyStorage struct {
+	Storage
+
+	added bool
+}
+
+func (s *addOnlyStorage) Add(_ context.Context, _ Sandbox) error {
+	s.added = true
+
+	return nil
+}
+
+func (s *addOnlyStorage) AddCapacity(ctx context.Context, sbx Sandbox) error {
+	return s.Add(ctx, sbx)
 }
 
 func NewMockStorage(storage Storage) *MockStorage {
@@ -155,6 +177,10 @@ func (m *MockStorage) Add(ctx context.Context, sbx Sandbox) error {
 	}
 
 	return m.Storage.Add(ctx, sbx)
+}
+
+func (m *MockStorage) AddCapacity(ctx context.Context, sbx Sandbox) error {
+	return m.Add(ctx, sbx)
 }
 
 // createTestSandbox creates a test sandbox with default values
@@ -298,6 +324,32 @@ func TestAdd_StorageErrors(t *testing.T) {
 		tracker.AssertNotCalled(t, "AddSandboxToRoutingTable")
 		tracker.AssertNotCalled(t, "AsyncNewlyCreatedSandbox")
 	})
+}
+
+func TestAdd_RoutingFailureIsReturnedBeforeCreationCallback(t *testing.T) {
+	t.Parallel()
+
+	routingErr := errors.New("routing unavailable")
+	creationCalled := make(chan struct{}, 1)
+	storage := &addOnlyStorage{}
+	store := NewStore(storage, &NoOpReservationStorage{}, Callbacks{
+		AddSandboxToRoutingTable: func(context.Context, Sandbox) error {
+			return routingErr
+		},
+		AsyncNewlyCreatedSandbox: func(context.Context, Sandbox, CreationMetadata) {
+			creationCalled <- struct{}{}
+		},
+	})
+
+	err := store.Add(t.Context(), createTestSandbox(), &CreationMetadata{})
+
+	require.ErrorIs(t, err, routingErr)
+	require.True(t, storage.added)
+	select {
+	case <-creationCalled:
+		t.Fatal("creation callback ran before routing commit")
+	case <-time.After(20 * time.Millisecond):
+	}
 }
 
 func TestAdd_ConcurrentCalls(t *testing.T) {

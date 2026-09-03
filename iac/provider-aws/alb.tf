@@ -37,10 +37,53 @@ resource "aws_lb" "ingress" {
   name               = "${var.prefix}ingress"
   internal           = false
   load_balancer_type = "application"
-  subnets            = module.init.vpc_public_subnet_ids
+  idle_timeout = var.capacity_autoscaler_enabled && var.capacity_controller_demand_mode == "start-intent-v1" ? var.capacity_ingress_idle_timeout_seconds : (
+    var.capacity_autoscaler_enabled ? 180 : 60
+  )
+  subnets = module.init.vpc_public_subnet_ids
   security_groups = [
     aws_security_group.ingress.id
   ]
+
+  lifecycle {
+    precondition {
+      condition = !var.capacity_autoscaler_enabled || contains([
+        "legacy-failure-ledger:legacy-failure-ledger",
+        "dual-write:legacy-failure-ledger",
+        "dual-write:start-intent-v1",
+        "start-intent-v1:start-intent-v1",
+      ], "${var.capacity_api_demand_mode}:${var.capacity_controller_demand_mode}")
+      error_message = "capacity API/controller demand modes must form a safe explicit migration pair."
+    }
+
+    precondition {
+      condition = !var.capacity_autoscaler_enabled || var.capacity_api_demand_mode == "legacy-failure-ledger" || (
+        var.capacity_api_pool_vcpu != null &&
+        var.capacity_api_pool_memory_mib != null &&
+        try(trimspace(var.capacity_api_pool_cpu_architecture), "") != "" &&
+        try(trimspace(var.capacity_api_pool_cpu_family), "") != "" &&
+        try(trimspace(var.capacity_api_pool_cpu_model), "") != ""
+      )
+      error_message = "capacity_api_pool_vcpu, capacity_api_pool_memory_mib, and the pool CPU architecture/family/model are required for dual-write or start-intent-v1."
+    }
+
+    precondition {
+      condition = !var.capacity_autoscaler_enabled || var.capacity_controller_demand_mode != "start-intent-v1" || (
+        var.capacity_ingress_idle_timeout_seconds >= ceil(local.capacity_api_wait_seconds) + 75
+      )
+      error_message = "capacity_ingress_idle_timeout_seconds must cover capacity_api_wait_timeout plus the API's 70-second normal request budget and 5 seconds of server grace."
+    }
+
+    precondition {
+      condition = !var.capacity_autoscaler_enabled || var.capacity_controller_demand_mode != "start-intent-v1" || (
+        local.capacity_controller_batch_idle_seconds > 0 &&
+        local.capacity_controller_batch_max_seconds > 0 &&
+        local.capacity_controller_batch_idle_seconds <= local.capacity_controller_batch_max_seconds &&
+        local.capacity_controller_batch_max_seconds < local.capacity_api_wait_seconds
+      )
+      error_message = "start-intent batching requires batch idle duration <= batch max duration < capacity_api_wait_timeout."
+    }
+  }
 
   access_logs {
     bucket  = data.aws_s3_bucket.load_balancer_logs.id

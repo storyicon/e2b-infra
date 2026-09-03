@@ -98,6 +98,22 @@ func TestAddRemove_ExecutionScopedMember(t *testing.T) {
 	require.ErrorIs(t, err, redis.Nil)
 }
 
+func TestAddPreservesLegacySuccessWhenGlobalTeamIndexUpdateFails(t *testing.T) {
+	t.Parallel()
+
+	storage, client := setupTestStorage(t)
+	teamID := uuid.New()
+	sbx := makeIndexedSandbox(teamID, "sbx-team-index-failure", uuid.NewString(), time.Now(), time.Now().Add(time.Hour))
+
+	require.NoError(t, client.Set(t.Context(), globalTeamsSet, "wrong-type", 0).Err())
+	err := storage.Add(t.Context(), sbx)
+	require.NoError(t, err)
+
+	stored, getErr := storage.Get(t.Context(), teamID, sbx.SandboxID)
+	require.NoError(t, getErr)
+	require.Equal(t, sbx.ExecutionID, stored.ExecutionID)
+}
+
 // TestRemove_DoesNotUnindexFreshExecution replays Race B: a lockless Add for
 // a fresh execution of the same sandbox ID lands its index write while Remove
 // of the old execution runs. The fresh execution's member must survive.

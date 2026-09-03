@@ -74,6 +74,14 @@ func (s *AdjustableSemaphore) TryAcquire(n int64) bool {
 	return true
 }
 
+// Snapshot returns the current usage and limit from one consistent semaphore state.
+func (s *AdjustableSemaphore) Snapshot() (used, limit int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.used, s.limit
+}
+
 func (s *AdjustableSemaphore) SetLimit(limit int64) error {
 	if limit <= 0 {
 		return fmt.Errorf("SetLimit: limit must be > 0, got: %d", limit)

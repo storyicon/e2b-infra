@@ -13,6 +13,7 @@ const (
 // Storage is the persistence interface implemented by the redis backend.
 type Storage interface {
 	Add(ctx context.Context, sandbox Sandbox) error
+	AddCapacity(ctx context.Context, sandbox Sandbox) error
 	Get(ctx context.Context, teamID uuid.UUID, sandboxID string) (Sandbox, error)
 	Remove(ctx context.Context, teamID uuid.UUID, sandboxID string) error
 
@@ -30,5 +31,11 @@ type Storage interface {
 // concurrency limits.
 type ReservationStorage interface {
 	Reserve(ctx context.Context, teamID uuid.UUID, sandboxID string, limit int) (finishStart func(Sandbox, error), waitForStart func(ctx context.Context) (Sandbox, error), err error)
+	ReserveOwned(ctx context.Context, teamID uuid.UUID, sandboxID string, limit int, owner ReservationOwner) (finishStart func(Sandbox, error), waitForStart func(ctx context.Context) (Sandbox, error), err error)
 	Release(ctx context.Context, teamID uuid.UUID, sandboxID string) error
+}
+
+type ReservationOwner struct {
+	Token       string
+	CancelCause context.CancelCauseFunc
 }

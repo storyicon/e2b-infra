@@ -75,13 +75,13 @@ func TestBestOfK_Score_WithPendingResources(t *testing.T) {
 	nodeNormal := nodemanager.NewTestNode("node-normal", api.NodeStatusReady, 0, 4)
 	nodeWithPending := nodemanager.NewTestNode("node-pending", api.NodeStatusReady, 0, 4)
 
-	// Inject InProgress resources into nodeWithPending using StartPlacing
+	// Inject in-progress resources into nodeWithPending through the same reservation path used by placement.
 	// This simulates a Sandbox that is currently being placed but hasn't fully started
 	pendingRes := nodemanager.SandboxResources{
 		CPUs:      2,
 		MiBMemory: 1024,
 	}
-	nodeWithPending.PlacementMetrics.StartPlacing("pending-sbx-1", pendingRes)
+	require.True(t, nodeWithPending.PlacementMetrics.TryReserve("pending-sbx-1", pendingRes))
 
 	reqResources := nodemanager.SandboxResources{
 		CPUs:      1,
@@ -177,9 +177,54 @@ func TestBestOfK_ChooseNode_NoAvailableNodes(t *testing.T) {
 	}
 
 	selected, err := algo.chooseNode(ctx, nodes, excludedNodes, resources, CPURequirement{}, FeatureRequirement{}, false, nil)
-	require.Error(t, err)
+	var noNodesErr NoNodesAvailableError
+	require.ErrorAs(t, err, &noNodesErr)
 	assert.Nil(t, selected)
-	assert.Contains(t, err.Error(), "no node available")
+}
+
+func TestBestOfK_ChooseNode_IncompatibleCPUIsNotCapacity(t *testing.T) {
+	t.Parallel()
+
+	algo := NewBestOfK(DefaultBestOfKConfig()).(*BestOfK)
+	node := nodemanager.NewTestNode("node1", api.NodeStatusReady, 0, 4)
+	requirement := CPURequirement{PinnedModel: machineinfo.IceLakeModel}
+
+	selected, err := algo.chooseNode(
+		t.Context(),
+		[]*nodemanager.Node{node},
+		map[string]struct{}{},
+		nodemanager.SandboxResources{CPUs: 1, MiBMemory: 512},
+		requirement,
+		FeatureRequirement{},
+		false,
+		nil,
+	)
+
+	var incompatibleErr FailedToPlaceSandboxError
+	require.ErrorAs(t, err, &incompatibleErr)
+	assert.Nil(t, selected)
+}
+
+func TestBestOfK_ChooseNode_TemporarilyExcludedNodesAreCapacity(t *testing.T) {
+	t.Parallel()
+
+	algo := NewBestOfK(DefaultBestOfKConfig()).(*BestOfK)
+	node := nodemanager.NewTestNode("node1", api.NodeStatusReady, 0, 4)
+
+	selected, err := algo.chooseNode(
+		t.Context(),
+		[]*nodemanager.Node{node},
+		map[string]struct{}{node.ID: {}},
+		nodemanager.SandboxResources{CPUs: 1, MiBMemory: 512},
+		CPURequirement{},
+		FeatureRequirement{},
+		false,
+		nil,
+	)
+
+	var noNodesErr NoNodesAvailableError
+	require.ErrorAs(t, err, &noNodesErr)
+	assert.Nil(t, selected)
 }
 
 func TestFailedToPlaceSandboxError_Error(t *testing.T) {

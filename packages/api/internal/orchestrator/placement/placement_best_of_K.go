@@ -109,6 +109,10 @@ func (b *BestOfK) chooseNode(_ context.Context, nodes []*nodemanager.Node, exclu
 	}
 
 	if bestNode == nil {
+		if hasCompatibleNode(nodes, cpu, features, filterByLabels, requiredLabels) {
+			return nil, NoNodesAvailableError{}
+		}
+
 		return nil, FailedToPlaceSandboxError{
 			filterByLabels: filterByLabels,
 			requiredLabels: requiredLabels,
@@ -118,6 +122,20 @@ func (b *BestOfK) chooseNode(_ context.Context, nodes []*nodemanager.Node, exclu
 	}
 
 	return bestNode, nil
+}
+
+func hasCompatibleNode(nodes []*nodemanager.Node, cpu CPURequirement, features FeatureRequirement, filterByLabels bool, requiredLabels []string) bool {
+	for _, node := range nodes {
+		if isNodeCompatible(node, cpu, features, filterByLabels, requiredLabels) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isNodeCompatible(node *nodemanager.Node, cpu CPURequirement, features FeatureRequirement, filterByLabels bool, requiredLabels []string) bool {
+	return NodeSatisfiesCPU(node, cpu) && NodeSatisfiesFeatures(node, features) && (!filterByLabels || isNodeLabelsCompatible(node, requiredLabels))
 }
 
 type FailedToPlaceSandboxError struct {
@@ -182,18 +200,8 @@ func (b *BestOfK) sample(items []*nodemanager.Node, config BestOfKConfig, exclud
 			continue
 		}
 
-		// Skip if node is not CPU compatible
-		if !NodeSatisfiesCPU(n, cpu) {
-			continue
-		}
-
-		// Skip if the node's orchestrator predates a requested feature
-		if !NodeSatisfiesFeatures(n, features) {
-			continue
-		}
-
-		// Skip if node doesn't have the required labels
-		if filterByLabels && !isNodeLabelsCompatible(n, requiredLabels) {
+		// Skip if node does not satisfy the request's CPU, feature, or label requirements.
+		if !isNodeCompatible(n, cpu, features, filterByLabels, requiredLabels) {
 			continue
 		}
 

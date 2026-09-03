@@ -172,6 +172,73 @@ func TestScannedItems_StateFilter(t *testing.T) {
 	assert.Equal(t, []string{"sbx-running", "sbx-pausing"}, sandboxIDsOf(some.out))
 }
 
+func TestAllRunningItemsStrictUnionsExpirationAndTeamIndexes(t *testing.T) {
+	t.Parallel()
+
+	storage, client := setupTestStorage(t)
+	indexedTeam, missingTeam, missingExpirationTeam := uuid.New(), uuid.New(), uuid.New()
+	indexed := makeIndexedSandbox(indexedTeam, "sbx-indexed", uuid.NewString(), time.Now(), time.Now().Add(time.Hour))
+	missing := makeIndexedSandbox(missingTeam, "sbx-missing-team-index", uuid.NewString(), time.Now(), time.Now().Add(time.Hour))
+	missingExpiration := makeIndexedSandbox(missingExpirationTeam, "sbx-missing-expiration-index", uuid.NewString(), time.Now(), time.Now().Add(time.Hour))
+	require.NoError(t, storage.Add(t.Context(), indexed))
+	require.NoError(t, storage.Add(t.Context(), missing))
+	require.NoError(t, storage.Add(t.Context(), missingExpiration))
+	require.NoError(t, client.ZRem(t.Context(), globalTeamsSet, missingTeam.String()).Err())
+	require.NoError(t, client.ZRem(t.Context(), globalExpirationSet, sandboxExpirationMember(missingExpiration)).Err())
+
+	items, err := storage.AllRunningItemsStrict(t.Context())
+	require.NoError(t, err)
+	require.Len(t, items, 3)
+}
+
+func TestAllRunningItemsStrictFailsOnCorruptTeamIndexedRecord(t *testing.T) {
+	t.Parallel()
+
+	storage, client := setupTestStorage(t)
+	teamID := uuid.New()
+	sandboxID := "corrupt-team-indexed"
+	require.NoError(t, client.SAdd(t.Context(), GetSandboxStorageTeamIndexKey(teamID.String()), sandboxID).Err())
+	require.NoError(t, client.ZAdd(t.Context(), globalTeamsSet, redis.Z{
+		Score:  float64(time.Now().Unix()),
+		Member: teamID.String(),
+	}).Err())
+	require.NoError(t, client.Set(t.Context(), getSandboxKey(teamID.String(), sandboxID), "not-json", 0).Err())
+
+	_, err := storage.AllRunningItemsStrict(t.Context())
+	require.ErrorContains(t, err, "decode sandbox")
+}
+
+func TestAllRunningItemsStrictSkipsStaleExpirationMember(t *testing.T) {
+	t.Parallel()
+
+	storage, client := setupTestStorage(t)
+	require.NoError(t, client.ZAdd(t.Context(), globalExpirationSet, redis.Z{
+		Score:  float64(time.Now().Add(time.Hour).UnixMilli()),
+		Member: expirationMember(uuid.NewString(), "deleted", uuid.NewString()),
+	}).Err())
+
+	items, err := storage.AllRunningItemsStrict(t.Context())
+	require.NoError(t, err)
+	require.Empty(t, items)
+}
+
+func TestAllRunningItemsStrictFailsOnCorruptIndexedRecord(t *testing.T) {
+	t.Parallel()
+
+	storage, client := setupTestStorage(t)
+	teamID := uuid.New()
+	sandboxID := "corrupt"
+	executionID := uuid.NewString()
+	require.NoError(t, client.ZAdd(t.Context(), globalExpirationSet, redis.Z{
+		Score:  float64(time.Now().Add(time.Hour).UnixMilli()),
+		Member: expirationMember(teamID.String(), sandboxID, executionID),
+	}).Err())
+	require.NoError(t, client.Set(t.Context(), getSandboxKey(teamID.String(), sandboxID), "not-json", 0).Err())
+
+	_, err := storage.AllRunningItemsStrict(t.Context())
+	require.ErrorContains(t, err, "decode sandbox")
+}
+
 // seedTeamSandboxes writes sandbox records + index entries directly (bypassing
 // Storage.Add) and registers the team in the global teams index.
 func seedTeamSandboxes(t *testing.T, client redis.UniversalClient, teamID uuid.UUID, count int, state sandboxtypes.State) {

@@ -13,6 +13,10 @@ on:
         description: "Whether to run unit tests"
         required: false
         default: true
+      use_specialized_runners:
+        type: boolean
+        description: "Whether upstream-only specialized runners are available"
+        required: true
     secrets:
       CODECOV_TOKEN: { required: false }
 
@@ -22,10 +26,12 @@ permissions:
 jobs:
   run-tests:
     name: Run unit test shards
+    # Firecracker tests require the upstream repository's dedicated KVM runner.
+    # Forks still run every portable shard on GitHub-hosted runners.
     if: ${{ inputs.run-tests == true }}
     # Shards that only need Docker run on Blacksmith. The orchestrator shard
     # stays on infra-tests: it needs modprobe nbd and /dev/kvm (smoketest).
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ inputs.use_specialized_runners && matrix.runner || 'ubuntu-24.04' }}
     env:
       GIN_MODE: test
       # Parallel `go test ./...` binaries derive the same Ryuk session id
@@ -40,6 +46,11 @@ jobs:
         include:
           - package: packages/api
             flag: unit-api
+            test_path: ./...
+            sudo: false
+            runner: blacksmith-4vcpu-ubuntu-2404
+          - package: packages/capacity-controller
+            flag: unit-capacity-controller
             test_path: ./...
             sudo: false
             runner: blacksmith-4vcpu-ubuntu-2404
@@ -79,7 +90,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Explain fork orchestrator test coverage
+        if: ${{ !inputs.use_specialized_runners && matrix.package == 'packages/orchestrator' }}
+        run: echo "orchestrator runtime tests require the upstream KVM runner; compilation still runs on forks"
+
+      - name: Setup Go for fork orchestrator compilation
+        if: ${{ !inputs.use_specialized_runners && matrix.package == 'packages/orchestrator' }}
+        uses: ./.github/actions/go-setup-cache
+        with:
+          cache-dependency-paths: |
+            go.work
+            packages/orchestrator/go.mod
+            packages/orchestrator/go.sum
+
+      - name: Compile fork orchestrator tests
+        if: ${{ !inputs.use_specialized_runners && matrix.package == 'packages/orchestrator' }}
+        working-directory: packages/orchestrator
+        run: go test -run '^$' ./...
+
       - name: Run unit tests
+        if: ${{ inputs.use_specialized_runners || matrix.package != 'packages/orchestrator' }}
         uses: ./.github/actions/unit-tests
         with:
           package: ${{ matrix.package }}

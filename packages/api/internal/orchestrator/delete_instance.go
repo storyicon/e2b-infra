@@ -93,7 +93,17 @@ func (o *Orchestrator) RemoveSandbox(ctx context.Context, teamID uuid.UUID, sand
 		logger.L().Info(ctx, "Sandbox was already in the process of being removed", logger.WithSandboxID(sandboxID), zap.String("state", string(sbx.State)))
 
 		if time.Since(sbx.EndTime) > sandbox.StaleCutoff && opts.Action.Effect == sandbox.TransitionExpires {
-			o.sandboxStore.Remove(context.WithoutCancel(ctx), teamID, sandboxID)
+			cleanupCtx := context.WithoutCancel(ctx)
+			if storageErr := o.sandboxStore.RemoveStrict(cleanupCtx, teamID, sandboxID); storageErr != nil {
+				logger.L().Error(ctx, "Error removing stale sandbox state", zap.Error(storageErr), logger.WithSandboxID(sandboxID))
+
+				return ErrSandboxOperationFailed
+			}
+			if leaseErr := o.removeWorkloadLease(cleanupCtx, sbx); leaseErr != nil {
+				logger.L().Error(ctx, "Error removing stale sandbox workload lease", zap.Error(leaseErr), logger.WithSandboxID(sandboxID))
+
+				return ErrSandboxOperationFailed
+			}
 			go o.analyticsRemove(context.WithoutCancel(ctx), sbx, opts.Action)
 		}
 
@@ -101,8 +111,6 @@ func (o *Orchestrator) RemoveSandbox(ctx context.Context, teamID uuid.UUID, sand
 	}
 
 	defer func() { go o.analyticsRemove(context.WithoutCancel(ctx), sbx, opts.Action) }()
-	// Once we start the removal process, we want to make sure it gets removed from the store
-	defer o.sandboxStore.Remove(context.WithoutCancel(ctx), teamID, sandboxID)
 	err = o.removeSandboxFromNode(ctx, sbx, opts.Action, opts.Reason, opts.FilesystemOnly)
 	if err != nil {
 		fields := []zap.Field{
@@ -118,6 +126,47 @@ func (o *Orchestrator) RemoveSandbox(ctx context.Context, teamID uuid.UUID, sand
 
 		return ErrSandboxOperationFailed
 	}
+	storageErr := o.sandboxStore.RemoveStrict(context.WithoutCancel(ctx), teamID, sandboxID)
+	if storageErr != nil {
+		logger.L().Error(ctx, "Error removing sandbox state",
+			zap.Error(storageErr),
+			logger.WithSandboxID(sbx.SandboxID),
+		)
+
+		return ErrSandboxOperationFailed
+	}
+	if err := o.removeWorkloadLease(context.WithoutCancel(ctx), sbx); err != nil {
+		logger.L().Error(ctx, "Error removing sandbox workload lease",
+			zap.Error(err),
+			logger.WithSandboxID(sbx.SandboxID),
+		)
+
+		return ErrSandboxOperationFailed
+	}
+
+	return nil
+}
+
+func (o *Orchestrator) removeWorkloadLease(ctx context.Context, sbx sandbox.Sandbox) error {
+	if !usesWorkloadLedger(o.capacityDemandMode) {
+		return nil
+	}
+	if o.workloadLeaseStore == nil {
+		return errors.New("workload store is not configured")
+	}
+
+	removed, err := o.workloadLeaseStore.Remove(ctx, sbx.ClusterID.String(), sbx.SandboxID, sbx.ExecutionID)
+	if err != nil {
+		o.recordWorkloadLifecycle(ctx, "remove", "error")
+
+		return err
+	}
+	if !removed {
+		o.recordWorkloadLifecycle(ctx, "remove", "fence_mismatch")
+
+		return fmt.Errorf("workload lease for execution %q was not removed", sbx.ExecutionID)
+	}
+	o.recordWorkloadLifecycle(ctx, "remove", "success")
 
 	return nil
 }
@@ -146,51 +195,51 @@ func (o *Orchestrator) removeSandboxFromNode(
 		return fmt.Errorf("node '%s' not found", sbx.NodeID)
 	}
 
-	// For remote cluster nodes we are using gPRC metadata for routing registration instead
-	if !node.IsClusterNode() {
-		// Remove the sandbox resources after the sandbox is deleted
-		err := o.routingCatalog.DeleteSandbox(ctx, sbx.SandboxID, sbx.ExecutionID)
-		if err != nil {
-			fields := []zap.Field{
-				zap.Error(err),
-				logger.WithSandboxID(sbx.SandboxID),
-			}
-			if stateAction == sandbox.StateActionKill {
-				fields = append(fields, zap.String("kill_reason", reason.String()))
-			}
-
-			logger.L().Error(ctx, "error removing routing record from catalog", fields...)
-		}
-	}
-
 	sbxlogger.I(sbx).Debug(ctx, "Removing sandbox",
 		zap.Bool("auto_pause", sbx.AutoPause),
 		zap.String("state_action", stateAction.Name),
 	)
 
+	var actionErr error
 	switch stateAction {
 	case sandbox.StateActionPause:
-		err := o.pauseSandbox(ctx, node, sbx, filesystemOnly)
-		if err != nil {
-			if dberrors.IsForeignKeyViolation(err) {
+		actionErr = o.pauseSandbox(ctx, node, sbx, filesystemOnly)
+		if actionErr != nil {
+			if dberrors.IsForeignKeyViolation(actionErr) {
 				killErr := o.killSandboxOnNode(ctx, node, sbx.ToNodeSandbox(), sandbox.KillReasonBaseTemplateMissing)
 				logger.L().Error(ctx, "Pause failed due to missing base template, killed sandbox as fallback",
 					logger.WithSandboxID(sbx.SandboxID),
 					zap.String("base_template_id", sbx.BaseTemplateID),
 					zap.String("kill_reason", sandbox.KillReasonBaseTemplateMissing.String()),
-					zap.NamedError("pause_error", err),
+					zap.NamedError("pause_error", actionErr),
 					zap.NamedError("kill_error", killErr),
 				)
 
-				return fmt.Errorf("failed to pause sandbox '%s': base template no longer exists: %w", sbx.SandboxID, err)
+				return fmt.Errorf("failed to pause sandbox '%s': base template no longer exists: %w", sbx.SandboxID, actionErr)
 			}
 
-			return fmt.Errorf("failed to auto pause sandbox '%s': %w", sbx.SandboxID, err)
+			return fmt.Errorf("failed to auto pause sandbox '%s': %w", sbx.SandboxID, actionErr)
 		}
-
-		return nil
 	case sandbox.StateActionKill:
-		return o.killSandboxOnNode(ctx, node, sbx.ToNodeSandbox(), reason)
+		actionErr = o.killSandboxOnNode(ctx, node, sbx.ToNodeSandbox(), reason)
+	}
+	if actionErr != nil {
+		return actionErr
+	}
+
+	// Local-cluster traffic uses the Redis routing catalog. Remove it only
+	// after the worker operation succeeds, so a failed kill/pause remains
+	// discoverable and retryable.
+	if !node.IsClusterNode() {
+		if err := o.routingCatalog.DeleteSandbox(ctx, sbx.SandboxID, sbx.ExecutionID); err != nil {
+			fields := []zap.Field{zap.Error(err), logger.WithSandboxID(sbx.SandboxID)}
+			if stateAction == sandbox.StateActionKill {
+				fields = append(fields, zap.String("kill_reason", reason.String()))
+			}
+			logger.L().Error(ctx, "error removing routing record from catalog", fields...)
+
+			return err
+		}
 	}
 
 	return nil

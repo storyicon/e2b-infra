@@ -95,8 +95,9 @@ type Server struct {
 	// uploadsWG tracks in-flight async snapshot uploads so a graceful shutdown
 	// can wait for them to finish instead of dropping them. uploadsInFlight is
 	// the live count, used to log drain progress during shutdown.
-	uploadsWG       sync.WaitGroup
-	uploadsInFlight atomic.Int64
+	uploadsWG             sync.WaitGroup
+	uploadsInFlight       atomic.Int64
+	sandboxStartsInFlight atomic.Int64
 
 	done      chan struct{}
 	closeOnce sync.Once
@@ -124,7 +125,10 @@ func New(ctx context.Context, cfg ServiceConfig) (*Server, error) {
 	)
 	go uploadedBuilds.Start()
 
-	startingLimit := cfg.FeatureFlags.IntFlag(ctx, featureflags.MaxStartingInstancesPerNode)
+	startingLimit := resolveNodeLimit(
+		cfg.Config.MaxStartingInstancesPerNode,
+		cfg.FeatureFlags.IntFlag(ctx, featureflags.MaxStartingInstancesPerNode),
+	)
 	startingSandboxes, err := utils.NewAdjustableSemaphore(int64(startingLimit))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create starting sandboxes semaphore: %w", err)
@@ -363,11 +367,12 @@ func (s *Server) DrainSandboxes(ctx context.Context) error {
 	lastLoggedAt := startedAt
 
 	for {
-		remaining := s.sandboxFactory.Sandboxes.Count()
-		if remaining == 0 {
+		state := service.SnapshotShutdownState(s.info, s.sandboxFactory.Sandboxes, s)
+		remaining := int(state.LiveSandboxes)
+		if state.ActivityQuiet {
 			logger.L().Info(ctx, "graceful sandbox drain complete", zap.Int("live_sandboxes", remaining))
 
-			return s.waitSandboxLifecycles(ctx)
+			return nil
 		}
 
 		select {
@@ -393,8 +398,13 @@ func (s *Server) DrainSandboxes(ctx context.Context) error {
 	}
 }
 
-func (s *Server) waitSandboxLifecycles(ctx context.Context) error {
-	return s.sandboxFactory.Sandboxes.WaitLifecycles(ctx)
+func (s *Server) SnapshotUploadsInFlight() uint64 {
+	value := s.uploadsInFlight.Load()
+	if value < 0 {
+		return 0
+	}
+
+	return uint64(value)
 }
 
 func (s *Server) refreshStartingSandboxesLimit(ctx context.Context) {
@@ -406,7 +416,10 @@ func (s *Server) refreshStartingSandboxesLimit(ctx context.Context) {
 		case <-s.done:
 			return
 		case <-ticker.C:
-			limit := s.featureFlags.IntFlag(ctx, featureflags.MaxStartingInstancesPerNode)
+			limit := resolveNodeLimit(
+				s.config.MaxStartingInstancesPerNode,
+				s.featureFlags.IntFlag(ctx, featureflags.MaxStartingInstancesPerNode),
+			)
 			if limit <= 0 {
 				continue
 			}
@@ -417,4 +430,18 @@ func (s *Server) refreshStartingSandboxesLimit(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func resolveNodeLimit(configured, featureFlag int) int {
+	if configured > 0 {
+		return configured
+	}
+
+	return featureFlag
+}
+
+func (s *Server) SandboxCreateConcurrencyLimit() uint64 {
+	_, limit := s.startingSandboxes.Snapshot()
+
+	return uint64(limit)
 }

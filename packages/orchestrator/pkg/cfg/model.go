@@ -3,6 +3,7 @@
 package cfg
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -85,6 +86,8 @@ type Config struct {
 	GRPCPort                    uint16            `env:"GRPC_PORT"                     envDefault:"5008"`
 	InstanceGroupName           string            `env:"INSTANCE_GROUP_NAME"`
 	LocalUploadBaseURL          string            `env:"LOCAL_UPLOAD_BASE_URL"`
+	MaxSandboxesPerNode         int               `env:"MAX_SANDBOXES_PER_NODE"          envDefault:"0"`
+	MaxStartingInstancesPerNode int               `env:"MAX_STARTING_INSTANCES_PER_NODE" envDefault:"0"`
 	NodeIP                      string            `env:"NODE_IP"                       envDefault:"localhost"`
 	NodeLabels                  []string          `env:"NODE_LABELS"                   envSeparator:","`
 	OrchestratorLockPath        string            `env:"ORCHESTRATOR_LOCK_PATH"        envDefault:"/orchestrator.lock"`
@@ -165,6 +168,12 @@ func Parse() (Config, error) {
 	}
 
 	config.BuilderConfig = bc
+	if config.MaxSandboxesPerNode < 0 {
+		return config, errors.New("MAX_SANDBOXES_PER_NODE cannot be negative")
+	}
+	if config.MaxStartingInstancesPerNode < 0 {
+		return config, errors.New("MAX_STARTING_INSTANCES_PER_NODE cannot be negative")
+	}
 
 	if err = config.BuilderConfig.NetworkConfig.Validate(); err != nil {
 		return config, err

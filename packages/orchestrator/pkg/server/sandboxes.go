@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -35,6 +36,7 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/fcversion"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
+	orchestratorinfo "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator-info"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	sbxlogger "github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
 	"github.com/e2b-dev/infra/packages/shared/pkg/retry"
@@ -96,6 +98,31 @@ func filesystemBoot(meta metadata.Template, req *orchestrator.SandboxCreateReque
 	return meta.IsFilesystemOnly() || req.GetFilesystemBoot()
 }
 
+// sandboxCreateFailureError authorizes a bounded retry only when the worker
+// proves that a guest-readiness timeout was fully compensated. Cleanup and
+// unknown failures remain fail-closed.
+func sandboxCreateFailureError(err error) error {
+	message := fmt.Sprintf("failed to create sandbox: %s", err)
+	if errors.Is(err, sandbox.ErrSandboxCleanupFailed) {
+		return orchestrator.NewSandboxCreateError(
+			codes.Internal,
+			orchestrator.SandboxCreateCleanupFailedReason,
+			message,
+			false,
+		)
+	}
+	if errors.Is(err, sandbox.ErrWaitForEnvdTimeout) {
+		return orchestrator.NewSandboxCreateError(
+			codes.DeadlineExceeded,
+			orchestrator.SandboxGuestReadinessTimeoutReason,
+			message,
+			true,
+		)
+	}
+
+	return status.Error(codes.Internal, message)
+}
+
 // firecrackerSupports reports whether the sandbox's RUNNING Firecracker
 // carries a version-gated feature, per the given fcversion predicate. The
 // version is fixed at resume, so the answer cannot change under a running
@@ -131,6 +158,16 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 	// set up tracing
 	ctx, childSpan := tracer.Start(ctx, "sandbox-create")
 	defer childSpan.End()
+
+	if !s.info.AdmitSandboxStart() {
+		return nil, orchestrator.NewSandboxCreateError(
+			codes.ResourceExhausted,
+			orchestrator.SandboxNodeDrainingReason,
+			"node is draining",
+			true,
+		)
+	}
+	defer s.info.FinishSandboxStart()
 
 	isResume := req.GetSandbox().GetSnapshot()
 	// fsOnly reports the ARTIFACT kind (filesystem-only snapshot), mirroring the
@@ -204,13 +241,24 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		}
 	}
 
-	maxRunningSandboxesPerNode := s.featureFlags.IntFlag(ctx, featureflags.MaxSandboxesPerNode)
-
-	runningSandboxes := s.sandboxFactory.Sandboxes.Count()
-	if runningSandboxes >= maxRunningSandboxesPerNode {
+	maxRunningSandboxesPerNode := s.config.MaxSandboxesPerNode
+	var admitted, reservedStart bool
+	if maxRunningSandboxesPerNode > 0 {
+		admitted, reservedStart = reserveSandboxAdmission(&s.sandboxStartsInFlight, s.sandboxFactory.Sandboxes.Count, maxRunningSandboxesPerNode, 0)
+	} else {
+		// Preserve the legacy feature-flag path when the static autoscaling
+		// limit is disabled: it checks running sandboxes only and lets the
+		// independent starting semaphore govern concurrent starts.
+		maxRunningSandboxesPerNode = s.featureFlags.IntFlag(ctx, featureflags.MaxSandboxesPerNode)
+		admitted, reservedStart = reserveSandboxAdmission(&s.sandboxStartsInFlight, s.sandboxFactory.Sandboxes.Count, 0, maxRunningSandboxesPerNode)
+	}
+	if !admitted {
 		telemetry.ReportEvent(ctx, "max number of running sandboxes reached")
 
 		return nil, status.Errorf(codes.ResourceExhausted, "max number of running sandboxes on node reached (%d), please retry", maxRunningSandboxesPerNode)
+	}
+	if reservedStart {
+		defer s.sandboxStartsInFlight.Add(-1)
 	}
 
 	// Check if we've reached the max number of starting instances on this node
@@ -325,7 +373,11 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		)
 	}
 	if err != nil {
-		if errors.Is(err, storage.ErrObjectNotExist) {
+		if errors.Is(err, sandbox.ErrSandboxCleanupFailed) {
+			// Cleanup failure takes precedence over the original resume error:
+			// the worker can no longer prove that all VM resources are gone.
+			s.info.SetStatus(ctx, orchestratorinfo.ServiceInfoStatus_Unhealthy)
+		} else if errors.Is(err, storage.ErrObjectNotExist) {
 			// Snapshot data not found, let the API know the data aren't probably upload yet
 			telemetry.ReportError(ctx, "sandbox files not found", err, telemetry.WithSandboxID(req.GetSandbox().GetSandboxId()))
 
@@ -344,10 +396,14 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 			logger.WithFirecrackerVersion(config.FirecrackerConfig.FirecrackerVersion),
 		)
 
-		return nil, status.Errorf(codes.Internal, "failed to create sandbox: %s", err)
+		return nil, sandboxCreateFailureError(err)
 	}
 
-	s.setupSandboxLifecycle(ctx, sbx)
+	// The resumed VM already owns host resources, but deferred registration keeps
+	// it out of live routing until the envd upgrade completes. Track cleanup now
+	// so a concurrent drain cannot see an all-zero shutdown snapshot if the
+	// upgrade fails and asynchronous teardown is still running.
+	s.sandboxFactory.Sandboxes.TrackLifecycle(ctx, sbx)
 
 	// Resume-time envd live-upgrade. The API /resume maps to Create
 	// with snapshot=true, so this is the real resume path. Flag-driven,
@@ -364,6 +420,7 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 			// is a no-op here and stopSandboxAsync does the physical teardown.
 			sbx.SetStopReason(sandbox.StopReasonKilled)
 			s.sandboxFactory.Sandboxes.MarkStopping(ctx, sbx.Runtime.SandboxID, sbx.LifecycleID)
+			s.setupSandboxLifecycle(ctx, sbx)
 			s.stopSandboxAsync(context.WithoutCancel(ctx), sbx)
 
 			return nil, upErr
@@ -375,6 +432,7 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 	// never routable during the upgrade's sub-second pre-init auth window. Both
 	// the resume and reboot paths above defer this.
 	s.markSandboxLive(ctx, sbx)
+	s.setupSandboxLifecycle(ctx, sbx)
 
 	// Read scheduling metadata after the sandbox resumed so the template's
 	// memfile/rootfs devices (and their headers) are resolved.
@@ -420,6 +478,34 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		// flag, which drifts from this frozen value whenever the flag moves.
 		ResolvedFirecrackerVersion: resolvedFCVersion,
 	}, nil
+}
+
+// reserveSandboxStart atomically accounts for creates that passed admission
+// but are not visible in the running sandbox map yet. A successful create is
+// added to that map before its in-flight reservation is released, so the sum
+// never opens a transient slot above the configured node limit.
+func reserveSandboxStart(inFlight *atomic.Int64, runningCount func() int, limit int) bool {
+	if limit <= 0 {
+		return false
+	}
+
+	for {
+		current := inFlight.Load()
+		if int64(runningCount())+current >= int64(limit) {
+			return false
+		}
+		if inFlight.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+func reserveSandboxAdmission(inFlight *atomic.Int64, runningCount func() int, staticLimit, legacyLimit int) (admitted, reservedStart bool) {
+	if staticLimit > 0 {
+		return reserveSandboxStart(inFlight, runningCount, staticLimit), true
+	}
+
+	return runningCount() < legacyLimit, false
 }
 
 func createVolumeMountModelsFromAPI(volumeMounts []*orchestrator.SandboxVolumeMount) ([]sandbox.VolumeMountConfig, error) {
@@ -1329,8 +1415,9 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 		sbxlogger.I(resumedSbx).Warn(ctx, "failed to get prefetch data for checkpoint", zap.Error(prefetchErr))
 	}
 
-	// Setup lifecycle for the resumed sandbox
-	s.setupSandboxLifecycle(ctx, resumedSbx)
+	// Track cleanup before the deferred-registration sandbox can fail post-init.
+	// This blocks shutdown without making the replacement lifecycle routable.
+	s.sandboxFactory.Sandboxes.TrackLifecycle(ctx, resumedSbx)
 
 	// resume-time envd live-upgrade. Best-effort and tightly gated so
 	// it can never disrupt the universal resume path — except an unrecoverable
@@ -1343,6 +1430,7 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 		// physical teardown.
 		resumedSbx.SetStopReason(sandbox.StopReasonKilled)
 		s.sandboxFactory.Sandboxes.MarkStopping(ctx, resumedSbx.Runtime.SandboxID, resumedSbx.LifecycleID)
+		s.setupSandboxLifecycle(ctx, resumedSbx)
 		s.stopSandboxAsync(context.WithoutCancel(ctx), resumedSbx)
 
 		return nil, upErr
@@ -1351,6 +1439,7 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 	// Promote to the live registry now that any resume-time upgrade's post-/init
 	// has restored auth — the sandbox was resumed with routing deferred.
 	s.markSandboxLive(ctx, resumedSbx)
+	s.setupSandboxLifecycle(ctx, resumedSbx)
 
 	// Embed prefetch data into the metadata so it's uploaded with the snapshot files in a single pass.
 	if prefetchErr == nil {
@@ -1638,6 +1727,9 @@ func (s *Server) setupSandboxLifecycle(ctx context.Context, sbx *sandbox.Sandbox
 		cleanupErr := sbx.Close(ctx)
 		if cleanupErr != nil {
 			sbxlogger.I(sbx).Error(ctx, "failed to cleanup sandbox, will remove from cache", zap.Error(cleanupErr))
+			// Close removes the lifecycle entry even when physical cleanup cannot
+			// be proven. Keep shutdown fail-closed through worker health instead.
+			s.info.SetStatus(ctx, orchestratorinfo.ServiceInfoStatus_Unhealthy)
 		}
 
 		closeErr := s.proxy.RemoveFromPool(sbx.LifecycleID)

@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -23,7 +24,7 @@ type CreationMetadata struct {
 }
 
 type (
-	InsertCallback   func(ctx context.Context, sbx Sandbox)
+	InsertCallback   func(ctx context.Context, sbx Sandbox) error
 	OrphanCallback   func(ctx context.Context, sbx NodeSandbox)
 	CreationCallback func(ctx context.Context, sbx Sandbox, meta CreationMetadata)
 )
@@ -37,6 +38,7 @@ const sbxRemoveTimeout = 10 * time.Second
 type (
 	Storage            = sandboxtypes.Storage
 	ReservationStorage = sandboxtypes.ReservationStorage
+	ReservationOwner   = sandboxtypes.ReservationOwner
 )
 
 type Callbacks struct {
@@ -71,6 +73,14 @@ func NewStore(
 // Add inserts a sandbox into the store. A non-nil creation argument fires the
 // AsyncNewlyCreatedSandbox callback; nil indicates a sync/reconcile re-add.
 func (s *Store) Add(ctx context.Context, sandbox Sandbox, creation *CreationMetadata) error {
+	return s.add(ctx, sandbox, creation, s.storage.Add)
+}
+
+func (s *Store) AddCapacity(ctx context.Context, sandbox Sandbox, creation *CreationMetadata) error {
+	return s.add(ctx, sandbox, creation, s.storage.AddCapacity)
+}
+
+func (s *Store) add(ctx context.Context, sandbox Sandbox, creation *CreationMetadata, persist func(context.Context, Sandbox) error) error {
 	sbxlogger.I(sandbox).Debug(ctx, "Adding sandbox to cache",
 		zap.Bool("newly_created", creation != nil),
 		logger.Time("start_time", sandbox.StartTime),
@@ -83,11 +93,13 @@ func (s *Store) Add(ctx context.Context, sandbox Sandbox, creation *CreationMeta
 		sandbox.EndTime = sandbox.StartTime.Add(sandbox.MaxInstanceLength)
 	}
 
-	err := s.storage.Add(ctx, sandbox)
+	err := persist(ctx, sandbox)
 	if err != nil {
 		return err
 	}
-	s.callbacks.AddSandboxToRoutingTable(ctx, sandbox)
+	if err := s.callbacks.AddSandboxToRoutingTable(ctx, sandbox); err != nil {
+		return fmt.Errorf("add sandbox to routing table: %w", err)
+	}
 
 	if creation != nil {
 		meta := *creation
@@ -102,15 +114,16 @@ func (s *Store) Get(ctx context.Context, teamID uuid.UUID, sandboxID string) (Sa
 }
 
 func (s *Store) Remove(ctx context.Context, teamID uuid.UUID, sandboxID string) {
-	err := s.storage.Remove(ctx, teamID, sandboxID)
-	if err != nil {
-		logger.L().Error(ctx, "Failed to remove sandbox from storage", zap.Error(err), logger.WithSandboxID(sandboxID))
+	if err := s.RemoveStrict(ctx, teamID, sandboxID); err != nil {
+		logger.L().Error(ctx, "Failed to remove sandbox", zap.Error(err), logger.WithSandboxID(sandboxID))
 	}
+}
 
-	err = s.reservations.Release(ctx, teamID, sandboxID)
-	if err != nil {
-		logger.L().Error(ctx, "Failed to release reservation", zap.Error(err), logger.WithSandboxID(sandboxID))
-	}
+func (s *Store) RemoveStrict(ctx context.Context, teamID uuid.UUID, sandboxID string) error {
+	storageErr := s.storage.Remove(ctx, teamID, sandboxID)
+	reservationErr := s.reservations.Release(ctx, teamID, sandboxID)
+
+	return errors.Join(storageErr, reservationErr)
 }
 
 func (s *Store) TeamItems(ctx context.Context, teamID uuid.UUID, states []State) ([]Sandbox, error) {
@@ -155,7 +168,19 @@ func (s *Store) Reconcile(ctx context.Context, sandboxes []NodeSandbox, nodeID s
 }
 
 func (s *Store) Reserve(ctx context.Context, teamID uuid.UUID, sandboxID string, limit int) (finishStart func(Sandbox, error), waitForStart func(ctx context.Context) (Sandbox, error), err error) {
-	finishStart, waitForStart, err = s.reservations.Reserve(ctx, teamID, sandboxID, limit)
+	return s.reserve(ctx, teamID, sandboxID, func() (func(Sandbox, error), func(context.Context) (Sandbox, error), error) {
+		return s.reservations.Reserve(ctx, teamID, sandboxID, limit)
+	})
+}
+
+func (s *Store) ReserveOwned(ctx context.Context, teamID uuid.UUID, sandboxID string, limit int, owner sandboxtypes.ReservationOwner) (finishStart func(Sandbox, error), waitForStart func(ctx context.Context) (Sandbox, error), err error) {
+	return s.reserve(ctx, teamID, sandboxID, func() (func(Sandbox, error), func(context.Context) (Sandbox, error), error) {
+		return s.reservations.ReserveOwned(ctx, teamID, sandboxID, limit, owner)
+	})
+}
+
+func (s *Store) reserve(_ context.Context, teamID uuid.UUID, sandboxID string, reserve func() (func(Sandbox, error), func(context.Context) (Sandbox, error), error)) (finishStart func(Sandbox, error), waitForStart func(ctx context.Context) (Sandbox, error), err error) {
+	finishStart, waitForStart, err = reserve()
 	if err != nil {
 		if errors.Is(err, ErrAlreadyExists) {
 			// Try to get the sandbox from the storage if already exists

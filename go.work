@@ -1,6 +1,7 @@
 go 1.26.6
 
 use (
+	./packages/capacity-controller
 	./packages/api
 	./packages/auth
 	./packages/clickhouse

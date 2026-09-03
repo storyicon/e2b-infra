@@ -71,6 +71,23 @@ func TestParse(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, config.DisableStartupReclaim)
 	})
+
+	t.Run("sandbox node limits can be overridden", func(t *testing.T) {
+		t.Setenv("MAX_SANDBOXES_PER_NODE", "20")
+		t.Setenv("MAX_STARTING_INSTANCES_PER_NODE", "20")
+
+		config, err := Parse()
+		require.NoError(t, err)
+		assert.Equal(t, 20, config.MaxSandboxesPerNode)
+		assert.Equal(t, 20, config.MaxStartingInstancesPerNode)
+	})
+
+	t.Run("sandbox node limits reject negative values", func(t *testing.T) {
+		t.Setenv("MAX_SANDBOXES_PER_NODE", "-1")
+
+		_, err := Parse()
+		require.ErrorContains(t, err, "MAX_SANDBOXES_PER_NODE")
+	})
 }
 
 func TestAdditionalClickhouseEndpoints(t *testing.T) {

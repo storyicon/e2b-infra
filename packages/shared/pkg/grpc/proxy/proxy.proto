@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package proxy;
 
+import "google/protobuf/timestamp.proto";
+
 option go_package = "github.com/e2b-dev/infra/packages/shared/pkg/grpc/proxy;proxygrpc";
 
 // Request to resume a paused sandbox.
@@ -18,7 +20,83 @@ message SandboxResumeResponse {
   string orchestrator_ip = 1;
 }
 
+// Request for the cluster-scoped sandbox workload used by the capacity
+// controller. This service is registered on the private internal gRPC listener.
+message CapacitySnapshotRequest {
+  string cluster_id = 1;
+}
+
+// Aggregated counts deliberately omit sandbox IDs and customer metadata.
+message CapacitySnapshotResponse {
+  uint64 workload_count = 1;
+  uint64 running_count = 2;
+  uint64 active_intent_count = 3;
+  uint64 overlap_count = 4;
+}
+
+// Cached, non-customer worker data used only to select scale-in candidates.
+// Final scale-in eligibility is established by an owned drain and fresh
+// VerifyWorkerScaleIn observations.
+message WorkerScaleInCandidate {
+  string node_id = 1;
+  string nomad_node_id = 2;
+  string service_instance_id = 3;
+  string service_status = 4;
+  uint64 running_sandboxes = 5;
+  uint64 cached_starts_in_flight = 6;
+  uint64 api_placement_in_progress = 7;
+  bool safe_scale_in_supported = 8;
+  google.protobuf.Timestamp observed_at = 9;
+}
+
+message ListScaleInCandidatesRequest {
+  string cluster_id = 1;
+}
+
+message ListScaleInCandidatesResponse {
+  repeated WorkerScaleInCandidate candidates = 1;
+}
+
+message WorkerScaleInRequest {
+  string cluster_id = 1;
+  string node_id = 2;
+  string expected_service_instance_id = 3;
+  string operation_id = 4;
+  reserved 5;
+  reserved "termination_release_token";
+}
+
+// A real-time worker response. Counts are authoritative only when
+// safe_scale_in_supported is true. No Sandbox or customer identifiers leave
+// the API through this contract.
+message WorkerScaleInState {
+  string node_id = 1;
+  string service_instance_id = 2;
+  string service_status = 3;
+  bool safe_scale_in_supported = 4;
+  uint64 running_sandboxes = 5;
+  uint64 starts_in_flight = 6;
+  uint64 lifecycle_cleanups_in_flight = 7;
+  uint64 snapshot_uploads_in_flight = 8;
+  bool shutdown_ready = 9;
+  bool sandbox_list_empty = 10;
+  google.protobuf.Timestamp observed_at = 11;
+  string operation_id = 12;
+  reserved 13, 14;
+  reserved "termination_acquired", "termination_release_token";
+}
+
 // SandboxService is used by the client-proxy to resume sandboxes.
 service SandboxService {
   rpc ResumeSandbox(SandboxResumeRequest) returns (SandboxResumeResponse);
+}
+
+// CapacityService exposes the minimum private contract required for node
+// scale-out reconciliation.
+service CapacityService {
+  rpc GetCapacitySnapshot(CapacitySnapshotRequest) returns (CapacitySnapshotResponse);
+  rpc ListScaleInCandidates(ListScaleInCandidatesRequest) returns (ListScaleInCandidatesResponse);
+  rpc BeginWorkerScaleIn(WorkerScaleInRequest) returns (WorkerScaleInState);
+  rpc VerifyWorkerScaleIn(WorkerScaleInRequest) returns (WorkerScaleInState);
+  rpc CancelWorkerScaleIn(WorkerScaleInRequest) returns (WorkerScaleInState);
 }

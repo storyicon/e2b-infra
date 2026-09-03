@@ -255,6 +255,10 @@ module "api" {
   aws_ecr_account_repository_domain = local.aws_ecr_account_repository_domain
   loki_bucket_arn                   = data.aws_s3_bucket.loki_bucket.arn
 
+  capacity_autoscaler_enabled  = var.capacity_autoscaler_enabled
+  capacity_scale_in_enforced   = var.capacity_scale_in_enforced
+  client_autoscaling_group_arn = module.client.autoscaling_group_arn
+
 }
 
 module "clickhouse" {
@@ -311,6 +315,8 @@ module "build" {
 
   image_family_prefix = var.build_image_family_prefix
   cluster_size        = var.build_cluster_size
+  min_size            = var.build_cluster_size
+  max_size            = var.build_cluster_size
   machine_type        = var.build_machine_type
 
   node_pool_name                    = var.build_node_pool_name
@@ -356,7 +362,12 @@ module "client" {
 
   image_family_prefix = var.client_image_family_prefix
   cluster_size        = var.client_cluster_size
+  min_size            = var.client_cluster_min_size
+  max_size            = var.client_cluster_max_size
   machine_type        = var.client_machine_type
+
+  protect_from_scale_in        = true
+  scale_in_protection_required = var.capacity_scale_in_enforced
 
   node_pool_name                    = var.client_node_pool_name
   node_labels                       = var.client_node_labels

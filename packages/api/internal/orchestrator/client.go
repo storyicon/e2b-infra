@@ -13,6 +13,7 @@ import (
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
 )
 
 const nodeHealthCheckTimeout = time.Second * 2
@@ -131,8 +132,13 @@ func (o *Orchestrator) listNomadNodes(ctx context.Context) ([]nodemanager.NodePl
 
 	result := make([]nodemanager.NodePlaneInstance, 0, len(instances))
 	for _, i := range instances {
+		nomadNodeID := ""
+		if i.Backend == servicediscovery.BackendNomad {
+			nomadNodeID = i.NodeID
+		}
 		result = append(result, nodemanager.NodePlaneInstance{
 			WorkloadID:          i.WorkloadID,
+			NomadNodeID:         nomadNodeID,
 			OrchestratorAddress: i.Address(),
 			IPAddress:           i.IPAddress,
 			Backend:             i.Backend,
@@ -260,6 +266,36 @@ func (o *Orchestrator) discoverClusterNode(ctx context.Context, clusterID uuid.U
 			o.connectToClusterNode(ctx, cluster, instance)
 		})
 	}
+}
+
+// refreshCapacityNodes pulls newly joined orchestrators into the local node
+// cache while a capacity-waiting request is retrying placement. Without this
+// on-demand refresh, the request can wait for the periodic discovery interval
+// even after the autoscaled instance is ready in Nomad.
+func (o *Orchestrator) refreshCapacityNodes(ctx context.Context, clusterID uuid.UUID) {
+	key := "capacity-refresh:" + clusterID.String()
+	o.discoveryGroup.Do(key, func() (any, error) {
+		o.capacityRefreshMu.Lock()
+		lastRefresh := o.capacityRefreshes[key]
+		if o.capacityRetryInterval > 0 && time.Since(lastRefresh) < o.capacityRetryInterval {
+			o.capacityRefreshMu.Unlock()
+
+			return nil, nil
+		}
+		if o.capacityRefreshes == nil {
+			o.capacityRefreshes = make(map[string]time.Time)
+		}
+		o.capacityRefreshes[key] = time.Now()
+		o.capacityRefreshMu.Unlock()
+
+		if clusterID == consts.LocalClusterID {
+			o.discoverNomadNodes(ctx)
+		} else {
+			o.discoverClusterNode(ctx, clusterID)
+		}
+
+		return nil, nil
+	})
 }
 
 func (o *Orchestrator) GetClusterNodes(clusterID uuid.UUID) []*nodemanager.Node {

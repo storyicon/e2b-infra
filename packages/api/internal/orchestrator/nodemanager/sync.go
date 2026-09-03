@@ -71,6 +71,7 @@ func (n *Node) Sync(ctx context.Context, store *sandbox.Store) error {
 		)
 		// Update host metrics from service info
 		n.UpdateMetricsFromServiceInfoResponse(nodeInfo)
+		n.updateScaleInObservation(nodeInfo)
 
 		orphanCandidates, instancesErr := n.GetOrphanCandidates(ctx)
 		if instancesErr != nil {
@@ -102,7 +103,13 @@ func (n *Node) Sync(ctx context.Context, store *sandbox.Store) error {
 		)
 		// Local status change, the timestamp is the time of the first unhealthy observation.
 		n.markUnhealthyLocal(ctx)
+	} else {
+		n.recordSuccessfulSync()
 	}
 
 	return nil
+}
+
+func (n *Node) recordSuccessfulSync() {
+	n.consecutiveCreateUnavailable.Store(0)
 }

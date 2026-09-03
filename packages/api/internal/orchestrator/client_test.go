@@ -223,6 +223,30 @@ func TestGetOrConnectNode_ConcurrentCacheMiss_SharesDiscovery(t *testing.T) {
 		"singleflight should deduplicate concurrent discovery attempts")
 }
 
+func TestRefreshCapacityNodesThrottlesSequentialDiscovery(t *testing.T) {
+	t.Parallel()
+
+	var discoveryAttempts atomic.Int32
+	nomadClient := newNomadMock(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/service/orchestrator" {
+			http.NotFound(w, r)
+
+			return
+		}
+		discoveryAttempts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(t, json.NewEncoder(w).Encode([]*nomadapi.ServiceRegistration{}))
+	})
+	o := newTestOrchestrator(t, nomadClient)
+	o.capacityRetryInterval = time.Minute
+
+	for range 20 {
+		o.refreshCapacityNodes(t.Context(), consts.LocalClusterID)
+	}
+
+	require.Equal(t, int32(1), discoveryAttempts.Load())
+}
+
 // TestConnectToNode_SingleflightDedup verifies that concurrent connectToNode
 // calls for the same WorkloadID share a single connection attempt
 func TestConnectToNode_SingleflightDedup(t *testing.T) {
@@ -307,6 +331,7 @@ func TestGetOrConnectNode_CacheMiss_DiscoversAndConnects(t *testing.T) {
 	require.NotNil(t, node, "getOrConnectNode must discover and connect the node via Nomad")
 	assert.Equal(t, orchestratorNodeID, node.ID)
 	assert.Equal(t, nomadFullID[:consts.NodeIDLength], node.WorkloadID)
+	assert.Equal(t, nomadFullID, node.NomadNodeID)
 	assert.Equal(t, servicediscovery.BackendNomad, node.Backend, "the discovering backend's platform must reach the node catalog")
 }
 

@@ -67,6 +67,23 @@ func (o *Orchestrator) setupMetrics(meterProvider metric.MeterProvider) error {
 		return fmt.Errorf("failed to create resume origin node remap counter: %w", err)
 	}
 
+	o.startIntentLifecycleCounter, err = meter.Int64Counter(
+		"api.sandbox.start_intent.lifecycle",
+		metric.WithDescription("Sandbox start-intent admission lifecycle events"),
+		metric.WithUnit("{event}"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create start intent lifecycle counter: %w", err)
+	}
+	o.workloadLifecycleCounter, err = meter.Int64Counter(
+		"api.sandbox.workload.lifecycle",
+		metric.WithDescription("Sandbox workload-v2 lifecycle events"),
+		metric.WithUnit("{event}"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create workload lifecycle counter: %w", err)
+	}
+
 	// Observable gauge that reads sandbox counts from Redis on each collection interval.
 	// This replaces the old UpDownCounter which drifted across multiple API instances.
 	sandboxCountGauge, err := telemetry.GetGaugeInt(meter, telemetry.SandboxCountGaugeName)

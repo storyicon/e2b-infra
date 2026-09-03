@@ -54,6 +54,28 @@ variable "cluster_size" {
   default = 1
 }
 
+variable "min_size" {
+  type        = number
+  description = "Minimum number of instances in the Auto Scaling group"
+}
+
+variable "max_size" {
+  type        = number
+  description = "Maximum number of instances in the Auto Scaling group"
+}
+
+variable "protect_from_scale_in" {
+  type        = bool
+  description = "Whether new Auto Scaling group instances start protected from normal scale-in"
+  default     = false
+}
+
+variable "scale_in_protection_required" {
+  type        = bool
+  description = "Whether configuration must enable scale-in protection for new instances"
+  default     = false
+}
+
 variable "machine_type" {
   type    = string
   default = "m8i.4xlarge"

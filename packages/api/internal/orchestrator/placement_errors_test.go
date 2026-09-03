@@ -46,6 +46,20 @@ func TestPlacementAPIError(t *testing.T) {
 			wantMsg:       "Failed to place sandbox: not enough capacity for the requested resources right now, please retry shortly",
 		},
 		{
+			name:          "capacity wait timeout",
+			err:           CapacityWaitTimeoutError{},
+			wantCode:      http.StatusGatewayTimeout,
+			wantErrorCode: "sandbox_placement_timeout",
+			wantMsg:       "Failed to place sandbox: capacity did not become available before the wait deadline, please retry",
+		},
+		{
+			name:          "capacity demand store unavailable",
+			err:           CapacityDemandStoreError{Err: errors.New("redis unavailable")},
+			wantCode:      http.StatusServiceUnavailable,
+			wantErrorCode: "sandbox_capacity_unavailable",
+			wantMsg:       "Failed to place sandbox: capacity management is temporarily unavailable, please retry shortly",
+		},
+		{
 			name:          "no eligible node",
 			err:           placement.FailedToPlaceSandboxError{},
 			wantCode:      http.StatusServiceUnavailable,

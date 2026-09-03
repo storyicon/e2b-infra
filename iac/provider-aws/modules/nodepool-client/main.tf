@@ -165,12 +165,14 @@ resource "aws_launch_template" "client" {
 }
 
 resource "aws_autoscaling_group" "client" {
-  name                = "${var.prefix}${var.name}"
-  vpc_zone_identifier = var.vpc_private_subnets
-  health_check_type   = "EC2"
+  name                  = "${var.prefix}${var.name}"
+  vpc_zone_identifier   = var.vpc_private_subnets
+  health_check_type     = "EC2"
+  protect_from_scale_in = var.protect_from_scale_in
 
-  min_size = var.cluster_size
-  max_size = var.cluster_size
+  min_size         = var.min_size
+  desired_capacity = var.cluster_size
+  max_size         = var.max_size
 
   launch_template {
     id      = aws_launch_template.client.id
@@ -183,5 +185,15 @@ resource "aws_autoscaling_group" "client" {
 
   lifecycle {
     ignore_changes = [desired_capacity]
+
+    precondition {
+      condition     = var.min_size <= var.cluster_size && var.cluster_size <= var.max_size
+      error_message = "Client node pool size must satisfy min_size <= cluster_size <= max_size."
+    }
+
+    precondition {
+      condition     = !var.scale_in_protection_required || var.protect_from_scale_in
+      error_message = "Safe scale-in enforcement requires protect_from_scale_in=true."
+    }
   }
 }

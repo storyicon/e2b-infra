@@ -89,6 +89,21 @@ const (
 // ErrWaitForEnvdTimeout is the cancel cause used when WaitForEnvd exceeds its timeout.
 var ErrWaitForEnvdTimeout = errors.New("syncing took too long")
 
+// ErrSandboxCleanupFailed marks a create whose compensating cleanup reported
+// an error. Callers must not retry such a create because resource state is no
+// longer proven absent.
+var ErrSandboxCleanupFailed = errors.New("sandbox create cleanup failed")
+
+// JoinCreateAndCleanupErrors preserves both the create cause and cleanup
+// result while making failed compensation machine-detectable.
+func JoinCreateAndCleanupErrors(createErr, cleanupErr error) error {
+	if cleanupErr == nil {
+		return createErr
+	}
+
+	return errors.Join(createErr, fmt.Errorf("%w: %w", ErrSandboxCleanupFailed, cleanupErr))
+}
+
 // ErrFcProcessExited is the cancel cause used when the Firecracker process exits during WaitForEnvd.
 var ErrFcProcessExited = errors.New("fc process exited prematurely")
 
@@ -702,7 +717,7 @@ func (f *Factory) CreateSandbox(
 	defer func() {
 		if e != nil {
 			cleanupErr := cleanup.Run(ctx)
-			e = errors.Join(e, cleanupErr)
+			e = JoinCreateAndCleanupErrors(e, cleanupErr)
 			handleSpanError(execSpan, &e)
 			execSpan.End()
 		}
@@ -1028,7 +1043,7 @@ func (f *Factory) ResumeSandbox(
 	defer func() {
 		if e != nil {
 			cleanupErr := cleanup.Run(ctx)
-			e = errors.Join(e, cleanupErr)
+			e = JoinCreateAndCleanupErrors(e, cleanupErr)
 			handleSpanError(execSpan, &e)
 			execSpan.End()
 		}
@@ -3537,7 +3552,7 @@ func (s *Sandbox) bestEffortEnvdReinit(ctx context.Context) {
 		}
 	}()
 
-	if err := s.initEnvd(initCtx, StartTypeResume, false); err != nil {
+	if _, err := s.initEnvd(initCtx, StartTypeResume, false); err != nil {
 		s.log().Warn(ctx, "envd re-init after in-place resume failed (guest clock may lag)", zap.Error(err))
 	}
 }
@@ -3865,6 +3880,7 @@ func (s *Sandbox) WaitForEnvd(
 	start := time.Now()
 	ctx, span := tracer.Start(ctx, "sandbox-wait-for-start")
 	defer span.End()
+	attempts := int64(0)
 
 	// Record the per-start KPIs, the envd-init counter, and StartedAt only on the
 	// FIRST WaitForEnvd for this handler (see startupRecorded). A later call — the
@@ -3885,13 +3901,23 @@ func (s *Sandbox) WaitForEnvd(
 		// cover its timing/size.
 		if !s.skipStartupMetrics {
 			duration := time.Since(start).Milliseconds()
+			exitType := classifyEnvdInitExit(e)
+			span.SetAttributes(
+				attribute.Int64("envd.attempt_timeout_ms", s.internalConfig.EnvdInitRequestTimeout.Milliseconds()),
+				attribute.Int64("envd.wait_budget_ms", timeout.Milliseconds()),
+				attribute.Int64("envd.attempts", attempts),
+				attribute.Int64("envd.elapsed_ms", duration),
+				attribute.String("envd.exit_type", string(exitType)),
+			)
 			// success is kept for backward compatibility until consumers move to exit_type.
 			waitForEnvdDurationHistogram.Record(ctx, duration, metric.WithAttributes(
 				telemetry.WithEnvdVersion(s.Config.Envd.Version),
 				attribute.Int64("timeout_ms", s.internalConfig.EnvdInitRequestTimeout.Milliseconds()),
+				attribute.Int64("attempt_timeout_ms", s.internalConfig.EnvdInitRequestTimeout.Milliseconds()),
+				attribute.Int64("wait_budget_ms", timeout.Milliseconds()),
 				attribute.Bool("success", e == nil),
 				attribute.String("start_type", string(startType)),
-				attribute.String("exit_type", string(classifyEnvdInitExit(e))),
+				attribute.String("exit_type", string(exitType)),
 			))
 
 			// The demand-fault working set the guest needed to reach this point.
@@ -3936,7 +3962,9 @@ func (s *Sandbox) WaitForEnvd(
 		}
 	}()
 
-	if err := s.initEnvd(ctx, startType, firstStart); err != nil {
+	var err error
+	attempts, err = s.initEnvd(ctx, startType, firstStart)
+	if err != nil {
 		return fmt.Errorf("failed to init new envd: %w", err)
 	}
 
