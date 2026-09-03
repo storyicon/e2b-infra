@@ -79,17 +79,18 @@ func (r *Reconciler) requireScaleInDependencies() error {
 	if r.scaleIn == nil || r.scaleIn.inventory == nil || r.scaleIn.workers == nil || r.scaleIn.infrastructure == nil {
 		return errors.New("scale-in dependencies are required in enforce mode")
 	}
+
 	return nil
 }
 
-func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, workloadCount int64, result Result) (Result, error) {
-	return r.reconcileScaleInAt(ctx, now, func() time.Time { return now }, workloadCount, result, true)
+func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, workloadCount int64) (Result, error) {
+	return r.reconcileScaleInAt(ctx, func() time.Time { return now }, workloadCount, Result{}, true)
 }
 
 // reconcileScaleInAt is level-triggered: every safety decision is reconstructed
 // from fresh Nomad, Worker, and ASG state. Process-local fields only rate-limit
 // idempotent work and are never required to recover correctness.
-func (r *Reconciler) reconcileScaleInAt(ctx context.Context, now time.Time, currentTime func() time.Time, workloadCount int64, result Result, allowNewDrains bool) (Result, error) {
+func (r *Reconciler) reconcileScaleInAt(ctx context.Context, currentTime func() time.Time, workloadCount int64, result Result, allowNewDrains bool) (Result, error) {
 	if r.config.ScaleInMode == "" || r.config.ScaleInMode == ScaleInModeOff {
 		return result, nil
 	}
@@ -100,16 +101,19 @@ func (r *Reconciler) reconcileScaleInAt(ctx context.Context, now time.Time, curr
 	nomadNodes, err := r.scaleIn.inventory.Inventory(ctx, r.config.NodePool)
 	if err != nil {
 		r.scaleIn.stabilizer.Reset()
+
 		return result, fmt.Errorf("read scale-in Nomad inventory: %w", err)
 	}
 	workerCandidates, err := r.scaleIn.workers.ListScaleInCandidates(ctx, r.config.ClusterID)
 	if err != nil {
 		r.scaleIn.stabilizer.Reset()
+
 		return result, fmt.Errorf("read worker scale-in candidates: %w", err)
 	}
 	cloud, err := r.scaleIn.infrastructure.Snapshot(ctx, r.config.ASGName)
 	if err != nil {
 		r.scaleIn.stabilizer.Reset()
+
 		return result, fmt.Errorf("read scale-in ASG snapshot: %w", err)
 	}
 	observationTime := currentTime()
@@ -119,6 +123,7 @@ func (r *Reconciler) reconcileScaleInAt(ctx context.Context, now time.Time, curr
 	plan, err := BuildScaleInPlan(workloadCount, r.config.SlotsPerNode, r.config.MinNodes, r.config.ScaleInHeadroom, nodes)
 	if err != nil {
 		r.scaleIn.stabilizer.Reset()
+
 		return result, err
 	}
 	result.ScaleInSafeRequired = plan.SafeRequired
@@ -156,6 +161,7 @@ func (r *Reconciler) reconcileScaleInAt(ctx context.Context, now time.Time, curr
 		if err := r.setProtection(ctx, invalidUnprotected, true); err != nil {
 			return result, errors.Join(verifyErr, fmt.Errorf("protect non-armed ASG members: %w", err))
 		}
+
 		return result, verifyErr
 	}
 	if verifyErr != nil {
@@ -183,6 +189,7 @@ func (r *Reconciler) reconcileScaleInAt(ctx context.Context, now time.Time, curr
 			result.Scaled = true
 			result.TargetNodes = target
 		}
+
 		return result, nil
 	}
 
@@ -194,6 +201,7 @@ func (r *Reconciler) reconcileScaleInAt(ctx context.Context, now time.Time, curr
 	if shrinkable == 0 || !allowNewDrains {
 		cancelled, cancelErr := r.restoreOperations(ctx, currentTime, operations, cloud, ScaleInGlobalBudget)
 		result.ScaleInCancelled += cancelled
+
 		return result, cancelErr
 	}
 
@@ -202,11 +210,12 @@ func (r *Reconciler) reconcileScaleInAt(ctx context.Context, now time.Time, curr
 		if err := r.setProtection(ctx, extra, true); err != nil {
 			return result, fmt.Errorf("protect surplus armed workers: %w", err)
 		}
+
 		return result, nil
 	}
 
 	if len(armed) > 0 {
-		reduced, err := r.lowerDesiredFromFreshState(ctx, currentTime, workloadCount, armed)
+		reduced, err := r.lowerDesiredFromFreshState(ctx, workloadCount, armed)
 		if err != nil {
 			return result, err
 		}
@@ -214,6 +223,7 @@ func (r *Reconciler) reconcileScaleInAt(ctx context.Context, now time.Time, curr
 			result.Scaled = true
 			result.TargetNodes = cloud.DesiredCapacity - reduced
 		}
+
 		return result, nil
 	}
 
@@ -232,6 +242,7 @@ func (r *Reconciler) reconcileScaleInAt(ctx context.Context, now time.Time, curr
 	draining, cancelled, err := r.openDrains(ctx, currentTime, observationTime, nodes, nomadNodes, operations, cloud, plan)
 	result.ScaleInDraining += draining
 	result.ScaleInCancelled += cancelled
+
 	return result, err
 }
 
@@ -245,20 +256,21 @@ func (r *Reconciler) completeSupersededOperations(ctx context.Context, now time.
 		}
 		operation := *node.Operation
 		completedThisOperation := false
-		if operation.Stage == "restored" {
+		switch {
+		case operation.Stage == "restored":
 			if err := r.scaleIn.inventory.CompleteRestore(ctx, node, operation); err != nil {
 				return completed, progressed, fmt.Errorf("complete superseded scale-in %q: %w", operation.OperationID, err)
 			}
 			completed++
 			progressed = true
 			completedThisOperation = true
-		} else if operation.Stage != "restoring" {
+		case operation.Stage != "restoring":
 			operation.Stage = "restoring"
 			if err := r.scaleIn.inventory.MarkOperationStage(ctx, node, operation); err != nil {
 				return completed, progressed, fmt.Errorf("persist superseded restoring stage %q: %w", operation.OperationID, err)
 			}
 			progressed = true
-		} else {
+		default:
 			if err := r.finishNomadRestore(ctx, node, operation); err != nil {
 				return completed, progressed, fmt.Errorf("restore superseded scale-in %q: %w", operation.OperationID, err)
 			}
@@ -267,7 +279,7 @@ func (r *Reconciler) completeSupersededOperations(ctx context.Context, now time.
 			completedThisOperation = true
 		}
 		if completedThisOperation {
-			r.recordScaleInTransition(node.NodeID, operation, "complete", "identity_replaced", "")
+			r.recordScaleInTransition(node.NodeID, operation, "complete", "identity_replaced")
 		}
 	}
 
@@ -355,6 +367,7 @@ func (r *Reconciler) progressOwnedDrains(ctx context.Context, currentTime func()
 			return result, fmt.Errorf("arm %d scale-in workers: %w", len(ready), err)
 		}
 		result.protectionWritten = true
+
 		return result, nil
 	}
 
@@ -380,8 +393,11 @@ func (r *Reconciler) openDrains(ctx context.Context, currentTime func() time.Tim
 	}
 	var attempts, nonEmpty, draining, cancelled int32
 	for _, candidate := range rotateScaleInCandidates(EligibleScaleInCandidates(nodes, observationTime, r.config.ScaleInMinimumAge), r.scaleIn.candidateCursor) {
-		if available <= 0 || attempts >= maxScaleInProgressPerReconcile || ctx.Err() != nil {
+		if available <= 0 || attempts >= maxScaleInProgressPerReconcile {
 			break
+		}
+		if err := ctx.Err(); err != nil {
+			return draining, cancelled, err
 		}
 		r.scaleIn.candidateCursor++
 		instance, member := cloud.Instances[candidate.NodeID]
@@ -410,7 +426,7 @@ func (r *Reconciler) openDrains(ctx context.Context, currentTime func() time.Tim
 			// reconstruct ownership from fresh inventory on the next reconcile.
 			return draining, cancelled, fmt.Errorf("mark Nomad drain %q: %w", operation.OperationID, err)
 		}
-		r.recordScaleInTransition(candidate.NodeID, operation, "nomad_marked", "success", "")
+		r.recordScaleInTransition(candidate.NodeID, operation, "nomad_marked", "success")
 		nomadNode.Draining, nomadNode.Eligible, nomadNode.Operation = true, false, &operation
 		state, err := r.scaleIn.workers.BeginWorkerScaleIn(ctx, r.config.ClusterID, candidate.NodeID, candidate.ServiceInstanceID, operation.OperationID)
 		if err != nil || !ownedWorkerMatches(state, candidate.NodeID, candidate.ServiceInstanceID, operation.OperationID) {
@@ -418,6 +434,7 @@ func (r *Reconciler) openDrains(ctx context.Context, currentTime func() time.Tim
 				err = errors.New("worker identity or operation ownership changed while beginning scale-in")
 			}
 			_, _, rollbackErr := r.restoreOne(ctx, nomadNode, operation, instance)
+
 			return draining, cancelled, errors.Join(fmt.Errorf("begin worker drain %q: %w", operation.OperationID, err), rollbackErr)
 		}
 		isNonEmpty := candidate.KnownWorkload > 0 || !workerShutdownReady(state)
@@ -429,6 +446,7 @@ func (r *Reconciler) openDrains(ctx context.Context, currentTime func() time.Tim
 			if done {
 				cancelled++
 			}
+
 			continue
 		}
 		if isNonEmpty {
@@ -437,9 +455,10 @@ func (r *Reconciler) openDrains(ctx context.Context, currentTime func() time.Tim
 		operation.Stage = "worker_draining"
 		if err := r.scaleIn.inventory.MarkOperationStage(ctx, nomadNode, operation); err != nil {
 			_, _, rollbackErr := r.restoreOne(ctx, nomadNode, operation, instance)
+
 			return draining, cancelled, errors.Join(fmt.Errorf("persist worker drain stage %q: %w", operation.OperationID, err), rollbackErr)
 		}
-		r.recordScaleInTransition(candidate.NodeID, operation, "worker_draining", "success", "")
+		r.recordScaleInTransition(candidate.NodeID, operation, "worker_draining", "success")
 		draining++
 		available--
 	}
@@ -457,6 +476,7 @@ func (r *Reconciler) classifyUnprotected(ctx context.Context, cloud ScaleInASGSn
 			if instance.LifecycleState == "InService" {
 				invalid = append(invalid, instanceID)
 			}
+
 			continue
 		}
 		state, err := r.scaleIn.workers.VerifyWorkerScaleIn(ctx, r.config.ClusterID, instanceID, node.Operation.ServiceInstanceID, node.Operation.OperationID)
@@ -465,6 +485,7 @@ func (r *Reconciler) classifyUnprotected(ctx context.Context, cloud ScaleInASGSn
 			if err != nil && firstErr == nil {
 				firstErr = fmt.Errorf("verify armed worker %q: %w", instanceID, err)
 			}
+
 			continue
 		}
 		armed = append(armed, instanceID)
@@ -485,6 +506,7 @@ func (r *Reconciler) setProtection(ctx context.Context, instanceIDs []string, pr
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -497,10 +519,11 @@ func asgSettled(cloud ScaleInASGSnapshot) bool {
 			return false
 		}
 	}
+
 	return true
 }
 
-func (r *Reconciler) lowerDesiredFromFreshState(ctx context.Context, currentTime func() time.Time, workloadCount int64, expectedArmed []string) (int32, error) {
+func (r *Reconciler) lowerDesiredFromFreshState(ctx context.Context, workloadCount int64, expectedArmed []string) (int32, error) {
 	workload, err := r.snapshot.Snapshot(ctx, r.config.ClusterID)
 	if err != nil {
 		return 0, fmt.Errorf("refresh workload before desired reduction: %w", err)
@@ -529,6 +552,7 @@ func (r *Reconciler) lowerDesiredFromFreshState(ctx context.Context, currentTime
 		if err := r.setProtection(ctx, invalid, true); err != nil {
 			return 0, errors.Join(verifyErr, err)
 		}
+
 		return 0, verifyErr
 	}
 	if verifyErr != nil {
@@ -567,6 +591,7 @@ func sameStringSetSubset(actual, expected []string) bool {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -588,6 +613,7 @@ func (r *Reconciler) restoreOperations(ctx context.Context, currentTime func() t
 			if firstErr == nil {
 				firstErr = fmt.Errorf("restore scale-in %q: %w", node.Operation.OperationID, err)
 			}
+
 			continue
 		}
 		if done {
@@ -595,6 +621,7 @@ func (r *Reconciler) restoreOperations(ctx context.Context, currentTime func() t
 			cancelled++
 		}
 	}
+
 	return cancelled, firstErr
 }
 
@@ -606,6 +633,7 @@ func (r *Reconciler) restoreOne(ctx context.Context, node NomadScaleInNode, oper
 		if err := r.setProtection(ctx, []string{node.NodeID}, true); err != nil {
 			return false, false, err
 		}
+
 		return false, true, nil
 	}
 	if instance.LifecycleState != "InService" {
@@ -626,7 +654,8 @@ func (r *Reconciler) restoreOne(ctx context.Context, node NomadScaleInNode, oper
 		if err := r.scaleIn.inventory.MarkOperationStage(ctx, node, operation); err != nil {
 			return false, false, fmt.Errorf("persist restoring stage: %w", err)
 		}
-		r.recordScaleInTransition(node.NodeID, operation, "restoring", "started", "")
+		r.recordScaleInTransition(node.NodeID, operation, "restoring", "started")
+
 		return false, false, nil
 	}
 	state, err := r.scaleIn.workers.CancelWorkerScaleIn(ctx, r.config.ClusterID, node.NodeID, operation.ServiceInstanceID, operation.OperationID)
@@ -639,7 +668,7 @@ func (r *Reconciler) restoreOne(ctx context.Context, node NomadScaleInNode, oper
 	if err := r.finishNomadRestore(ctx, node, operation); err != nil {
 		return false, false, err
 	}
-	r.recordScaleInTransition(node.NodeID, operation, "complete", "cancelled", "")
+	r.recordScaleInTransition(node.NodeID, operation, "complete", "cancelled")
 
 	return true, false, nil
 }
@@ -650,6 +679,7 @@ func (r *Reconciler) finishNomadRestore(ctx context.Context, node NomadScaleInNo
 			return err
 		}
 	}
+
 	return r.scaleIn.inventory.CompleteRestore(ctx, node, operation)
 }
 
@@ -657,6 +687,7 @@ func (r *Reconciler) completeDepartedOperation(ctx context.Context, node NomadSc
 	if (operation.Stage == "restoring" || operation.Stage == "restored") && !node.Draining && node.Eligible {
 		return r.scaleIn.inventory.CompleteRestore(ctx, node, operation)
 	}
+
 	return r.scaleIn.inventory.CompleteTermination(ctx, node, operation)
 }
 
@@ -672,7 +703,7 @@ func (r *Reconciler) resumeNomadMarked(ctx context.Context, node NomadScaleInNod
 	if err := r.scaleIn.inventory.MarkOperationStage(ctx, node, operation); err != nil {
 		return err
 	}
-	r.recordScaleInTransition(node.NodeID, operation, "worker_draining", "recovered", "")
+	r.recordScaleInTransition(node.NodeID, operation, "worker_draining", "recovered")
 
 	return nil
 }
@@ -695,11 +726,11 @@ func (r *Reconciler) recordScaleInCooldown(now time.Time, node NomadScaleInNode,
 	}
 }
 
-func (r *Reconciler) recordScaleInTransition(nodeID string, operation NomadScaleInOperation, stage, outcome, reason string) {
+func (r *Reconciler) recordScaleInTransition(nodeID string, operation NomadScaleInOperation, stage, outcome string) {
 	r.recordAudit(ScaleAuditEvent{
 		Event: AuditEventScaleInTransition, ControllerInstanceID: r.controllerInstanceID,
 		Mode: r.config.Mode, Outcome: outcome, ScaleInOperationID: operation.OperationID,
-		ScaleInNodeID: nodeID, ScaleInStage: stage, ScaleInReason: reason,
+		ScaleInNodeID: nodeID, ScaleInStage: stage,
 	})
 }
 
@@ -710,6 +741,7 @@ func activeScaleInOperations(nodes []NomadScaleInNode) []NomadScaleInNode {
 			result = append(result, node)
 		}
 	}
+
 	return result
 }
 
@@ -717,6 +749,7 @@ func hasActiveScaleInOperation(node NomadScaleInNode) bool {
 	if node.Operation == nil || node.Operation.Stage == "complete" {
 		return false
 	}
+
 	return node.Operation.Stage != "restored" || !node.Eligible || node.Draining
 }
 
@@ -739,6 +772,7 @@ func mergeScaleInNodes(now time.Time, nomadNodes []NomadScaleInNode, candidates 
 		nomad, found := nomadByID[candidate.NomadNodeID]
 		if !observed || candidate.NomadNodeID == "" || !found || nomad.NodeID != instanceID {
 			result = append(result, ScaleInNode{NodeID: instanceID, LaunchTime: instance.LaunchTime, Terminating: instance.LifecycleState != "InService"})
+
 			continue
 		}
 		result = append(result, ScaleInNode{
@@ -770,8 +804,10 @@ func operationSupersededByReadyWorker(now time.Time, node NomadScaleInNode, cand
 			// longer exists, so only the owned Nomad marker needs restoration.
 			return found && replacement.Ready
 		}
+
 		return found && replacement.Ready && replacement.Eligible && !replacement.Draining
 	}
+
 	return false
 }
 
@@ -788,6 +824,7 @@ func findNomadNode(nodes []NomadScaleInNode, nodeID, nomadNodeID string) (NomadS
 			return node, true
 		}
 	}
+
 	return NomadScaleInNode{}, false
 }
 
@@ -799,6 +836,7 @@ func rotateScaleInOperations(nodes []NomadScaleInNode, cursor uint64) []NomadSca
 	rotated := make([]NomadScaleInNode, 0, len(nodes))
 	rotated = append(rotated, nodes[start:]...)
 	rotated = append(rotated, nodes[:start]...)
+
 	return rotated
 }
 
@@ -810,6 +848,7 @@ func rotateScaleInCandidates(nodes []ScaleInNode, cursor uint64) []ScaleInNode {
 	rotated := make([]ScaleInNode, 0, len(nodes))
 	rotated = append(rotated, nodes[start:]...)
 	rotated = append(rotated, nodes[:start]...)
+
 	return rotated
 }
 
@@ -828,5 +867,6 @@ func compareStrings(left, right string) int {
 	if left > right {
 		return 1
 	}
+
 	return 0
 }

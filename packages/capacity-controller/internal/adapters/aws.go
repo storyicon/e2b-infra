@@ -125,7 +125,7 @@ func (a *ASG) SetDesiredCapacity(ctx context.Context, asgName string, desired in
 
 func (a *ASG) SetInstanceProtection(ctx context.Context, asgName string, instanceIDs []string, protected bool) error {
 	if asgName == "" {
-		return errors.New("Auto Scaling group name is required")
+		return errors.New("auto scaling group name is required")
 	}
 	if len(instanceIDs) == 0 || len(instanceIDs) > maxInstanceProtectionBatch {
 		return fmt.Errorf("instance protection batch must contain 1 to %d instances", maxInstanceProtectionBatch)

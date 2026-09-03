@@ -57,7 +57,7 @@ func newScaleInWorld(count int, protected bool) *scaleInWorld {
 		cloud:   ScaleInASGSnapshot{Name: "workers", ARN: "arn:workers", DesiredCapacity: int32(count), MinSize: 1, MaxSize: 1000, NewInstancesProtectedFromScaleIn: true, Instances: make(map[string]ScaleInASGInstance, count)},
 		workers: make(map[string]WorkerScaleInState, count),
 	}
-	for i := 0; i < count; i++ {
+	for i := range count {
 		id := fmt.Sprintf("i-%03d", i)
 		nomadID := "nomad-" + id
 		serviceID := "service-" + id
@@ -66,6 +66,7 @@ func newScaleInWorld(count int, protected bool) *scaleInWorld {
 		w.nodes = append(w.nodes, NomadScaleInNode{NomadNodeID: nomadID, NodeID: id, NodePool: "default", Ready: true, Eligible: true, CreateIndex: uint64(i + 1)})
 		w.workers[id] = WorkerScaleInState{NodeID: id, ServiceInstanceID: serviceID, ServiceStatus: "Healthy", ScaleInProtocolSupport: true}
 	}
+
 	return w
 }
 
@@ -81,7 +82,9 @@ func (w *scaleInWorld) armAll() {
 	}
 }
 
-func (w *scaleInWorld) restoreOrdinary(nodeID string) {
+func (w *scaleInWorld) restoreOrdinary() {
+	const nodeID = "i-002"
+
 	instance := w.cloud.Instances[nodeID]
 	instance.ProtectedFromScaleIn = true
 	w.cloud.Instances[nodeID] = instance
@@ -112,6 +115,7 @@ func (w *scaleInWorld) DesiredCapacity(context.Context, string) (int32, error) {
 func (w *scaleInWorld) SetDesiredCapacity(_ context.Context, _ string, desired int32) (ScaleWriteMetadata, error) {
 	w.desiredWrites = append(w.desiredWrites, desired)
 	w.cloud.DesiredCapacity = desired
+
 	return ScaleWriteMetadata{}, w.desiredErr
 }
 
@@ -127,9 +131,11 @@ func (w *scaleInWorld) MarkDrain(_ context.Context, node NomadScaleInNode, opera
 	for i := range w.nodes {
 		if w.nodes[i].NomadNodeID == node.NomadNodeID {
 			w.nodes[i].Eligible, w.nodes[i].Draining, w.nodes[i].Operation = false, true, &operation
+
 			return w.markDrainErr
 		}
 	}
+
 	return errors.New("node missing")
 }
 
@@ -144,9 +150,11 @@ func (w *scaleInWorld) MarkOperationStage(_ context.Context, node NomadScaleInNo
 	for i := range w.nodes {
 		if w.nodes[i].NomadNodeID == node.NomadNodeID {
 			w.nodes[i].Operation = &operation
+
 			return nil
 		}
 	}
+
 	return errors.New("node missing")
 }
 
@@ -159,9 +167,11 @@ func (w *scaleInWorld) RestoreDrain(_ context.Context, node NomadScaleInNode, op
 		if w.nodes[i].NomadNodeID == node.NomadNodeID {
 			operation.Stage = "restoring"
 			w.nodes[i].Eligible, w.nodes[i].Draining, w.nodes[i].Operation = true, false, &operation
+
 			return w.restoreErr
 		}
 	}
+
 	return errors.New("node missing")
 }
 
@@ -171,9 +181,11 @@ func (w *scaleInWorld) CompleteRestore(_ context.Context, node NomadScaleInNode,
 		if w.nodes[i].NomadNodeID == node.NomadNodeID {
 			operation.Stage = "restored"
 			w.nodes[i].Eligible, w.nodes[i].Draining, w.nodes[i].Operation = true, false, &operation
+
 			return nil
 		}
 	}
+
 	return errors.New("node missing")
 }
 
@@ -182,9 +194,11 @@ func (w *scaleInWorld) CompleteTermination(_ context.Context, node NomadScaleInN
 		if w.nodes[i].NomadNodeID == node.NomadNodeID {
 			operation.Stage = "complete"
 			w.nodes[i].Operation = &operation
+
 			return nil
 		}
 	}
+
 	return errors.New("node missing")
 }
 
@@ -206,6 +220,7 @@ func (w *scaleInWorld) ListScaleInCandidates(_ context.Context, _ string) ([]Sca
 		}
 		result = append(result, ScaleInCandidateObservation{NodeID: node.NodeID, NomadNodeID: node.NomadNodeID, ServiceInstanceID: state.ServiceInstanceID, ServiceStatus: status, ScaleInProtocolSupport: state.ScaleInProtocolSupport, ObservedAt: now})
 	}
+
 	return result, nil
 }
 
@@ -223,6 +238,7 @@ func (w *scaleInWorld) BeginWorkerScaleIn(_ context.Context, _, nodeID, serviceI
 	}
 	state = readyWorker(nodeID, serviceID, operationID)
 	w.workers[nodeID] = state
+
 	return state, w.beginErr
 }
 
@@ -238,6 +254,7 @@ func (w *scaleInWorld) VerifyWorkerScaleIn(_ context.Context, _, nodeID, service
 	if state.ServiceInstanceID != serviceID || state.ScaleInOperationID != operationID {
 		return state, errors.New("ownership conflict")
 	}
+
 	return state, nil
 }
 
@@ -261,6 +278,7 @@ func (w *scaleInWorld) CancelWorkerScaleIn(_ context.Context, _, nodeID, service
 	if w.cancelApplyThenErr {
 		return WorkerScaleInState{}, w.cancelErr
 	}
+
 	return state, w.cancelErr
 }
 
@@ -276,6 +294,7 @@ func (w *scaleInWorld) SetInstanceProtection(_ context.Context, _ string, ids []
 		instance.ProtectedFromScaleIn = protected
 		w.cloud.Instances[id] = instance
 	}
+
 	return w.protectionErr
 }
 
@@ -292,27 +311,32 @@ func (i worldInfrastructure) SetInstanceProtection(ctx context.Context, asg stri
 
 func newTestScaleInReconciler(w *scaleInWorld) *Reconciler {
 	cfg := &Config{Mode: ModeStartIntentV1, ClusterID: "cluster", NodePool: "default", ASGName: "workers", SlotsPerNode: 1, MinNodes: 1, MaxNodes: 1000, ReconcileTimeout: time.Minute, ScaleInMode: ScaleInModeEnforce, ScaleInHeadroom: 0, ScaleInStableFor: 0, ScaleInMinimumAge: 0, ScaleInTimeout: time.Hour}
+
 	return NewWithScaleIn(cfg, nil, w, w, w, w, w, worldInfrastructure{w})
 }
 
 func TestScaleInRepairsProtectionBaselineBeforeAnyDesiredWrite(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(3, true)
 	instance := w.cloud.Instances["i-001"]
 	instance.ProtectedFromScaleIn = false
 	w.cloud.Instances["i-001"] = instance
 
-	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0)
 	require.NoError(t, err)
 	require.Equal(t, []protectionWrite{{ids: []string{"i-001"}, protected: true}}, w.protectionWrites)
 	require.Empty(t, w.desiredWrites)
 }
 
 func TestScaleInArmedWorkersLowerAbsoluteDesired(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(3, true)
 	w.armAll()
-	w.restoreOrdinary("i-002")
+	w.restoreOrdinary()
 
-	result, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+	result, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0)
 	require.NoError(t, err)
 	require.Equal(t, []int32{1}, w.desiredWrites)
 	require.Zero(t, result.ScaleInTerminated, "desired reduction is not a confirmed instance departure")
@@ -322,24 +346,28 @@ func TestScaleInArmedWorkersLowerAbsoluteDesired(t *testing.T) {
 }
 
 func TestScaleInDesiredResponseLostRestartDoesNotDecrementAgain(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(3, true)
 	w.armAll()
-	w.restoreOrdinary("i-002")
+	w.restoreOrdinary()
 	w.desiredErr = errors.New("response lost")
-	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0)
 	require.ErrorContains(t, err, "response lost")
 	require.Equal(t, []int32{1}, w.desiredWrites)
 
 	w.desiredErr = nil
-	_, err = newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+	_, err = newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0)
 	require.NoError(t, err)
 	require.Equal(t, []int32{1}, w.desiredWrites, "memberCount > desired waits for AWS membership convergence")
 }
 
 func TestScaleOutCompensationExcludesCommittedScaleIn(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(3, true)
 	w.armAll()
-	w.restoreOrdinary("i-002")
+	w.restoreOrdinary()
 	r := newTestScaleInReconciler(w)
 
 	w.cloud.DesiredCapacity = 1
@@ -354,6 +382,8 @@ func TestScaleOutCompensationExcludesCommittedScaleIn(t *testing.T) {
 }
 
 func TestScaleInOverlappingControllersReplayOneAbsoluteTarget(t *testing.T) {
+	t.Parallel()
+
 	var writes []int32
 	for range 2 {
 		// Both reconcilers start from the same stale desired=3 membership view.
@@ -361,8 +391,8 @@ func TestScaleInOverlappingControllersReplayOneAbsoluteTarget(t *testing.T) {
 		// decrements to shared capacity.
 		w := newScaleInWorld(3, true)
 		w.armAll()
-		w.restoreOrdinary("i-002")
-		_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+		w.restoreOrdinary()
+		_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0)
 		require.NoError(t, err)
 		writes = append(writes, w.desiredWrites...)
 	}
@@ -370,41 +400,47 @@ func TestScaleInOverlappingControllersReplayOneAbsoluteTarget(t *testing.T) {
 }
 
 func TestScaleInFreshWorkloadBlocksLateStaleReduction(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(3, true)
 	w.armAll()
-	w.restoreOrdinary("i-002")
+	w.restoreOrdinary()
 	w.workload = 3
 
-	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0)
 
 	require.NoError(t, err)
 	require.Empty(t, w.desiredWrites, "the fresh workload snapshot must override the stale reconcile input")
 }
 
 func TestScaleInDesiredIncreaseResponseLostIsNotRepeated(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(3, true)
 	w.armAll()
 	w.cloud.DesiredCapacity = 2
 	w.workload = 3
 	w.desiredErr = errors.New("increase response lost")
 
-	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 3, Result{})
+	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 3)
 	require.ErrorContains(t, err, "response lost")
 	require.Equal(t, []int32{3}, w.desiredWrites)
 
 	w.desiredErr = nil
-	_, err = newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 3, Result{})
+	_, err = newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 3)
 	require.NoError(t, err)
 	require.Equal(t, []int32{3}, w.desiredWrites)
 }
 
 func TestScaleInDemandRiseRaisesDesiredBeforeProtectionOrAdmission(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(3, true)
 	w.armAll()
 	w.cloud.DesiredCapacity = 2
 	w.workload = 3
 
-	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 3, Result{})
+	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 3)
 	require.NoError(t, err)
 	require.Equal(t, []int32{3}, w.desiredWrites)
 	require.Empty(t, w.protectionWrites)
@@ -414,23 +450,27 @@ func TestScaleInDemandRiseRaisesDesiredBeforeProtectionOrAdmission(t *testing.T)
 }
 
 func TestScaleInProtectionResponseLostRecoversFromFreshState(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(2, true)
 	op := NomadScaleInOperation{OperationID: "op", ServiceInstanceID: "service-i-001", StartedAt: time.Now(), Stage: "worker_draining"}
 	w.nodes[1].Eligible, w.nodes[1].Draining, w.nodes[1].Operation = false, true, &op
 	w.workers["i-001"] = readyWorker("i-001", op.ServiceInstanceID, op.OperationID)
 	w.protectionErr = errors.New("response lost")
 
-	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0)
 	require.ErrorContains(t, err, "response lost")
 	require.Empty(t, w.desiredWrites)
 
 	w.protectionErr = nil
-	_, err = newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+	_, err = newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0)
 	require.NoError(t, err)
 	require.Equal(t, []int32{1}, w.desiredWrites)
 }
 
 func TestScaleInProtectionResourceContentionDoesNotGuessOutcome(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(2, true)
 	op := NomadScaleInOperation{OperationID: "op", ServiceInstanceID: "service-i-001", StartedAt: time.Now(), Stage: "worker_draining"}
 	w.nodes[1].Eligible, w.nodes[1].Draining, w.nodes[1].Operation = false, true, &op
@@ -439,31 +479,33 @@ func TestScaleInProtectionResourceContentionDoesNotGuessOutcome(t *testing.T) {
 	w.protectionErrBeforeApply = true
 	r := newTestScaleInReconciler(w)
 
-	_, err := r.reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+	_, err := r.reconcileScaleIn(t.Context(), time.Now(), 0)
 	require.ErrorContains(t, err, "ResourceContention")
 	require.True(t, w.cloud.Instances["i-001"].ProtectedFromScaleIn)
 	require.Empty(t, w.desiredWrites)
 
 	w.protectionErr = nil
-	_, err = r.reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+	_, err = r.reconcileScaleIn(t.Context(), time.Now(), 0)
 	require.NoError(t, err)
 	require.False(t, w.cloud.Instances["i-001"].ProtectedFromScaleIn)
 	require.Empty(t, w.desiredWrites, "arming requires a later fresh snapshot before desired reduction")
 }
 
 func TestScaleInRestoreProtectionResponseLostUsesFreshState(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(1, true)
 	w.armAll()
 	w.workload = 1
 	w.protectionErr = errors.New("restore protection response lost")
 	r := newTestScaleInReconciler(w)
 
-	_, err := r.reconcileScaleIn(t.Context(), time.Now(), 1, Result{})
+	_, err := r.reconcileScaleIn(t.Context(), time.Now(), 1)
 	require.ErrorContains(t, err, "response lost")
 	require.True(t, w.cloud.Instances["i-000"].ProtectedFromScaleIn)
 
 	w.protectionErr = nil
-	_, err = r.reconcileScaleIn(t.Context(), time.Now(), 1, Result{})
+	_, err = r.reconcileScaleIn(t.Context(), time.Now(), 1)
 	require.NoError(t, err)
 	require.Len(t, w.protectionWrites, 1, "fresh protected state must prevent a duplicate protection write")
 	require.Equal(t, "restoring", w.nodes[0].Operation.Stage)
@@ -480,17 +522,20 @@ func replacementWorld(protected bool, status string, observable bool) *scaleInWo
 	} else {
 		w.candidates = []ScaleInCandidateObservation{}
 	}
+
 	return w
 }
 
 func TestScaleInProtectedConfirmedReplacementOnlyCleansOldNomadOperation(t *testing.T) {
+	t.Parallel()
+
 	w := replacementWorld(true, "ready", true)
 
 	r := newTestScaleInReconciler(w)
-	result, err := r.reconcileScaleIn(t.Context(), time.Now(), 1, Result{})
+	_, err := r.reconcileScaleIn(t.Context(), time.Now(), 1)
 	require.NoError(t, err)
 	require.Equal(t, "restoring", w.nodes[0].Operation.Stage)
-	result, err = r.reconcileScaleIn(t.Context(), time.Now(), 1, Result{})
+	result, err := r.reconcileScaleIn(t.Context(), time.Now(), 1)
 
 	require.NoError(t, err)
 	require.Equal(t, int32(1), result.ScaleInCancelled)
@@ -501,6 +546,8 @@ func TestScaleInProtectedConfirmedReplacementOnlyCleansOldNomadOperation(t *test
 }
 
 func TestScaleInWorkerRestartOnSameNomadNodeOnlyCleansOldNomadOperation(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(1, true)
 	op := NomadScaleInOperation{OperationID: "old-op", ServiceInstanceID: "old-service", StartedAt: time.Now(), Stage: "worker_draining"}
 	w.nodes[0].Eligible, w.nodes[0].Draining, w.nodes[0].Operation = false, true, &op
@@ -508,10 +555,10 @@ func TestScaleInWorkerRestartOnSameNomadNodeOnlyCleansOldNomadOperation(t *testi
 	w.candidates = []ScaleInCandidateObservation{{NodeID: "i-000", NomadNodeID: w.nodes[0].NomadNodeID, ServiceInstanceID: "new-service", ServiceStatus: "ready", ScaleInProtocolSupport: true, ObservedAt: time.Now()}}
 	r := newTestScaleInReconciler(w)
 
-	result, err := r.reconcileScaleIn(t.Context(), time.Now(), 1, Result{})
+	_, err := r.reconcileScaleIn(t.Context(), time.Now(), 1)
 	require.NoError(t, err)
 	require.Equal(t, "restoring", w.nodes[0].Operation.Stage)
-	result, err = r.reconcileScaleIn(t.Context(), time.Now(), 1, Result{})
+	result, err := r.reconcileScaleIn(t.Context(), time.Now(), 1)
 
 	require.NoError(t, err)
 	require.Equal(t, int32(1), result.ScaleInCancelled)
@@ -521,6 +568,8 @@ func TestScaleInWorkerRestartOnSameNomadNodeOnlyCleansOldNomadOperation(t *testi
 }
 
 func TestScaleInReplacementIsNotCleanedWithoutEverySafetyProof(t *testing.T) {
+	t.Parallel()
+
 	for _, test := range []struct {
 		name        string
 		protected   bool
@@ -534,8 +583,10 @@ func TestScaleInReplacementIsNotCleanedWithoutEverySafetyProof(t *testing.T) {
 		{name: "not healthy", protected: true, status: "unhealthy", observable: true, wantError: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
 			w := replacementWorld(test.protected, test.status, test.observable)
-			_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 1, Result{})
+			_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 1)
 
 			require.Equal(t, "worker_draining", w.nodes[0].Operation.Stage)
 			if test.wantError {
@@ -553,15 +604,17 @@ func TestScaleInReplacementIsNotCleanedWithoutEverySafetyProof(t *testing.T) {
 }
 
 func TestScaleInArmsFiftyReadyOperationsWithOneProtectionWrite(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(51, true)
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		node := &w.nodes[i]
 		op := NomadScaleInOperation{OperationID: "op-" + node.NodeID, ServiceInstanceID: "service-" + node.NodeID, StartedAt: time.Now(), Stage: "worker_draining"}
 		node.Eligible, node.Draining, node.Operation = false, true, &op
 		w.workers[node.NodeID] = readyWorker(node.NodeID, op.ServiceInstanceID, op.OperationID)
 	}
 
-	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0)
 
 	require.NoError(t, err)
 	require.Len(t, w.protectionWrites, 1)
@@ -571,10 +624,12 @@ func TestScaleInArmsFiftyReadyOperationsWithOneProtectionWrite(t *testing.T) {
 }
 
 func TestScaleInOffDoesNotTouchDependencies(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(2, true)
 	r := newTestScaleInReconciler(w)
 	r.config.ScaleInMode = ScaleInModeOff
-	_, err := r.reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+	_, err := r.reconcileScaleIn(t.Context(), time.Now(), 0)
 	require.NoError(t, err)
 	require.Zero(t, w.listCalls)
 	require.Empty(t, w.protectionWrites)
@@ -582,6 +637,8 @@ func TestScaleInOffDoesNotTouchDependencies(t *testing.T) {
 }
 
 func TestObserveMixedWorkerVersionsNeverMutatesCapacity(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(2, true)
 	w.candidates = []ScaleInCandidateObservation{
 		{NodeID: "i-000", NomadNodeID: "nomad-i-000", ServiceInstanceID: "service-i-000", ServiceStatus: "ready", ScaleInProtocolSupport: true, ObservedAt: time.Now()},
@@ -589,7 +646,7 @@ func TestObserveMixedWorkerVersionsNeverMutatesCapacity(t *testing.T) {
 	}
 	r := newTestScaleInReconciler(w)
 	r.config.ScaleInMode = ScaleInModeObserve
-	result, err := r.reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+	result, err := r.reconcileScaleIn(t.Context(), time.Now(), 0)
 	require.NoError(t, err)
 	require.Equal(t, int32(2), result.ScaleInAccepting)
 	require.Empty(t, w.protectionWrites)
@@ -598,6 +655,8 @@ func TestObserveMixedWorkerVersionsNeverMutatesCapacity(t *testing.T) {
 }
 
 func TestCandidateObservationFreshnessFailsClosed(t *testing.T) {
+	t.Parallel()
+
 	now := time.Unix(100, 0)
 	launch := now.Add(-time.Hour)
 	nomad := []NomadScaleInNode{{NomadNodeID: "nomad", NodeID: "i", Ready: true, Eligible: true}}
@@ -610,6 +669,8 @@ func TestCandidateObservationFreshnessFailsClosed(t *testing.T) {
 		{"fresh", now.Add(-scaleInCandidateMaxAge), true}, {"expired", now.Add(-scaleInCandidateMaxAge - time.Nanosecond), false}, {"future", now.Add(time.Nanosecond), false}, {"missing", time.Time{}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			nodes := mergeScaleInNodes(now, nomad, []ScaleInCandidateObservation{{NodeID: "i", NomadNodeID: "nomad", ServiceInstanceID: "service", ServiceStatus: "ready", ScaleInProtocolSupport: true, ObservedAt: tc.observed}}, cloud)
 			require.Equal(t, tc.ready, nodes[0].Healthy)
 			require.Equal(t, tc.ready, nodes[0].ScaleInProtocolSupport)
@@ -618,6 +679,8 @@ func TestCandidateObservationFreshnessFailsClosed(t *testing.T) {
 }
 
 func TestCurrentASGInstanceWithoutNomadConsumesDisruptionBudget(t *testing.T) {
+	t.Parallel()
+
 	now := time.Now()
 	launch := now.Add(-time.Hour)
 	cloud := ScaleInASGSnapshot{Instances: map[string]ScaleInASGInstance{"i-known": {ID: "i-known", HealthStatus: "Healthy", LifecycleState: "InService", LaunchTime: &launch}, "i-unknown": {ID: "i-unknown", HealthStatus: "Healthy", LifecycleState: "InService", LaunchTime: &launch}}}
@@ -628,11 +691,13 @@ func TestCurrentASGInstanceWithoutNomadConsumesDisruptionBudget(t *testing.T) {
 }
 
 func TestDepartedNomadHistoryCompletesWithoutCancellationChurn(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(2, true)
 	op := NomadScaleInOperation{OperationID: "departed", ServiceInstanceID: "service-gone", StartedAt: time.Now(), Stage: "worker_draining"}
 	w.nodes = append(w.nodes, NomadScaleInNode{NomadNodeID: "nomad-gone", NodeID: "i-gone", NodePool: "default", Draining: true, Operation: &op})
 	r := newTestScaleInReconciler(w)
-	result, err := r.reconcileScaleIn(t.Context(), time.Now(), 2, Result{})
+	result, err := r.reconcileScaleIn(t.Context(), time.Now(), 2)
 	require.NoError(t, err)
 	require.Equal(t, int32(1), result.ScaleInTerminated)
 	require.Zero(t, w.cancelCalls)
@@ -647,6 +712,8 @@ func TestDepartedNomadHistoryCompletesWithoutCancellationChurn(t *testing.T) {
 }
 
 func TestEnforceScaleOutContinuesWhenScaleInObservationFails(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(1, true)
 	w.workload = 2
 	w.listErr = errors.New("scale-in observation unavailable")
@@ -662,11 +729,13 @@ func TestEnforceScaleOutContinuesWhenScaleInObservationFails(t *testing.T) {
 }
 
 func TestNomadMarkedRecoveryAndRestoringUseExactStateActions(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(2, true)
 	op := NomadScaleInOperation{OperationID: "op", ServiceInstanceID: "service-i-000", StartedAt: time.Now(), Stage: "nomad_marked"}
 	w.nodes[0].Eligible, w.nodes[0].Draining, w.nodes[0].Operation = false, true, &op
 	r := newTestScaleInReconciler(w)
-	_, err := r.reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+	_, err := r.reconcileScaleIn(t.Context(), time.Now(), 0)
 	require.NoError(t, err)
 	require.Equal(t, "worker_draining", w.nodes[0].Operation.Stage)
 	require.Equal(t, 1, w.beginCalls)
@@ -674,7 +743,7 @@ func TestNomadMarkedRecoveryAndRestoringUseExactStateActions(t *testing.T) {
 
 	w.nodes[0].Operation.Stage = "restoring"
 	w.workers["i-000"] = readyWorker("i-000", op.ServiceInstanceID, op.OperationID)
-	_, err = r.reconcileScaleIn(t.Context(), time.Now(), 2, Result{})
+	_, err = r.reconcileScaleIn(t.Context(), time.Now(), 2)
 	require.NoError(t, err)
 	require.Equal(t, "restored", w.nodes[0].Operation.Stage)
 	require.Equal(t, 1, w.beginCalls)
@@ -682,17 +751,21 @@ func TestNomadMarkedRecoveryAndRestoringUseExactStateActions(t *testing.T) {
 }
 
 func TestNomadMarkedBeginFailureKeepsIsolationWhenOwnershipCannotBeVerified(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(2, true)
 	w.beginErr = errors.New("begin failed")
 	op := NomadScaleInOperation{OperationID: "op", ServiceInstanceID: "service-i-000", StartedAt: time.Now(), Stage: "nomad_marked"}
 	w.nodes[0].Eligible, w.nodes[0].Draining, w.nodes[0].Operation = false, true, &op
-	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0)
 	require.ErrorContains(t, err, "begin failed")
 	require.Equal(t, "nomad_marked", w.nodes[0].Operation.Stage)
 	require.Zero(t, w.cancelCalls)
 }
 
 func TestNomadMarkResponseLostStopsBatchAndRecoversFromInventory(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(3, true)
 	w.markDrainErr = errors.New("mark response lost")
 	w.markDrainApplyThenErr = true
@@ -700,7 +773,7 @@ func TestNomadMarkResponseLostStopsBatchAndRecoversFromInventory(t *testing.T) {
 	now := time.Now()
 	r.scaleIn.stabilizer.firstObservedAt = now.Add(-time.Second)
 
-	_, err := r.reconcileScaleIn(t.Context(), now, 0, Result{})
+	_, err := r.reconcileScaleIn(t.Context(), now, 0)
 	require.ErrorContains(t, err, "response lost")
 	require.Equal(t, 1, w.markDrainCalls, "an ambiguous write must stop the batch")
 	active := slices.IndexFunc(w.nodes, func(node NomadScaleInNode) bool { return node.Operation != nil })
@@ -709,13 +782,15 @@ func TestNomadMarkResponseLostStopsBatchAndRecoversFromInventory(t *testing.T) {
 
 	w.markDrainErr = nil
 	w.markDrainApplyThenErr = false
-	_, err = r.reconcileScaleIn(t.Context(), now, 0, Result{})
+	_, err = r.reconcileScaleIn(t.Context(), now, 0)
 	require.NoError(t, err)
 	require.Equal(t, "worker_draining", w.nodes[active].Operation.Stage)
 	require.GreaterOrEqual(t, w.beginCalls, 1)
 }
 
 func TestWorkerBeginResponseLostPersistsRecoveryBeforeCancel(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(2, true)
 	w.beginErr = errors.New("begin response lost")
 	w.beginApplyThenErr = true
@@ -723,7 +798,7 @@ func TestWorkerBeginResponseLostPersistsRecoveryBeforeCancel(t *testing.T) {
 	now := time.Now()
 	r.scaleIn.stabilizer.firstObservedAt = now.Add(-time.Second)
 
-	_, err := r.reconcileScaleIn(t.Context(), now, 0, Result{})
+	_, err := r.reconcileScaleIn(t.Context(), now, 0)
 	require.ErrorContains(t, err, "response lost")
 	active := slices.IndexFunc(w.nodes, func(node NomadScaleInNode) bool { return node.Operation != nil })
 	require.NotEqual(t, -1, active)
@@ -732,47 +807,51 @@ func TestWorkerBeginResponseLostPersistsRecoveryBeforeCancel(t *testing.T) {
 
 	w.beginErr = nil
 	w.beginApplyThenErr = false
-	_, err = r.reconcileScaleIn(t.Context(), now, 0, Result{})
+	_, err = r.reconcileScaleIn(t.Context(), now, 0)
 	require.NoError(t, err)
 	require.Equal(t, "restored", w.nodes[active].Operation.Stage)
 	require.Equal(t, 1, w.cancelCalls)
 }
 
 func TestRestoringSurvivesCancelAndNomadRestoreResponseLoss(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(1, true)
 	op := NomadScaleInOperation{OperationID: "op", ServiceInstanceID: "service-i-000", StartedAt: time.Now(), Stage: "restoring"}
 	w.nodes[0].Eligible, w.nodes[0].Draining, w.nodes[0].Operation = false, true, &op
 	w.workers["i-000"] = readyWorker("i-000", op.ServiceInstanceID, op.OperationID)
 	w.cancelErr, w.cancelApplyThenErr = errors.New("cancel response lost"), true
-	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 1, Result{})
+	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 1)
 	require.ErrorContains(t, err, "response lost")
 	require.Equal(t, "restoring", w.nodes[0].Operation.Stage)
 	require.Zero(t, w.restoreCalls)
 	w.cancelErr, w.cancelApplyThenErr = nil, false
 	w.restoreErr, w.restoreApplyThenErr = errors.New("restore response lost"), true
-	_, err = newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 1, Result{})
+	_, err = newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 1)
 	require.ErrorContains(t, err, "response lost")
 	require.True(t, w.nodes[0].Eligible)
 	require.False(t, w.nodes[0].Draining)
 	require.Equal(t, 1, w.restoreCalls)
 	w.restoreErr, w.restoreApplyThenErr = nil, false
-	_, err = newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 1, Result{})
+	_, err = newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 1)
 	require.NoError(t, err)
 	require.Equal(t, "restored", w.nodes[0].Operation.Stage)
 	require.Equal(t, 1, w.restoreCalls, "fresh eligible state skips replaying RestoreDrain")
 }
 
 func TestSupersededRestoreResponseLossSkipsWorkerAndRestoreReplay(t *testing.T) {
+	t.Parallel()
+
 	w := replacementWorld(true, "ready", true)
 	w.nodes[0].Operation.Stage = "restoring"
 	w.restoreErr, w.restoreApplyThenErr = errors.New("restore response lost"), true
-	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 1, Result{})
+	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 1)
 	require.ErrorContains(t, err, "response lost")
 	require.True(t, w.nodes[0].Eligible)
 	require.False(t, w.nodes[0].Draining)
 	require.Zero(t, w.cancelCalls)
 	w.restoreErr, w.restoreApplyThenErr = nil, false
-	_, err = newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 1, Result{})
+	_, err = newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 1)
 	require.NoError(t, err)
 	require.Equal(t, "restored", w.nodes[0].Operation.Stage)
 	require.Equal(t, 1, w.restoreCalls)
@@ -780,18 +859,22 @@ func TestSupersededRestoreResponseLossSkipsWorkerAndRestoreReplay(t *testing.T) 
 }
 
 func TestASGUnsettledNeverDecrementsDesired(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(3, true)
 	w.armAll()
-	w.restoreOrdinary("i-002")
+	w.restoreOrdinary()
 	instance := w.cloud.Instances["i-002"]
 	instance.LifecycleState = "Terminating"
 	w.cloud.Instances["i-002"] = instance
-	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 0)
 	require.NoError(t, err)
 	require.Empty(t, w.desiredWrites)
 }
 
 func TestNewDrainStagePersistenceFailureStopsAndPersistsRecoveryBeforeCancel(t *testing.T) {
+	t.Parallel()
+
 	for _, tc := range []struct {
 		name        string
 		stageErrors []error
@@ -801,12 +884,14 @@ func TestNewDrainStagePersistenceFailureStopsAndPersistsRecoveryBeforeCancel(t *
 		{"recovery marker fails", []error{errors.New("stage write failed"), errors.New("recovery marker failed")}, "nomad_marked"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			w := newScaleInWorld(2, true)
 			w.markStageErrors = tc.stageErrors
 			r := newTestScaleInReconciler(w)
 			now := time.Now()
 			r.scaleIn.stabilizer.firstObservedAt = now.Add(-time.Second)
-			_, err := r.reconcileScaleIn(t.Context(), now, 0, Result{})
+			_, err := r.reconcileScaleIn(t.Context(), now, 0)
 			require.ErrorContains(t, err, "stage write failed")
 			require.Equal(t, 1, w.markDrainCalls)
 			require.Equal(t, 1, w.beginCalls)
@@ -819,6 +904,8 @@ func TestNewDrainStagePersistenceFailureStopsAndPersistsRecoveryBeforeCancel(t *
 }
 
 func TestOperationFailureDoesNotStarveLaterRecovery(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(3, true)
 	w.verifyErrors = map[string]error{"i-000": errors.New("verify failed")}
 	first := NomadScaleInOperation{OperationID: "op-0", ServiceInstanceID: "service-i-000", StartedAt: time.Now(), Stage: "worker_draining"}
@@ -827,18 +914,22 @@ func TestOperationFailureDoesNotStarveLaterRecovery(t *testing.T) {
 	w.nodes[1].Eligible, w.nodes[1].Draining, w.nodes[1].Operation = false, true, &second
 	w.workers["i-000"] = readyWorker("i-000", first.ServiceInstanceID, first.OperationID)
 	w.workers["i-001"] = readyWorker("i-001", second.ServiceInstanceID, second.OperationID)
-	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 3, Result{})
+	_, err := newTestScaleInReconciler(w).reconcileScaleIn(t.Context(), time.Now(), 3)
 	require.ErrorContains(t, err, "verify failed")
 	require.Equal(t, "restored", w.nodes[1].Operation.Stage, "independent restoring operation must still converge")
 }
 
 func TestRestoredMarkerIsTerminalAndAllowsFutureScaleIn(t *testing.T) {
+	t.Parallel()
+
 	op := NomadScaleInOperation{OperationID: "done", ServiceInstanceID: "service", Stage: "restored"}
 	node := NomadScaleInNode{Ready: true, Eligible: true, Operation: &op}
 	require.False(t, hasActiveScaleInOperation(node))
 }
 
 func TestRestoreRequiresExactHealthyWorkerIdentity(t *testing.T) {
+	t.Parallel()
+
 	for _, tc := range []struct {
 		name   string
 		mutate func(*WorkerScaleInState)
@@ -849,6 +940,8 @@ func TestRestoreRequiresExactHealthyWorkerIdentity(t *testing.T) {
 		{"protocol", func(s *WorkerScaleInState) { s.ScaleInProtocolSupport = false }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			w := newScaleInWorld(1, true)
 			op := NomadScaleInOperation{OperationID: "op", ServiceInstanceID: "service-i-000", Stage: "restoring"}
 			w.nodes[0].Eligible, w.nodes[0].Draining, w.nodes[0].Operation = false, true, &op
@@ -863,12 +956,14 @@ func TestRestoreRequiresExactHealthyWorkerIdentity(t *testing.T) {
 }
 
 func TestScaleInModel500WorkersUsesSettledBatchesOfAtMost50(t *testing.T) {
+	t.Parallel()
+
 	w := newScaleInWorld(500, true)
 	r := newTestScaleInReconciler(w)
 	for w.cloud.DesiredCapacity > 1 {
 		batch := min(int(w.cloud.DesiredCapacity-1), int(ScaleInGlobalBudget))
 		ids := make([]string, 0, batch)
-		for i := 0; i < batch; i++ {
+		for i := range batch {
 			id := w.nodes[i].NodeID
 			ids = append(ids, id)
 			nodeIndex := slices.IndexFunc(w.nodes, func(node NomadScaleInNode) bool { return node.NodeID == id })
@@ -880,7 +975,7 @@ func TestScaleInModel500WorkersUsesSettledBatchesOfAtMost50(t *testing.T) {
 			w.workers[id] = readyWorker(id, op.ServiceInstanceID, op.OperationID)
 		}
 		before := w.cloud.DesiredCapacity
-		_, err := r.reconcileScaleIn(t.Context(), time.Now(), 0, Result{})
+		_, err := r.reconcileScaleIn(t.Context(), time.Now(), 0)
 		require.NoError(t, err)
 		require.Equal(t, int32(batch), before-w.cloud.DesiredCapacity)
 		for _, id := range ids {

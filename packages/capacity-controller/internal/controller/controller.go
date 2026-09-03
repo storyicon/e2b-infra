@@ -240,10 +240,7 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, cu
 		if !ready {
 			result.TargetNodes = desired
 			result.Aggregating = true
-			result, err = r.observeReadyNodes(ctx, result)
-			if err != nil {
-				return result, err
-			}
+			result = r.observeReadyNodes(ctx, result)
 
 			return r.reconcileExistingScaleInOperations(ctx, now, currentTime, snapshot.WorkloadCount, result), nil
 		}
@@ -292,15 +289,12 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, cu
 		r.startIntentBatch = startIntentBatch{}
 	}
 
-	result, err = r.observeReadyNodes(ctx, result)
-	if err != nil {
-		return result, err
-	}
+	result = r.observeReadyNodes(ctx, result)
 	if result.Scaled || result.Aggregating {
 		return r.reconcileExistingScaleInOperations(ctx, now, currentTime, snapshot.WorkloadCount, result), nil
 	}
 
-	return r.reconcileScaleInAt(ctx, now, currentTime, snapshot.WorkloadCount, result, true)
+	return r.reconcileScaleInAt(ctx, currentTime, snapshot.WorkloadCount, result, true)
 }
 
 func (r *Reconciler) reconcileExistingScaleInOperations(ctx context.Context, now time.Time, currentTime func() time.Time, workloadCount int64, result Result) Result {
@@ -308,7 +302,7 @@ func (r *Reconciler) reconcileExistingScaleInOperations(ctx context.Context, now
 		return result
 	}
 
-	updated, err := r.reconcileScaleInAt(ctx, now, currentTime, workloadCount, result, false)
+	updated, err := r.reconcileScaleInAt(ctx, currentTime, workloadCount, result, false)
 	if err != nil {
 		// Existing drain recovery is auxiliary to scale-out. Keep the raw demand
 		// path non-blocking while surfacing the exact recovery failure.
@@ -394,17 +388,17 @@ func (r *Reconciler) startIntentBatchReady(now time.Time, workloadCount int64, d
 	return false, ""
 }
 
-func (r *Reconciler) observeReadyNodes(ctx context.Context, result Result) (Result, error) {
+func (r *Reconciler) observeReadyNodes(ctx context.Context, result Result) Result {
 	ready, readyErr := r.nodes.ReadyCount(ctx, r.config.NodePool)
 	if readyErr != nil {
 		result.ReadyNodesError = fmt.Errorf("count ready Nomad nodes: %w", readyErr)
 
-		return result, nil
+		return result
 	}
 	result.ReadyNodes = ready
 	result.ReadyNodesObserved = true
 
-	return result, nil
+	return result
 }
 
 func (r *Reconciler) reconcileLegacy(ctx context.Context, now time.Time) (Result, error) {
