@@ -154,6 +154,10 @@ func New(config *Config, demand DemandReader, snapshot CapacitySnapshotReader, n
 func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Result, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	startedAt := time.Now()
+	currentTime := func() time.Time {
+		return now.Add(time.Since(startedAt))
+	}
 	if r.config.ReconcileTimeout <= 0 {
 		return Result{Mode: r.config.Mode}, errors.New("reconcile timeout must be positive")
 	}
@@ -174,13 +178,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Result, erro
 			return Result{Mode: r.config.Mode}, errors.New("start-intent batch idle duration must not exceed max duration")
 		}
 
-		return r.reconcileStartIntent(reconcileCtx, now)
+		return r.reconcileStartIntent(reconcileCtx, now, currentTime)
 	default:
 		return Result{Mode: r.config.Mode}, fmt.Errorf("unsupported capacity demand mode %q", r.config.Mode)
 	}
 }
 
-func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time) (Result, error) {
+func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, currentTime func() time.Time) (Result, error) {
 	result := Result{Mode: ModeStartIntentV1}
 	if r.snapshot == nil {
 		return result, errors.New("start-intent capacity snapshot reader is required")
@@ -207,9 +211,14 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time) (R
 	}
 	result.DesiredNodes = desired
 
-	required := ceilDiv(snapshot.WorkloadCount, int64(r.config.SlotsPerNode))
-	if r.config.ScaleInMode == ScaleInModeEnforce {
-		compensatedRequired, scaleInErr := r.scaleOutRequiredForEnforce(ctx, now, snapshot.WorkloadCount, required)
+	rawRequired := ceilDiv(snapshot.WorkloadCount, int64(r.config.SlotsPerNode))
+	required := rawRequired
+	rawGrowth := rawRequired > int64(desired)
+	// Raw demand growth takes priority over every scale-in observation. Apply
+	// that increase first; only then observe and compensate already-draining
+	// workers so continuous demand growth cannot starve either path.
+	if r.config.ScaleInMode == ScaleInModeEnforce && !rawGrowth {
+		compensatedRequired, scaleInErr := r.scaleOutRequiredForEnforceAt(ctx, currentTime, required)
 		if scaleInErr != nil {
 			// Scale-in observations may only increase a scale-out target. If they
 			// are unavailable, reset stabilization and preserve the authoritative
@@ -231,8 +240,12 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time) (R
 		if !ready {
 			result.TargetNodes = desired
 			result.Aggregating = true
+			result, err = r.observeReadyNodes(ctx, result)
+			if err != nil {
+				return result, err
+			}
 
-			return r.observeReadyNodes(ctx, result)
+			return r.reconcileExistingScaleInOperations(ctx, now, currentTime, snapshot.WorkloadCount, result), nil
 		}
 		result.BatchTrigger = trigger
 		batch := r.startIntentBatch
@@ -252,16 +265,57 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time) (R
 		}
 		result.Scaled = true
 		r.startIntentBatch = startIntentBatch{}
+
+		if r.config.ScaleInMode == ScaleInModeEnforce && rawGrowth && target < r.config.MaxNodes {
+			compensatedRequired, scaleInErr := r.scaleOutRequiredForEnforceAt(ctx, currentTime, int64(target))
+			if scaleInErr != nil {
+				r.scaleIn.stabilizer.Reset()
+				result.ScaleInReadError = scaleInErr
+			} else {
+				compensatedTarget := clampInt32(compensatedRequired, r.config.MinNodes, r.config.MaxNodes)
+				if compensatedTarget > target {
+					if err := r.setDesiredCapacity(ctx, ScaleAuditEvent{
+						Mode:           r.config.Mode,
+						WorkloadCount:  snapshot.WorkloadCount,
+						CurrentDesired: target,
+						Target:         compensatedTarget,
+						BatchTrigger:   "drain-compensation",
+					}); err != nil {
+						return result, fmt.Errorf("compensate ASG desired capacity for draining workers to %d: %w", compensatedTarget, err)
+					}
+					result.TargetNodes = compensatedTarget
+					result.Capped = compensatedRequired > int64(r.config.MaxNodes)
+				}
+			}
+		}
 	} else {
 		r.startIntentBatch = startIntentBatch{}
 	}
 
 	result, err = r.observeReadyNodes(ctx, result)
-	if err != nil || result.Scaled || result.Aggregating {
+	if err != nil {
 		return result, err
 	}
+	if result.Scaled || result.Aggregating {
+		return r.reconcileExistingScaleInOperations(ctx, now, currentTime, snapshot.WorkloadCount, result), nil
+	}
 
-	return r.reconcileScaleIn(ctx, now, snapshot.WorkloadCount, result)
+	return r.reconcileScaleInAt(ctx, now, currentTime, snapshot.WorkloadCount, result, true)
+}
+
+func (r *Reconciler) reconcileExistingScaleInOperations(ctx context.Context, now time.Time, currentTime func() time.Time, workloadCount int64, result Result) Result {
+	if r.config.ScaleInMode != ScaleInModeEnforce {
+		return result
+	}
+
+	updated, err := r.reconcileScaleInAt(ctx, now, currentTime, workloadCount, result, false)
+	if err != nil {
+		// Existing drain recovery is auxiliary to scale-out. Keep the raw demand
+		// path non-blocking while surfacing the exact recovery failure.
+		updated.ScaleInReadError = errors.Join(updated.ScaleInReadError, err)
+	}
+
+	return updated
 }
 
 func (r *Reconciler) setDesiredCapacity(ctx context.Context, audit ScaleAuditEvent) error {

@@ -366,6 +366,9 @@ module "client" {
   max_size            = var.client_cluster_max_size
   machine_type        = var.client_machine_type
 
+  protect_from_scale_in        = true
+  scale_in_protection_required = var.capacity_scale_in_enforced
+
   node_pool_name                    = var.client_node_pool_name
   node_labels                       = var.client_node_labels
   base_hugepages_percentage         = var.client_base_hugepages_percentage

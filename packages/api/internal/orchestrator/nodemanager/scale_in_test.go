@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
@@ -18,9 +20,13 @@ import (
 type scriptedScaleInInfoClient struct {
 	orchestratorinfo.InfoServiceClient
 
-	mu        sync.Mutex
-	responses []*orchestratorinfo.ServiceInfoResponse
-	calls     int
+	mu                      sync.Mutex
+	responses               []*orchestratorinfo.ServiceInfoResponse
+	calls                   int
+	overrideErr             error
+	overrideCalls           int
+	lastOverrideServiceID   string
+	lastOverrideOperationID string
 }
 
 func (c *scriptedScaleInInfoClient) ServiceInfo(context.Context, *emptypb.Empty, ...grpc.CallOption) (*orchestratorinfo.ServiceInfoResponse, error) {
@@ -37,6 +43,16 @@ func (c *scriptedScaleInInfoClient) ServiceInfo(context.Context, *emptypb.Empty,
 	}
 
 	return response, nil
+}
+
+func (c *scriptedScaleInInfoClient) ConditionalServiceStatusOverride(_ context.Context, request *orchestratorinfo.ServiceStatusChangeRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.overrideCalls++
+	c.lastOverrideServiceID = request.GetExpectedServiceId()
+	c.lastOverrideOperationID = request.GetOperationId()
+
+	return &emptypb.Empty{}, c.overrideErr
 }
 
 type scriptedScaleInSandboxClient struct {
@@ -63,6 +79,7 @@ func scaleInInfo(serviceID string, supported, ready bool, running, starts, clean
 		SandboxStartsInFlight:     starts,
 		LifecycleCleanupsInFlight: cleanups,
 		SnapshotUploadsInFlight:   uploads,
+		ScaleInOperationId:        "operation-1",
 	}
 }
 
@@ -84,7 +101,7 @@ func TestReadWorkerScaleInStateRejectsRestartBetweenInfoAndList(t *testing.T) {
 	sandboxes := &scriptedScaleInSandboxClient{response: &orchestrator.SandboxListResponse{}}
 	node := testScaleInNode(info, sandboxes)
 
-	_, err := node.ReadWorkerScaleInState(t.Context(), "service-old")
+	_, err := node.ReadWorkerScaleInState(t.Context(), "service-old", "operation-1")
 
 	require.ErrorIs(t, err, ErrScaleInIdentityChanged)
 	require.Equal(t, 2, info.calls)
@@ -100,7 +117,7 @@ func TestReadWorkerScaleInStateRejectsLegacyProtocolBeforeList(t *testing.T) {
 	sandboxes := &scriptedScaleInSandboxClient{response: &orchestrator.SandboxListResponse{}}
 	node := testScaleInNode(info, sandboxes)
 
-	_, err := node.ReadWorkerScaleInState(t.Context(), "service-1")
+	_, err := node.ReadWorkerScaleInState(t.Context(), "service-1", "operation-1")
 
 	require.ErrorIs(t, err, ErrScaleInProtocolMissing)
 	require.Zero(t, sandboxes.calls)
@@ -121,7 +138,7 @@ func TestReadWorkerScaleInStateUsesLiveStateInsteadOfCandidateCache(t *testing.T
 		ProtocolSupported: true,
 	}
 
-	state, err := node.ReadWorkerScaleInState(t.Context(), "service-1")
+	state, err := node.ReadWorkerScaleInState(t.Context(), "service-1", "operation-1")
 
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), state.RunningSandboxes)
@@ -149,9 +166,9 @@ func TestReadWorkerScaleInStateIgnoresDivergentReplicaCaches(t *testing.T) {
 	replicaA.scaleIn = scaleInObservation{NodeID: "node-1", ServiceInstanceID: "service-1", RunningSandboxes: 0, ProtocolSupported: true}
 	replicaB.scaleIn = scaleInObservation{NodeID: "node-1", ServiceInstanceID: "service-1", RunningSandboxes: 99, ProtocolSupported: true}
 
-	stateA, err := replicaA.ReadWorkerScaleInState(t.Context(), "service-1")
+	stateA, err := replicaA.ReadWorkerScaleInState(t.Context(), "service-1", "operation-1")
 	require.NoError(t, err)
-	stateB, err := replicaB.ReadWorkerScaleInState(t.Context(), "service-1")
+	stateB, err := replicaB.ReadWorkerScaleInState(t.Context(), "service-1", "operation-1")
 	require.NoError(t, err)
 
 	require.Equal(t, uint64(1), stateA.RunningSandboxes)
@@ -167,37 +184,94 @@ func TestReadWorkerScaleInStateRejectsContradictoryShutdownReady(t *testing.T) {
 	sandboxes := &scriptedScaleInSandboxClient{response: &orchestrator.SandboxListResponse{}}
 	node := testScaleInNode(info, sandboxes)
 
-	_, err := node.ReadWorkerScaleInState(t.Context(), "service-1")
+	_, err := node.ReadWorkerScaleInState(t.Context(), "service-1", "operation-1")
 
 	require.ErrorIs(t, err, ErrScaleInStateInvalid)
 }
 
-func TestCancelWorkerScaleInAcceptsHealthyReplacementWithoutMutation(t *testing.T) {
+func TestReadWorkerScaleInStateRejectsCompetingOperation(t *testing.T) {
 	t.Parallel()
 
-	replacement := scaleInInfo("service-new", true, false, 0, 0, 0, 0)
-	replacement.ServiceStatus = orchestratorinfo.ServiceInfoStatus_Healthy
-	info := &scriptedScaleInInfoClient{responses: []*orchestratorinfo.ServiceInfoResponse{replacement}}
+	live := scaleInInfo("service-1", true, true, 0, 0, 0, 0)
+	info := &scriptedScaleInInfoClient{responses: []*orchestratorinfo.ServiceInfoResponse{live, live}}
+	node := testScaleInNode(info, &scriptedScaleInSandboxClient{response: &orchestrator.SandboxListResponse{}})
+
+	_, err := node.ReadWorkerScaleInState(t.Context(), "service-1", "operation-2")
+
+	require.ErrorIs(t, err, ErrScaleInIdentityChanged)
+}
+
+func TestCancelWorkerScaleInRejectsReplacementIdentity(t *testing.T) {
+	t.Parallel()
+
+	info := &scriptedScaleInInfoClient{overrideErr: status.Error(codes.FailedPrecondition, "identity changed")}
 	sandboxes := &scriptedScaleInSandboxClient{response: &orchestrator.SandboxListResponse{}}
 	node := testScaleInNode(info, sandboxes)
 
-	state, err := node.CancelWorkerScaleIn(t.Context(), "service-old")
+	_, err := node.CancelWorkerScaleIn(t.Context(), "service-old", "operation-1")
+
+	require.ErrorIs(t, err, ErrScaleInIdentityChanged)
+	require.Equal(t, 1, info.overrideCalls)
+	require.Zero(t, sandboxes.calls, "replacement recovery must not require or infer an empty worker")
+}
+
+func TestCancelWorkerScaleInRejectsAlreadyHealthyWithoutOwnedDrain(t *testing.T) {
+	t.Parallel()
+
+	info := &scriptedScaleInInfoClient{overrideErr: status.Error(codes.FailedPrecondition, "not owned")}
+	node := testScaleInNode(info, &scriptedScaleInSandboxClient{response: &orchestrator.SandboxListResponse{}})
+
+	_, err := node.CancelWorkerScaleIn(t.Context(), "service-1", "operation-1")
+
+	require.ErrorIs(t, err, ErrScaleInIdentityChanged)
+	require.Equal(t, 1, info.overrideCalls)
+}
+
+func TestCancelWorkerScaleInReplaysOperationOwnerAfterLostResponse(t *testing.T) {
+	t.Parallel()
+
+	healthy := scaleInInfo("service-1", true, false, 0, 0, 0, 0)
+	healthy.ServiceStatus = orchestratorinfo.ServiceInfoStatus_Healthy
+	info := &scriptedScaleInInfoClient{responses: []*orchestratorinfo.ServiceInfoResponse{healthy, healthy}}
+	node := testScaleInNode(info, &scriptedScaleInSandboxClient{response: &orchestrator.SandboxListResponse{}})
+
+	_, err := node.CancelWorkerScaleIn(t.Context(), "service-1", "operation-1")
 
 	require.NoError(t, err)
-	require.Equal(t, "service-new", state.ServiceInstanceID)
-	require.Equal(t, orchestratorinfo.ServiceInfoStatus_Healthy, state.ServiceStatus)
-	require.Zero(t, sandboxes.calls, "replacement recovery must not require or infer an empty worker")
+	require.Equal(t, "operation-1", info.lastOverrideOperationID)
+
+	_, err = node.CancelWorkerScaleIn(t.Context(), "service-1", "operation-1")
+	require.NoError(t, err)
+	require.Equal(t, 2, info.overrideCalls)
+}
+
+func TestBeginWorkerScaleInDoesNotMutateLegacyWorker(t *testing.T) {
+	t.Parallel()
+
+	live := scaleInInfo("service-1", true, false, 0, 0, 0, 0)
+	live.ServiceStatus = orchestratorinfo.ServiceInfoStatus_Healthy
+	info := &scriptedScaleInInfoClient{
+		responses:   []*orchestratorinfo.ServiceInfoResponse{live},
+		overrideErr: status.Error(codes.Unimplemented, "method not implemented"),
+	}
+	node := testScaleInNode(info, &scriptedScaleInSandboxClient{response: &orchestrator.SandboxListResponse{}})
+
+	_, err := node.BeginWorkerScaleIn(t.Context(), "service-1", "operation-1")
+
+	require.Equal(t, codes.Unimplemented, status.Code(err))
+	require.Equal(t, 1, info.overrideCalls)
+	require.Equal(t, "service-1", info.lastOverrideServiceID)
+	require.Equal(t, "operation-1", info.lastOverrideOperationID)
 }
 
 func TestCancelWorkerScaleInRejectsNonHealthyReplacement(t *testing.T) {
 	t.Parallel()
 
-	replacement := scaleInInfo("service-new", true, false, 0, 0, 0, 0)
-	replacement.ServiceStatus = orchestratorinfo.ServiceInfoStatus_Unhealthy
-	info := &scriptedScaleInInfoClient{responses: []*orchestratorinfo.ServiceInfoResponse{replacement}}
+	info := &scriptedScaleInInfoClient{}
 	node := testScaleInNode(info, &scriptedScaleInSandboxClient{response: &orchestrator.SandboxListResponse{}})
 
-	_, err := node.CancelWorkerScaleIn(t.Context(), "service-old")
+	info.overrideErr = status.Error(codes.FailedPrecondition, "identity changed")
+	_, err := node.CancelWorkerScaleIn(t.Context(), "service-old", "operation-1")
 
 	require.ErrorIs(t, err, ErrScaleInIdentityChanged)
 }

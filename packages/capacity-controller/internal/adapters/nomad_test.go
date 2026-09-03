@@ -53,7 +53,6 @@ func TestOwnedNomadOperationRequiresCompleteControllerMetadata(t *testing.T) {
 		ServiceInstanceID: "service-1",
 		StartedAt:         startedAt,
 		Stage:             "worker_draining",
-		ActivityID:        "activity-1",
 	}
 	metadata := &nomadapi.DrainMetadata{Meta: nomadOperationMeta(operation)}
 
@@ -68,6 +67,35 @@ func TestOwnedNomadOperationRequiresCompleteControllerMetadata(t *testing.T) {
 	delete(metadata.Meta, nomadMetaServiceID)
 	_, err = ownedNomadOperation(metadata)
 	require.ErrorContains(t, err, "incomplete")
+}
+
+func TestOwnedNomadOperationAcceptsOnlyCompletedLegacyMarker(t *testing.T) {
+	t.Parallel()
+
+	metadata := &nomadapi.DrainMetadata{
+		Status: nomadapi.DrainStatusComplete,
+		Meta: map[string]string{
+			nomadMetaOwner:     controller.ScaleInNomadOwner,
+			nomadMetaOperation: "operation-1",
+			nomadMetaServiceID: "service-1",
+			nomadMetaStartedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			nomadMetaStage:     "complete",
+			nomadMetaVersion:   legacyScaleInVersion,
+		},
+	}
+
+	operation, err := ownedNomadOperation(metadata)
+	require.NoError(t, err)
+	require.Equal(t, "complete", operation.Stage)
+
+	metadata.Meta[nomadMetaStage] = "worker_draining"
+	_, err = ownedNomadOperation(metadata)
+	require.ErrorContains(t, err, "unsupported")
+
+	metadata.Meta[nomadMetaStage] = "complete"
+	metadata.Status = nomadapi.DrainStatusDraining
+	_, err = ownedNomadOperation(metadata)
+	require.ErrorContains(t, err, "unsupported")
 }
 
 func TestOwnedNomadIsolationAcceptsCompletedIgnoreSystemDrain(t *testing.T) {
@@ -263,6 +291,86 @@ func TestNomadCompleteRestorePersistsTerminalMarker(t *testing.T) {
 	require.True(t, updates[1].MarkEligible)
 	require.Equal(t, "restored", node.LastDrain.Meta[nomadMetaStage])
 	require.Equal(t, nomadapi.NodeSchedulingEligible, node.SchedulingEligibility)
+}
+
+func TestNomadRestoreDrainRequiresReversiblePersistedStage(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name        string
+		stage       string
+		wantErr     string
+		wantUpdates int
+	}{
+		{name: "owned worker drain is reversible", stage: "worker_draining", wantUpdates: 1},
+		{name: "ambiguous termination remains isolated", stage: "terminating", wantErr: "no longer reversible"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			operation := controller.NomadScaleInOperation{
+				OperationID:       "operation-1",
+				ServiceInstanceID: "service-1",
+				StartedAt:         time.Unix(100, 0).UTC(),
+				Stage:             test.stage,
+			}
+			node := &nomadapi.Node{
+				ID:                    "nomad-1",
+				Name:                  "i-1",
+				NodePool:              "orchestrator",
+				Drain:                 true,
+				SchedulingEligibility: nomadapi.NodeSchedulingIneligible,
+				LastDrain: &nomadapi.DrainMetadata{
+					Status: nomadapi.DrainStatusDraining,
+					Meta:   nomadOperationMeta(operation),
+				},
+			}
+			updates := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					if r.URL.Path != "/v1/node/nomad-1" {
+						t.Errorf("unexpected request path: %s", r.URL.Path)
+						http.Error(w, "unexpected request path", http.StatusNotFound)
+
+						return
+					}
+					if err := json.NewEncoder(w).Encode(node); err != nil {
+						t.Errorf("encode node response: %v", err)
+					}
+				case http.MethodPut:
+					if r.URL.Path != "/v1/node/nomad-1/drain" {
+						t.Errorf("unexpected request path: %s", r.URL.Path)
+						http.Error(w, "unexpected request path", http.StatusNotFound)
+
+						return
+					}
+					updates++
+					if err := json.NewEncoder(w).Encode(&nomadapi.NodeDrainUpdateResponse{}); err != nil {
+						t.Errorf("encode drain response: %v", err)
+					}
+				default:
+					http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+				}
+			}))
+			defer server.Close()
+
+			client, err := nomadapi.NewClient(&nomadapi.Config{Address: server.URL})
+			require.NoError(t, err)
+			err = NewNomad(client).RestoreDrain(t.Context(), controller.NomadScaleInNode{
+				NomadNodeID: "nomad-1",
+				NodeID:      "i-1",
+				NodePool:    "orchestrator",
+			}, operation)
+
+			if test.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, test.wantErr)
+			}
+			require.Equal(t, test.wantUpdates, updates)
+		})
+	}
 }
 
 func TestNomadCompleteRestoreResumesAfterTerminalMarker(t *testing.T) {

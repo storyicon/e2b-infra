@@ -727,22 +727,34 @@ components:
           format: int64
         concurrentSandboxes:
           type: integer
-          format: int32
+          format: int64
         concurrentTemplateBuilds:
           type: integer
-          format: int32
+          format: int64
         maxVcpu:
           type: integer
-          format: int32
+          format: int64
         maxRamMb:
           type: integer
-          format: int32
+          format: int64
         diskMb:
           type: integer
-          format: int32
+          format: int64
         eventsTtlDays:
           type: integer
-          format: int32
+          format: int64
+
+    TeamLimitsResponse:
+      type: object
+      required:
+        - tier
+        - limits
+      properties:
+        tier:
+          type: string
+          description: The team's raw tier identifier, exactly as stored (not normalized to a catalog plan).
+        limits:
+          $ref: "#/components/schemas/UserTeamLimits"
 
     UserTeam:
       type: object
@@ -1312,6 +1324,32 @@ components:
               type: string
               format: uuid
 
+    ManagementClusterRegistrationRequest:
+      type: object
+      required:
+        - name
+        - endpoint
+        - endpoint_tls
+        - token
+      properties:
+        name:
+          type: string
+          minLength: 1
+        endpoint:
+          type: string
+          minLength: 1
+        endpoint_tls:
+          type: boolean
+        token:
+          type: string
+          minLength: 1
+        sandbox_proxy_domain:
+          type: string
+          nullable: true
+        auth_org_id:
+          type: string
+          nullable: true
+
     ManagementProjectMemberIdentity:
       type: object
       required: [issuer, subject]
@@ -1335,6 +1373,10 @@ components:
           minimum: 1
         present:
           type: boolean
+        is_default:
+          type: boolean
+          default: false
+          description: Whether this membership is the user's default team. Omitted requests from older sources remain non-default.
         identities:
           type: array
           maxItems: 16
@@ -1354,6 +1396,13 @@ components:
         under looser constraints on purpose — it is a push target, and a floor
         that only rejects the impossible keeps a future decision about what is
         allowed a change to this schema rather than a migration.
+
+
+        `max_disk_size_mb` and `max_free_disk_size_mb` are one ceiling under two
+        names, and either name alone carries it. A caller that sends both must
+        send them equal; a caller that sends neither is refused. Sending both is
+        what a caller does while receivers older than the second name are still
+        running.
       required:
         - revision
         - concurrent_sandboxes
@@ -1364,7 +1413,9 @@ components:
         - concurrent_template_builds
         - events_ttl_days
         - default_free_disk_size_mb
-        - max_disk_size_mb
+      anyOf:
+        - required: [max_free_disk_size_mb]
+        - required: [max_disk_size_mb]
       properties:
         revision:
           type: integer
@@ -1413,12 +1464,25 @@ components:
           format: int64
           minimum: 0
           description: >-
-            Free rootfs allowance. Must not exceed max_disk_size_mb; the two
-            are stored together and rejected as a pair if they disagree.
+            The default free-space growth target when a template build request
+            omits one. May sit anywhere at or below the maximum free-space
+            growth target, and usually sits well below it; a delivery whose
+            default exceeds the maximum is rejected.
+        max_free_disk_size_mb:
+          type: integer
+          format: int64
+          minimum: 1
+          description: >-
+            The most a template build may request as its free-space growth
+            target.
         max_disk_size_mb:
           type: integer
           format: int64
           minimum: 1
+          description: >-
+            The same ceiling as max_free_disk_size_mb, under the name it was
+            first published with. Kept until every deployed sender and receiver
+            speaks the other name.
 
 tags:
   - name: builds
@@ -1598,6 +1662,7 @@ paths:
       tags: [teams]
       security:
         - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
       requestBody:
         required: true
         content:
@@ -1627,6 +1692,7 @@ paths:
       tags: [admin]
       security:
         - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
       requestBody:
         required: true
         content:
@@ -1658,6 +1724,7 @@ paths:
       tags: [admin]
       security:
         - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
       requestBody:
         required: true
         content:
@@ -1687,6 +1754,7 @@ paths:
       tags: [admin]
       security:
         - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
       parameters:
         - $ref: "#/components/parameters/clusterID"
       responses:
@@ -1708,6 +1776,7 @@ paths:
       tags: [admin]
       security:
         - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
       parameters:
         - $ref: "#/components/parameters/teamID"
       responses:
@@ -1731,6 +1800,7 @@ paths:
       tags: [admin]
       security:
         - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
       parameters:
         - $ref: "#/components/parameters/teamID"
       requestBody:
@@ -1762,6 +1832,7 @@ paths:
       tags: [admin]
       security:
         - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
       parameters:
         - $ref: "#/components/parameters/teamID"
         - $ref: "#/components/parameters/clusterID"
@@ -1787,6 +1858,7 @@ paths:
       tags: [admin]
       security:
         - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
       requestBody:
         required: true
         content:
@@ -1813,6 +1885,7 @@ paths:
       tags: [admin]
       security:
         - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
       requestBody:
         required: true
         content:
@@ -1839,6 +1912,7 @@ paths:
       tags: [admin]
       security:
         - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
       parameters:
         - $ref: "#/components/parameters/userId"
       responses:
@@ -1862,6 +1936,7 @@ paths:
       tags: [admin]
       security:
         - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
       parameters:
         - $ref: "#/components/parameters/userId"
       responses:
@@ -1941,11 +2016,13 @@ paths:
   /teams/{teamID}/status:
     get:
       summary: Get team access status
-      description: Returns whether the team is blocked or banned and its recorded blocked reason. Bearer-authenticated users may read only teams they belong to.
+      description: Returns whether the team is blocked or banned and its recorded blocked reason. Team-authenticated requests may read only the team they are scoped to.
       tags: [teams]
       security:
         - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
         - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
       parameters:
         - $ref: "#/components/parameters/teamID"
       responses:
@@ -1955,6 +2032,32 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TeamStatusResponse"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /teams/{teamID}/limits:
+    get:
+      summary: Get team limits
+      description: Returns the team's tier and effective resource limits. Team-authenticated requests may read only the team they are scoped to.
+      tags: [teams]
+      security:
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
+      parameters:
+        - $ref: "#/components/parameters/teamID"
+      responses:
+        "200":
+          description: Successfully returned team limits.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TeamLimitsResponse"
         "401":
           $ref: "#/components/responses/401"
         "404":
@@ -2362,3 +2465,86 @@ paths:
           $ref: "#/components/responses/500"
         "501":
           $ref: "#/components/responses/501"
+
+  /v1/management/clusters/{clusterID}:
+    parameters:
+      - $ref: "#/components/parameters/clusterID"
+    put:
+      operationId: managementRegisterCluster
+      summary: Register a cluster (v1).
+      tags: [control-plane-management]
+      security:
+        - AdminJWTAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagementClusterRegistrationRequest"
+      responses:
+        "204":
+          description: Cluster registration is present.
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+    delete:
+      operationId: managementDeleteCluster
+      summary: Delete an unreferenced cluster (v1).
+      tags: [control-plane-management]
+      security:
+        - AdminJWTAuth: []
+      responses:
+        "204":
+          description: Cluster is absent.
+        "401":
+          $ref: "#/components/responses/401"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /v1/management/projects/{projectID}/cluster/{clusterID}:
+    parameters:
+      - $ref: "#/components/parameters/projectID"
+      - $ref: "#/components/parameters/clusterID"
+    put:
+      operationId: managementAssignProjectCluster
+      summary: Assign a cluster to a project (v1).
+      tags: [control-plane-management]
+      security:
+        - AdminJWTAuth: []
+      responses:
+        "204":
+          description: Cluster is assigned to the project.
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+    delete:
+      operationId: managementDetachProjectCluster
+      summary: Detach a cluster assignment from a project (v1).
+      tags: [control-plane-management]
+      security:
+        - AdminJWTAuth: []
+      responses:
+        "204":
+          description: The matching assignment is absent.
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"

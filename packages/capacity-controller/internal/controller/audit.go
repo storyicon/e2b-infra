@@ -43,7 +43,6 @@ type ScaleAuditEvent struct {
 	ScaleInNodeID         string
 	ScaleInStage          string
 	ScaleInReason         string
-	ASGActivityID         string
 }
 
 // AuditSink has no error return so evidence collection cannot change a scale

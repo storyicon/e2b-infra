@@ -34,6 +34,7 @@ const (
 	TeamKind             ldcontext.Kind = "team"
 	UserKind             ldcontext.Kind = "user"
 	ClusterKind          ldcontext.Kind = "cluster"
+	InstanceGroupKind    ldcontext.Kind = "instance-group"
 	deploymentKind       ldcontext.Kind = "deployment"
 	TierKind             ldcontext.Kind = "tier"
 	ServiceKind          ldcontext.Kind = "service"
@@ -129,6 +130,7 @@ var (
 	UseNFSCacheForBuildingTemplatesFlag = NewBoolFlag("use-nfs-for-building-templates", env.IsDevelopment())
 	CreateStorageCacheSpansFlag         = NewBoolFlag("create-storage-cache-spans", env.IsDevelopment())
 	OrchAcceptsCombinedHostFlag         = NewBoolFlag("orch-accepts-combined-host", false)
+	WorkspacesEnabledFlag               = NewBoolFlag("workspacesEnabled", false)
 
 	// FsFreezeViaExecFlag freezes the guest rootfs with `fsfreeze -f /` run through
 	// the envd exec API before a filesystem-only pause, for guests whose envd
@@ -141,6 +143,12 @@ var (
 	// memory-inclusive snapshot (an explicit cold-boot rescue). Off = the
 	// request is rejected, never silently downgraded to a memory restore.
 	FsOnlyResumeAPIFlag = NewBoolFlag("fs-only-resume-api", false)
+
+	// PrebootFsRecoveryFlag runs a jailed filesystem recovery before every cold
+	// boot of a rootfs that was not frozen at pause (fs_quiesced absent/false).
+	// Separate from FsOnlyResumeAPIFlag because it also changes the behavior of
+	// existing filesystem-only cold boots whose pause fell back to sync.
+	PrebootFsRecoveryFlag = NewBoolFlag("preboot-fs-recovery", false)
 
 	// StorageSoftDeleteCheckFlag enables reading the storage-index soft-delete
 	// tombstone on header load (one extra GCS Attrs on cold load). Off = no overhead.
@@ -317,6 +325,7 @@ var (
 	SandboxVolumeLabelBasedSchedulingFlag = NewBoolFlag("sandbox-volume-label-based-scheduling", false)
 
 	NetworkTransformRulesFlag = NewBoolFlag("network-transform-rules", env.IsDevelopment())
+	MaxNetworkRuleDomains     = NewIntFlag("max-network-rule-domains", 10)
 
 	BYOPProxyEnabledFlag = NewBoolFlag("byop-proxy-enabled", env.IsDevelopment())
 
@@ -355,6 +364,11 @@ var (
 
 	// BuildEnsureFreeDiskSpace grows the rootfs after build steps and before finalize.
 	BuildEnsureFreeDiskSpace = NewBoolFlag("build-ensure-free-disk-space", false)
+
+	// BuildExt4DirIndex keeps the htree directory index that mkfs.ext4 enables by
+	// default on the rootfs. Read at mkfs time, so it governs only rootfs images
+	// built after the flip.
+	BuildExt4DirIndex = NewBoolFlag("build-ext4-dir-index", false)
 )
 
 // envdTimeoutFallbackMs reads ENVD_TIMEOUT (Go duration string, e.g. "10s")
@@ -414,7 +428,12 @@ var (
 	// GuestSyncTimeoutMs overrides the mandatory pre-pause guest-sync deadline
 	// for filesystem-only snapshots, in milliseconds. 0 (default) derives the
 	// timeout from guest RAM; a positive value pins it.
-	GuestSyncTimeoutMs            = NewIntFlag("guest-sync-timeout-milliseconds", 0)
+	GuestSyncTimeoutMs = NewIntFlag("guest-sync-timeout-milliseconds", 0)
+	// PauseAdmissionGraceMs gates the pause/checkpoint snapshot-admission
+	// pre-flight, in milliseconds. Negative (default) disables the pre-flight;
+	// 0 probes the parent header's readiness without waiting; a positive value
+	// waits up to that long before refusing retryably.
+	PauseAdmissionGraceMs         = NewIntFlag("pause-admission-grace-milliseconds", -1)
 	MaxCacheWriterConcurrencyFlag = NewIntFlag("max-cache-writer-concurrency", 10)
 
 	// BuildCacheMaxUsagePercentage the maximum percentage of the cache disk storage
@@ -622,6 +641,13 @@ func NewStringFlag(name string, fallback string) StringFlag {
 
 const (
 	DefaultKernelVersion = "vmlinux-6.1.158"
+
+	// DefaultEnvdVersion is the envd new template builds bake when neither the
+	// build-envd-version flag nor DEFAULT_ENVD_VERSION says otherwise:
+	// "promoted" selects the node-local promoted binary (HOST_ENVD_PATH), the
+	// behavior every build has always had, so deployments without
+	// LaunchDarkly (dev, self-host) are unaffected.
+	DefaultEnvdVersion = "promoted"
 )
 
 // The Firecracker version per release line: legacy lines pin
@@ -654,7 +680,19 @@ var FirecrackerVersionMap = map[string]string{
 var (
 	BuildFirecrackerVersion = NewStringFlag("build-firecracker-version", env.GetEnv("DEFAULT_FIRECRACKER_VERSION", DefaultFirecrackerVersion))
 	BuildKernelVersion      = NewStringFlag("build-kernel-version", env.GetEnv("DEFAULT_KERNEL_VERSION", DefaultKernelVersion))
-	BuildIoEngine           = NewStringFlag("build-io-engine", "Sync")
+	// BuildEnvdVersion selects which staged envd binary a template build bakes
+	// into the rootfs — the envd counterpart of BuildKernelVersion /
+	// BuildFirecrackerVersion, same default mechanism. "promoted" (the
+	// fallback) is the node-local promoted binary; a concrete version id
+	// (e.g. v0.7.0, or a git SHA while those age out) selects a staged binary
+	// (the flat envd.<id> sibling or the release bucket's <id>/envd layout,
+	// see build/core/envd.ResolveBuildBinary). A pinned target that is not
+	// staged FAILS the build rather than silently baking a different envd —
+	// feature gates key on the baked version, so a silent substitute
+	// misgates. The build-site LD context carries template/team, so cohort
+	// canaries come for free.
+	BuildEnvdVersion = NewStringFlag("build-envd-version", env.GetEnv("DEFAULT_ENVD_VERSION", DefaultEnvdVersion))
+	BuildIoEngine    = NewStringFlag("build-io-engine", "Sync")
 
 	// BuildKernelCmdlineArgs supplies extra guest kernel command line parameters at
 	// template build time, keyed on team, as a command line fragment:
@@ -682,7 +720,12 @@ var (
 	//   "promoted"   — track the node-local promoted envd (HOST_ENVD_PATH); upgrade
 	//                  whenever it differs from the sandbox's built-with version
 	//                  (no per-publish flag edits needed).
-	//   "<git-sha>"  — pin a specific versioned binary (/fc-envd/envd.<sha>).
+	//   "<version>"  — pin a specific staged binary, in either layout beside the
+	//                  promoted one: the flat /fc-envd/envd.<version> sibling or
+	//                  the release bucket's /fc-envd/<version>/envd directory.
+	//                  Release names may carry dots and hyphens (v0.7.0,
+	//                  v0.8.0-rc1); legacy git-SHA suffixes keep resolving while
+	//                  the old envd.<sha> objects age out.
 	// The resume-site LD context carries envd-version/team/template, so %-ramp
 	// and cohort canaries come for free. The fallback is env-overridable
 	// (ENVD_UPGRADE_TARGET) so it can be exercised where there is no LD (dev),
@@ -692,7 +735,7 @@ var (
 	// filesystem-only snapshot: at cold-boot resume the rootfs binary is rewritten
 	// (jailed debugfs) before the guest boots, reaching envd too old to self-upgrade
 	// (< MinEnvdVersionForUpgrade). Same value grammar and resolver as
-	// EnvdUpgradeTargetFlag ("off" / "promoted" / "<git-sha>"); a SEPARATE flag so
+	// EnvdUpgradeTargetFlag ("off" / "promoted" / "<version>"); a SEPARATE flag so
 	// the newer/riskier offline mechanism ramps independently of the live path. The
 	// fallback is env-overridable (ENVD_OFFLINE_UPGRADE_TARGET) for dev, where there
 	// is no LD. Default off.
@@ -1078,7 +1121,8 @@ func ResolveFirecrackerVersion(ctx context.Context, ff *Client, buildVersion str
 // ResolveFirecrackerVersion.
 //
 // hostEnvdPath is the promoted binary (cfg HostEnvdPath, e.g. /fc-envd/envd);
-// versioned binaries live beside it as envd.<sha>. getVersion resolves a
+// versioned binaries live beside it as envd.<version> (legacy uploads:
+// envd.<sha>). getVersion resolves a
 // binary's baked version (orchestrator's build/core/envd.GetEnvdVersion) — it is
 // injected so this shared package does not depend on the orchestrator.
 //
@@ -1124,11 +1168,12 @@ func ResolveEnvdOfflineUpgrade(
 // resolveEnvdUpgradePath is the pure decision, split out so it can be unit-tested
 // without a LaunchDarkly client (the flag value is passed directly). It returns
 // the target path and its baked version, or ("", "", <reason>) for no upgrade.
-// envdUpgradeTargetRe constrains a concrete-SHA EnvdUpgradeTargetFlag value to a
-// bare alphanumeric identifier (git SHAs are hex, but any staged-binary suffix
-// is safe) so it can't traverse out of the envd staging directory when joined
-// into the candidate path.
-var envdUpgradeTargetRe = regexp.MustCompile(`^[a-zA-Z0-9]+$`)
+// envdUpgradeTargetRe constrains a concrete EnvdUpgradeTargetFlag value to a
+// bare version-ish identifier — a git SHA or a release name like v0.7.0. Dots
+// and hyphens are admitted, but no path separators and no leading dot, so the
+// value can't traverse out of the envd staging directory when joined into the
+// candidate path.
+var envdUpgradeTargetRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9.-]*$`)
 
 func resolveEnvdUpgradePath(
 	ctx context.Context,
@@ -1144,21 +1189,36 @@ func resolveEnvdUpgradePath(
 	case "promoted":
 		candidate = hostEnvdPath
 	default:
-		// A concrete git SHA -> the versioned binary next to the promoted one.
-		// The flag value becomes both a filesystem path and an exec target
-		// (version probing runs `<candidate> -version`), so reject anything that
-		// isn't a bare alphanumeric identifier: a value with path separators or
-		// ".." (e.g. "../../bin/sh") would otherwise escape the staging directory
-		// and run an arbitrary host binary.
+		// A concrete version id -> the staged binary next to the promoted one,
+		// in either layout: the flat "envd.<id>" sibling or the release
+		// bucket's "<id>/envd" directory. The flag value becomes both a
+		// filesystem path and an exec target (version probing runs
+		// `<candidate> -version`), so reject anything that isn't a bare
+		// identifier: a value with path separators (e.g. "../../bin/sh") would
+		// otherwise escape the staging directory and run an arbitrary host
+		// binary.
 		if !envdUpgradeTargetRe.MatchString(target) {
 			return "", "", "invalid_target"
 		}
-		candidate = filepath.Join(filepath.Dir(hostEnvdPath), "envd."+target)
+		dir := filepath.Dir(hostEnvdPath)
+		for _, c := range []string{filepath.Join(dir, "envd."+target), filepath.Join(dir, target, "envd")} {
+			if _, err := os.Stat(c); err == nil {
+				candidate = c
+
+				break
+			}
+		}
+	}
+
+	if candidate == "" {
+		// Not staged on this node in either layout — e.g. a bad target /
+		// rubbish flag value, or a node that has not fetched the target yet.
+		return "", "", "not_staged"
 	}
 
 	if _, err := os.Stat(candidate); err != nil {
-		// Not staged on this node — e.g. a bad SHA / rubbish flag value, or a
-		// node that has not fetched the target yet.
+		// The promoted binary is absent (e.g. a version-free central mount
+		// with no unversioned object).
 		return "", "", "not_staged"
 	}
 

@@ -25,6 +25,16 @@ func TestDrainSandboxesReturnsWhenEmpty(t *testing.T) {
 	require.NoError(t, s.DrainSandboxes(t.Context()))
 }
 
+func TestDrainSandboxesReturnsWhenUnhealthyAndEmpty(t *testing.T) {
+	t.Parallel()
+
+	s := drainTestServer()
+	s.info.SetStatus(t.Context(), orchestratorinfo.ServiceInfoStatus_Unhealthy)
+
+	require.NoError(t, s.DrainSandboxes(t.Context()))
+	require.Equal(t, orchestratorinfo.ServiceInfoStatus_Unhealthy, s.info.GetStatus().Status)
+}
+
 func TestDrainSandboxesBlocksWhileLiveAndReturnsOnCancel(t *testing.T) {
 	t.Parallel()
 

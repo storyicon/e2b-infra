@@ -68,7 +68,6 @@ func (slogAuditSink) Record(event controller.ScaleAuditEvent) {
 		"scale_in_node_id", event.ScaleInNodeID,
 		"scale_in_stage", event.ScaleInStage,
 		"scale_in_reason", event.ScaleInReason,
-		"asg_activity_id", event.ASGActivityID,
 	)
 }
 

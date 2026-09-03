@@ -49,15 +49,23 @@ func (a *CapacitySnapshot) ListScaleInCandidates(ctx context.Context, clusterID 
 
 	result := make([]controller.ScaleInCandidateObservation, 0, len(response.GetCandidates()))
 	for _, candidate := range response.GetCandidates() {
-		if candidate == nil || candidate.GetObservedAt() == nil || !candidate.GetObservedAt().IsValid() || candidate.GetRunningSandboxes() > math.MaxInt64 {
+		if candidate == nil || candidate.GetObservedAt() == nil || !candidate.GetObservedAt().IsValid() {
 			return nil, errors.New("list scale-in candidates: invalid candidate")
+		}
+		running := candidate.GetRunningSandboxes()
+		cachedStarts := candidate.GetCachedStartsInFlight()
+		placement := candidate.GetApiPlacementInProgress()
+		maxWorkload := uint64(math.MaxInt64)
+		if running > maxWorkload || cachedStarts > maxWorkload-running || placement > maxWorkload-running-cachedStarts {
+			return nil, errors.New("list scale-in candidates: candidate workload exceeds supported range")
 		}
 		result = append(result, controller.ScaleInCandidateObservation{
 			NodeID:                 candidate.GetNodeId(),
 			NomadNodeID:            candidate.GetNomadNodeId(),
 			ServiceInstanceID:      candidate.GetServiceInstanceId(),
 			ServiceStatus:          candidate.GetServiceStatus(),
-			RunningSandboxes:       int64(candidate.GetRunningSandboxes()),
+			RunningSandboxes:       int64(running),
+			KnownWorkload:          int64(running + cachedStarts + placement),
 			ScaleInProtocolSupport: candidate.GetSafeScaleInSupported(),
 			ObservedAt:             candidate.GetObservedAt().AsTime(),
 		})
@@ -66,20 +74,20 @@ func (a *CapacitySnapshot) ListScaleInCandidates(ctx context.Context, clusterID 
 	return result, nil
 }
 
-func (a *CapacitySnapshot) BeginWorkerScaleIn(ctx context.Context, clusterID, nodeID, serviceInstanceID string) (controller.WorkerScaleInState, error) {
-	response, err := a.client.BeginWorkerScaleIn(a.authenticatedContext(ctx), scaleInRequest(clusterID, nodeID, serviceInstanceID))
+func (a *CapacitySnapshot) BeginWorkerScaleIn(ctx context.Context, clusterID, nodeID, serviceInstanceID, operationID string) (controller.WorkerScaleInState, error) {
+	response, err := a.client.BeginWorkerScaleIn(a.authenticatedContext(ctx), scaleInRequest(clusterID, nodeID, serviceInstanceID, operationID))
 
 	return workerScaleInState(response, err, "begin worker scale-in")
 }
 
-func (a *CapacitySnapshot) VerifyWorkerScaleIn(ctx context.Context, clusterID, nodeID, serviceInstanceID string) (controller.WorkerScaleInState, error) {
-	response, err := a.client.VerifyWorkerScaleIn(a.authenticatedContext(ctx), scaleInRequest(clusterID, nodeID, serviceInstanceID))
+func (a *CapacitySnapshot) VerifyWorkerScaleIn(ctx context.Context, clusterID, nodeID, serviceInstanceID, operationID string) (controller.WorkerScaleInState, error) {
+	response, err := a.client.VerifyWorkerScaleIn(a.authenticatedContext(ctx), scaleInRequest(clusterID, nodeID, serviceInstanceID, operationID))
 
 	return workerScaleInState(response, err, "verify worker scale-in")
 }
 
-func (a *CapacitySnapshot) CancelWorkerScaleIn(ctx context.Context, clusterID, nodeID, serviceInstanceID string) (controller.WorkerScaleInState, error) {
-	response, err := a.client.CancelWorkerScaleIn(a.authenticatedContext(ctx), scaleInRequest(clusterID, nodeID, serviceInstanceID))
+func (a *CapacitySnapshot) CancelWorkerScaleIn(ctx context.Context, clusterID, nodeID, serviceInstanceID, operationID string) (controller.WorkerScaleInState, error) {
+	response, err := a.client.CancelWorkerScaleIn(a.authenticatedContext(ctx), scaleInRequest(clusterID, nodeID, serviceInstanceID, operationID))
 
 	return workerScaleInState(response, err, "cancel worker scale-in")
 }
@@ -92,8 +100,8 @@ func (a *CapacitySnapshot) authenticatedContext(ctx context.Context) context.Con
 	return metadata.NewOutgoingContext(ctx, md)
 }
 
-func scaleInRequest(clusterID, nodeID, serviceInstanceID string) *proxygrpc.WorkerScaleInRequest {
-	return &proxygrpc.WorkerScaleInRequest{ClusterId: clusterID, NodeId: nodeID, ExpectedServiceInstanceId: serviceInstanceID}
+func scaleInRequest(clusterID, nodeID, serviceInstanceID, operationID string) *proxygrpc.WorkerScaleInRequest {
+	return &proxygrpc.WorkerScaleInRequest{ClusterId: clusterID, NodeId: nodeID, ExpectedServiceInstanceId: serviceInstanceID, OperationId: operationID}
 }
 
 func workerScaleInState(response *proxygrpc.WorkerScaleInState, err error, operation string) (controller.WorkerScaleInState, error) {
@@ -115,5 +123,6 @@ func workerScaleInState(response *proxygrpc.WorkerScaleInState, err error, opera
 		SnapshotUploadsInFlight:   int64(response.GetSnapshotUploadsInFlight()),
 		ShutdownReady:             response.GetShutdownReady(),
 		SandboxListEmpty:          response.GetSandboxListEmpty(),
+		ScaleInOperationID:        response.GetOperationId(),
 	}, nil
 }

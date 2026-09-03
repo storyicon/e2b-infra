@@ -12,13 +12,13 @@ import (
 )
 
 const (
-	nomadMetaOwner      = "e2b_scale_in_owner"
-	nomadMetaOperation  = "e2b_scale_in_operation_id"
-	nomadMetaServiceID  = "e2b_scale_in_service_instance_id"
-	nomadMetaStartedAt  = "e2b_scale_in_started_at"
-	nomadMetaStage      = "e2b_scale_in_stage"
-	nomadMetaVersion    = "e2b_scale_in_version"
-	nomadMetaActivityID = "e2b_scale_in_activity_id"
+	nomadMetaOwner       = "e2b_scale_in_owner"
+	nomadMetaOperation   = "e2b_scale_in_operation_id"
+	nomadMetaServiceID   = "e2b_scale_in_service_instance_id"
+	nomadMetaStartedAt   = "e2b_scale_in_started_at"
+	nomadMetaStage       = "e2b_scale_in_stage"
+	nomadMetaVersion     = "e2b_scale_in_version"
+	legacyScaleInVersion = "safe-empty-worker-v1"
 )
 
 type Nomad struct {
@@ -158,6 +158,13 @@ func (n *Nomad) RestoreDrain(ctx context.Context, node controller.NomadScaleInNo
 	current, err := n.requireOwnedDrain(ctx, node, operation.OperationID)
 	if err != nil {
 		return err
+	}
+	owned, err := ownedNomadOperation(current.LastDrain)
+	if err != nil {
+		return err
+	}
+	if owned == nil || !nomadRestoreSourceStage(owned.Stage) {
+		return errors.New("Nomad scale-in operation is no longer reversible")
 	}
 	operation.Stage = "restoring"
 	_, err = n.client.Nodes().UpdateDrainOpts(current.ID, &nomadapi.DrainOptions{
@@ -309,7 +316,12 @@ func ownedNomadOperation(metadata *nomadapi.DrainMetadata) (*controller.NomadSca
 	startedAtValue := metadata.Meta[nomadMetaStartedAt]
 	stage := metadata.Meta[nomadMetaStage]
 	serviceID := metadata.Meta[nomadMetaServiceID]
-	if operationID == "" || serviceID == "" || startedAtValue == "" || stage == "" || metadata.Meta[nomadMetaVersion] != controller.ScaleInVersion {
+	if operationID == "" || serviceID == "" || startedAtValue == "" || stage == "" {
+		return nil, errors.New("owned drain has incomplete or unsupported metadata")
+	}
+	version := metadata.Meta[nomadMetaVersion]
+	legacyComplete := version == legacyScaleInVersion && stage == "complete" && metadata.Status == nomadapi.DrainStatusComplete
+	if version != controller.ScaleInVersion && !legacyComplete {
 		return nil, errors.New("owned drain has incomplete or unsupported metadata")
 	}
 	startedAt, err := time.Parse(time.RFC3339Nano, startedAtValue)
@@ -317,23 +329,16 @@ func ownedNomadOperation(metadata *nomadapi.DrainMetadata) (*controller.NomadSca
 		return nil, fmt.Errorf("parse owned drain start time: %w", err)
 	}
 
-	return &controller.NomadScaleInOperation{
-		OperationID:       operationID,
-		ServiceInstanceID: serviceID,
-		StartedAt:         startedAt,
-		Stage:             stage,
-		ActivityID:        metadata.Meta[nomadMetaActivityID],
-	}, nil
+	return &controller.NomadScaleInOperation{OperationID: operationID, ServiceInstanceID: serviceID, StartedAt: startedAt, Stage: stage}, nil
 }
 
 func nomadOperationMeta(operation controller.NomadScaleInOperation) map[string]string {
 	return map[string]string{
-		nomadMetaOwner:      controller.ScaleInNomadOwner,
-		nomadMetaOperation:  operation.OperationID,
-		nomadMetaServiceID:  operation.ServiceInstanceID,
-		nomadMetaStartedAt:  operation.StartedAt.UTC().Format(time.RFC3339Nano),
-		nomadMetaStage:      operation.Stage,
-		nomadMetaVersion:    controller.ScaleInVersion,
-		nomadMetaActivityID: operation.ActivityID,
+		nomadMetaOwner:     controller.ScaleInNomadOwner,
+		nomadMetaOperation: operation.OperationID,
+		nomadMetaServiceID: operation.ServiceInstanceID,
+		nomadMetaStartedAt: operation.StartedAt.UTC().Format(time.RFC3339Nano),
+		nomadMetaStage:     operation.Stage,
+		nomadMetaVersion:   controller.ScaleInVersion,
 	}
 }

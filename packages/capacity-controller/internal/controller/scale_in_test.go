@@ -94,7 +94,8 @@ func TestEligibleScaleInCandidatesFailsClosedAndSortsByLoadThenNewest(t *testing
 	old := now.Add(-time.Hour)
 	young := now.Add(-time.Minute)
 	nodes := []ScaleInNode{
-		{NodeID: "busy", RunningSandboxes: 2, NomadCreateIndex: 10, ScaleInProtocolSupport: true, Ready: true, Healthy: true, Eligible: true, LaunchTime: &old},
+		{NodeID: "busy", RunningSandboxes: 2, KnownWorkload: 2, NomadCreateIndex: 10, ScaleInProtocolSupport: true, Ready: true, Healthy: true, Eligible: true, LaunchTime: &old},
+		{NodeID: "start-in-flight", KnownWorkload: 1, NomadCreateIndex: 40, ScaleInProtocolSupport: true, Ready: true, Healthy: true, Eligible: true, LaunchTime: &old},
 		{NodeID: "older-empty", NomadCreateIndex: 20, ScaleInProtocolSupport: true, Ready: true, Healthy: true, Eligible: true, LaunchTime: &old},
 		{NodeID: "newer-empty", NomadCreateIndex: 30, ScaleInProtocolSupport: true, Ready: true, Healthy: true, Eligible: true, LaunchTime: &old},
 		{NodeID: "unsupported", Ready: true, Healthy: true, Eligible: true, LaunchTime: &old},
@@ -103,14 +104,15 @@ func TestEligibleScaleInCandidatesFailsClosedAndSortsByLoadThenNewest(t *testing
 	}
 
 	candidates := EligibleScaleInCandidates(nodes, now, 10*time.Minute)
-	require.Equal(t, []string{"newer-empty", "older-empty", "busy"}, []string{
+	require.Equal(t, []string{"newer-empty", "older-empty", "start-in-flight", "busy"}, []string{
 		candidates[0].NodeID,
 		candidates[1].NodeID,
 		candidates[2].NodeID,
+		candidates[3].NodeID,
 	})
-	require.Equal(t, CandidateUnsupportedProtocol, ScaleInCandidateBlockReason(nodes[3], now, 10*time.Minute))
-	require.Equal(t, CandidateUnknownLaunchTime, ScaleInCandidateBlockReason(nodes[4], now, 10*time.Minute))
-	require.Equal(t, CandidateTooYoung, ScaleInCandidateBlockReason(nodes[5], now, 10*time.Minute))
+	require.Equal(t, CandidateUnsupportedProtocol, ScaleInCandidateBlockReason(nodes[4], now, 10*time.Minute))
+	require.Equal(t, CandidateUnknownLaunchTime, ScaleInCandidateBlockReason(nodes[5], now, 10*time.Minute))
+	require.Equal(t, CandidateTooYoung, ScaleInCandidateBlockReason(nodes[6], now, 10*time.Minute))
 }
 
 func TestSurplusStabilizerRequiresContinuousKnownExcess(t *testing.T) {

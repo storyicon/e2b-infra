@@ -84,6 +84,7 @@ type Config struct {
 	DisableStartupReclaim       bool              `env:"DISABLE_STARTUP_RECLAIM"`
 	ForceStop                   bool              `env:"FORCE_STOP"`
 	GRPCPort                    uint16            `env:"GRPC_PORT"                     envDefault:"5008"`
+	InstanceGroupName           string            `env:"INSTANCE_GROUP_NAME"`
 	LocalUploadBaseURL          string            `env:"LOCAL_UPLOAD_BASE_URL"`
 	MaxSandboxesPerNode         int               `env:"MAX_SANDBOXES_PER_NODE"          envDefault:"0"`
 	MaxStartingInstancesPerNode int               `env:"MAX_STARTING_INSTANCES_PER_NODE" envDefault:"0"`

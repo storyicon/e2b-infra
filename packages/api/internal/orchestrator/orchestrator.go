@@ -27,7 +27,6 @@ import (
 	capacitydemand "github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand"
 	"github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand/startintent"
 	"github.com/e2b-dev/infra/packages/shared/pkg/capacity-demand/workload"
-	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/machineinfo"
@@ -104,7 +103,7 @@ type Orchestrator struct {
 	localClusterOwnsOrchestrators bool
 
 	// connectGroup deduplicates concurrent dial+register attempts for the same
-	// physical node. It is keyed by NomadNodeShortID (Nomad-managed nodes) or
+	// physical node. It is keyed by WorkloadID (Nomad-managed nodes) or
 	// scopedNodeID(clusterID, instanceNodeID) (cluster nodes) and is held inside
 	// connectToNode / connectToClusterNode, so it guards every connection path
 	// regardless of what triggered the attempt.
@@ -130,6 +129,7 @@ func New(
 	config cfg.Config,
 	tel *telemetry.Client,
 	nodeDiscovery servicediscovery.Discoverer,
+	localRegistryOwnsOrchestrators bool,
 	posthogClient *analyticscollector.PosthogClient,
 	redisClient redis.UniversalClient,
 	sqlcDB *sqlcdb.Client,
@@ -176,9 +176,13 @@ func New(
 	}
 	go redisStorage.Start(ctx)
 
-	// For local development and testing, we skip the Nomad sync
-	// Local cluster is used for single-node setups instead
-	skipNomadSync := env.IsLocal()
+	// The local clusters registry is the only source of orchestrator nodes
+	// exactly when the discovery provider is the static local one: there both
+	// planes are the same single instance and the registry registers it. Under
+	// nomad or kubernetes the node plane lists orchestrators itself, local
+	// environment or not — deriving this from the environment instead of the
+	// resolved provider builds a node plane nothing ever consults.
+	skipNomadSync := localRegistryOwnsOrchestrators
 
 	workloadRedisStore := workload.NewRedisStore(redisClient)
 	o := Orchestrator{

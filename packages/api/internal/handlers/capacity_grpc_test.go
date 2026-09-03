@@ -39,21 +39,21 @@ func (f *fakeCapacitySnapshotProvider) ListScaleInCandidates(_ context.Context, 
 	return f.candidates, f.err
 }
 
-func (f *fakeCapacitySnapshotProvider) BeginWorkerScaleIn(_ context.Context, clusterID, _, _ string) (orchestrator.WorkerScaleInState, error) {
+func (f *fakeCapacitySnapshotProvider) BeginWorkerScaleIn(_ context.Context, clusterID, _, _, _ string) (orchestrator.WorkerScaleInState, error) {
 	f.calls++
 	f.cluster = clusterID
 
 	return f.state, f.err
 }
 
-func (f *fakeCapacitySnapshotProvider) VerifyWorkerScaleIn(_ context.Context, clusterID, _, _ string) (orchestrator.WorkerScaleInState, error) {
+func (f *fakeCapacitySnapshotProvider) VerifyWorkerScaleIn(_ context.Context, clusterID, _, _, _ string) (orchestrator.WorkerScaleInState, error) {
 	f.calls++
 	f.cluster = clusterID
 
 	return f.state, f.err
 }
 
-func (f *fakeCapacitySnapshotProvider) CancelWorkerScaleIn(_ context.Context, clusterID, _, _ string) (orchestrator.WorkerScaleInState, error) {
+func (f *fakeCapacitySnapshotProvider) CancelWorkerScaleIn(_ context.Context, clusterID, _, _, _ string) (orchestrator.WorkerScaleInState, error) {
 	f.calls++
 	f.cluster = clusterID
 
@@ -102,6 +102,7 @@ func TestCapacityServiceProtectsEveryScaleInRPCWithBearer(t *testing.T) {
 		ClusterId:                 "00000000-0000-0000-0000-000000000000",
 		NodeId:                    "node-1",
 		ExpectedServiceInstanceId: "service-1",
+		OperationId:               "operation-1",
 	}
 	contexts := []context.Context{
 		t.Context(),

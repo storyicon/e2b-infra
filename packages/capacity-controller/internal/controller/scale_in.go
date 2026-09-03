@@ -10,7 +10,7 @@ import (
 
 const (
 	ScaleInNomadOwner = "e2b-capacity-controller"
-	ScaleInVersion    = "safe-empty-worker-v1"
+	ScaleInVersion    = "safe-empty-worker-v2"
 )
 
 type NomadScaleInOperation struct {
@@ -18,7 +18,6 @@ type NomadScaleInOperation struct {
 	ServiceInstanceID string
 	StartedAt         time.Time
 	Stage             string
-	ActivityID        string
 }
 
 type NomadScaleInNode struct {
@@ -47,6 +46,7 @@ type ScaleInCandidateObservation struct {
 	ServiceInstanceID      string
 	ServiceStatus          string
 	RunningSandboxes       int64
+	KnownWorkload          int64
 	ScaleInProtocolSupport bool
 	ObservedAt             time.Time
 }
@@ -62,13 +62,14 @@ type WorkerScaleInState struct {
 	SnapshotUploadsInFlight   int64
 	ShutdownReady             bool
 	SandboxListEmpty          bool
+	ScaleInOperationID        string
 }
 
 type ScaleInWorkerControl interface {
 	ListScaleInCandidates(ctx context.Context, clusterID string) ([]ScaleInCandidateObservation, error)
-	BeginWorkerScaleIn(ctx context.Context, clusterID, nodeID, serviceInstanceID string) (WorkerScaleInState, error)
-	VerifyWorkerScaleIn(ctx context.Context, clusterID, nodeID, serviceInstanceID string) (WorkerScaleInState, error)
-	CancelWorkerScaleIn(ctx context.Context, clusterID, nodeID, serviceInstanceID string) (WorkerScaleInState, error)
+	BeginWorkerScaleIn(ctx context.Context, clusterID, nodeID, serviceInstanceID, operationID string) (WorkerScaleInState, error)
+	VerifyWorkerScaleIn(ctx context.Context, clusterID, nodeID, serviceInstanceID, operationID string) (WorkerScaleInState, error)
+	CancelWorkerScaleIn(ctx context.Context, clusterID, nodeID, serviceInstanceID, operationID string) (WorkerScaleInState, error)
 }
 
 type ScaleInASGInstance struct {
@@ -80,56 +81,20 @@ type ScaleInASGInstance struct {
 }
 
 type ScaleInASGSnapshot struct {
-	Name                  string
-	ARN                   string
-	DesiredCapacity       int32
-	MinSize               int32
-	MaxSize               int32
-	TerminateSuspended    bool
-	ActiveInstanceRefresh bool
-	Instances             map[string]ScaleInASGInstance
-}
-
-type ScaleInTerminationReceipt struct {
-	RequestID  string
-	ActivityID string
-	Status     string
-}
-
-type ScaleInTerminationErrorOutcome string
-
-const (
-	ScaleInTerminationRejected  ScaleInTerminationErrorOutcome = "rejected"
-	ScaleInTerminationAmbiguous ScaleInTerminationErrorOutcome = "ambiguous"
-)
-
-// ScaleInTerminationError distinguishes an authoritative API rejection from a
-// transport outcome where AWS may already have accepted the destructive call.
-type ScaleInTerminationError struct {
-	Outcome ScaleInTerminationErrorOutcome
-	Err     error
-}
-
-func (e *ScaleInTerminationError) Error() string {
-	if e.Err == nil {
-		return "exact termination failed"
-	}
-
-	return e.Err.Error()
-}
-func (e *ScaleInTerminationError) Unwrap() error { return e.Err }
-
-type ScaleInActivity struct {
-	ID        string
-	ASGName   string
-	Status    string
-	StartedAt time.Time
+	Name                             string
+	ARN                              string
+	DesiredCapacity                  int32
+	MinSize                          int32
+	MaxSize                          int32
+	NewInstancesProtectedFromScaleIn bool
+	TerminateSuspended               bool
+	ActiveInstanceRefresh            bool
+	Instances                        map[string]ScaleInASGInstance
 }
 
 type ScaleInInfrastructure interface {
 	Snapshot(ctx context.Context, asgName string) (ScaleInASGSnapshot, error)
-	TerminateInstance(ctx context.Context, instanceID string) (ScaleInTerminationReceipt, error)
-	Activity(ctx context.Context, asgName, activityID string) (*ScaleInActivity, error)
+	SetInstanceProtection(ctx context.Context, asgName string, instanceIDs []string, protected bool) error
 }
 
 type ScaleInMode string
@@ -160,6 +125,7 @@ type ScaleInNode struct {
 	NomadNodeID            string
 	ServiceInstanceID      string
 	RunningSandboxes       int64
+	KnownWorkload          int64
 	NomadCreateIndex       uint64
 	LaunchTime             *time.Time
 	ScaleInProtocolSupport bool
@@ -283,8 +249,8 @@ func EligibleScaleInCandidates(nodes []ScaleInNode, now time.Time, minimumAge ti
 		}
 	}
 	slices.SortStableFunc(candidates, func(left, right ScaleInNode) int {
-		if left.RunningSandboxes != right.RunningSandboxes {
-			if left.RunningSandboxes < right.RunningSandboxes {
+		if left.KnownWorkload != right.KnownWorkload {
+			if left.KnownWorkload < right.KnownWorkload {
 				return -1
 			}
 

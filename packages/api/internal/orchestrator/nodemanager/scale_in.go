@@ -52,6 +52,7 @@ type WorkerScaleInState struct {
 	SnapshotUploadsInFlight   uint64
 	ShutdownReady             bool
 	SandboxListEmpty          bool
+	OperationID               string
 	ObservedAt                time.Time
 }
 
@@ -82,7 +83,7 @@ func (n *Node) ScaleInCandidate() ScaleInCandidate {
 
 	return ScaleInCandidate{
 		NodeID:                 observation.NodeID,
-		NomadNodeID:            n.NomadNodeShortID,
+		NomadNodeID:            n.NomadNodeID,
 		ServiceInstanceID:      observation.ServiceInstanceID,
 		ServiceStatus:          n.Status(),
 		RunningSandboxes:       observation.RunningSandboxes,
@@ -93,15 +94,19 @@ func (n *Node) ScaleInCandidate() ScaleInCandidate {
 	}
 }
 
-func (n *Node) BeginWorkerScaleIn(ctx context.Context, expectedServiceID string) (WorkerScaleInState, error) {
+func (n *Node) BeginWorkerScaleIn(ctx context.Context, expectedServiceID, operationID string) (WorkerScaleInState, error) {
+	if operationID == "" {
+		return WorkerScaleInState{}, fmt.Errorf("%w: operation ID is empty", ErrScaleInIdentityChanged)
+	}
 	if err := n.validateScaleInWorker(ctx, expectedServiceID); err != nil {
 		return WorkerScaleInState{}, err
 	}
 
 	client, callCtx := n.GetClient(ctx)
-	_, err := client.Info.ServiceStatusOverride(callCtx, &orchestratorinfo.ServiceStatusChangeRequest{
+	_, err := client.Info.ConditionalServiceStatusOverride(callCtx, &orchestratorinfo.ServiceStatusChangeRequest{
 		ServiceStatus:     orchestratorinfo.ServiceInfoStatus_Draining,
 		ExpectedServiceId: expectedServiceID,
+		OperationId:       operationID,
 	})
 	if err != nil {
 		if status.Code(err) == codes.FailedPrecondition {
@@ -111,7 +116,7 @@ func (n *Node) BeginWorkerScaleIn(ctx context.Context, expectedServiceID string)
 		return WorkerScaleInState{}, fmt.Errorf("set worker draining: %w", err)
 	}
 
-	state, err := n.ReadWorkerScaleInState(ctx, expectedServiceID)
+	state, err := n.ReadWorkerScaleInState(ctx, expectedServiceID, operationID)
 	if err != nil {
 		return WorkerScaleInState{}, err
 	}
@@ -122,7 +127,10 @@ func (n *Node) BeginWorkerScaleIn(ctx context.Context, expectedServiceID string)
 	return state, nil
 }
 
-func (n *Node) ReadWorkerScaleInState(ctx context.Context, expectedServiceID string) (WorkerScaleInState, error) {
+func (n *Node) ReadWorkerScaleInState(ctx context.Context, expectedServiceID, operationID string) (WorkerScaleInState, error) {
+	if operationID == "" {
+		return WorkerScaleInState{}, fmt.Errorf("%w: operation ID is empty", ErrScaleInIdentityChanged)
+	}
 	_, err := n.readScaleInInfo(ctx, expectedServiceID)
 	if err != nil {
 		return WorkerScaleInState{}, err
@@ -146,6 +154,9 @@ func (n *Node) ReadWorkerScaleInState(ctx context.Context, expectedServiceID str
 	}
 
 	state := workerScaleInState(verifiedInfo, len(listed.GetSandboxes()) == 0)
+	if state.OperationID != operationID {
+		return WorkerScaleInState{}, fmt.Errorf("%w: expected operation %q, got %q", ErrScaleInIdentityChanged, operationID, state.OperationID)
+	}
 	if state.ShutdownReady && (state.ServiceStatus != orchestratorinfo.ServiceInfoStatus_Draining ||
 		state.RunningSandboxes != 0 ||
 		state.StartsInFlight != 0 ||
@@ -158,34 +169,15 @@ func (n *Node) ReadWorkerScaleInState(ctx context.Context, expectedServiceID str
 	return state, nil
 }
 
-func (n *Node) CancelWorkerScaleIn(ctx context.Context, expectedServiceID string) (WorkerScaleInState, error) {
-	info, err := n.readWorkerInfo(ctx)
-	if err != nil {
-		return WorkerScaleInState{}, err
+func (n *Node) CancelWorkerScaleIn(ctx context.Context, expectedServiceID, operationID string) (WorkerScaleInState, error) {
+	if expectedServiceID == "" || operationID == "" {
+		return WorkerScaleInState{}, fmt.Errorf("%w: expected service instance ID and operation ID are required", ErrScaleInIdentityChanged)
 	}
-	if info.GetNodeId() != n.ID {
-		return WorkerScaleInState{}, fmt.Errorf("%w: expected node %q, got node %q", ErrScaleInIdentityChanged, n.ID, info.GetNodeId())
-	}
-	if !info.GetSafeScaleInSupported() {
-		return WorkerScaleInState{}, ErrScaleInProtocolMissing
-	}
-	if info.GetServiceId() != expectedServiceID {
-		// Nomad has already been restored before cancellation reaches the worker.
-		// If the old process disappeared and its replacement is independently
-		// Healthy, there is no old Draining state left to clear. Return the live
-		// replacement identity without mutating it so the controller can retire
-		// the stale operation marker.
-		if info.GetServiceStatus() != orchestratorinfo.ServiceInfoStatus_Healthy {
-			return WorkerScaleInState{}, fmt.Errorf("%w: replacement worker is not healthy", ErrScaleInIdentityChanged)
-		}
-
-		return workerScaleInState(info, false), nil
-	}
-
 	client, callCtx := n.GetClient(ctx)
-	_, err = client.Info.ServiceStatusOverride(callCtx, &orchestratorinfo.ServiceStatusChangeRequest{
+	_, err := client.Info.ConditionalServiceStatusOverride(callCtx, &orchestratorinfo.ServiceStatusChangeRequest{
 		ServiceStatus:     orchestratorinfo.ServiceInfoStatus_Healthy,
 		ExpectedServiceId: expectedServiceID,
+		OperationId:       operationID,
 	})
 	if err != nil {
 		if status.Code(err) == codes.FailedPrecondition {
@@ -195,10 +187,11 @@ func (n *Node) CancelWorkerScaleIn(ctx context.Context, expectedServiceID string
 		return WorkerScaleInState{}, fmt.Errorf("restore worker healthy: %w", err)
 	}
 
-	state, err := n.ReadWorkerScaleInState(ctx, expectedServiceID)
+	info, err := n.readScaleInInfo(ctx, expectedServiceID)
 	if err != nil {
 		return WorkerScaleInState{}, err
 	}
+	state := workerScaleInState(info, false)
 	if state.ServiceStatus != orchestratorinfo.ServiceInfoStatus_Healthy {
 		return WorkerScaleInState{}, fmt.Errorf("%w: worker did not return healthy", ErrScaleInStateInvalid)
 	}
@@ -257,6 +250,7 @@ func workerScaleInState(info *orchestratorinfo.ServiceInfoResponse, sandboxListE
 		SnapshotUploadsInFlight:   info.GetSnapshotUploadsInFlight(),
 		ShutdownReady:             info.GetShutdownReady(),
 		SandboxListEmpty:          sandboxListEmpty,
+		OperationID:               info.GetScaleInOperationId(),
 		ObservedAt:                time.Now().UTC(),
 	}
 }

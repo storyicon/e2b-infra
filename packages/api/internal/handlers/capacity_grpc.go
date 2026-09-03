@@ -24,9 +24,9 @@ type capacitySnapshotProvider interface {
 
 type workerScaleInProvider interface {
 	ListScaleInCandidates(ctx context.Context, clusterID string) ([]orchestrator.ScaleInCandidate, error)
-	BeginWorkerScaleIn(ctx context.Context, clusterID, nodeID, expectedServiceID string) (orchestrator.WorkerScaleInState, error)
-	VerifyWorkerScaleIn(ctx context.Context, clusterID, nodeID, expectedServiceID string) (orchestrator.WorkerScaleInState, error)
-	CancelWorkerScaleIn(ctx context.Context, clusterID, nodeID, expectedServiceID string) (orchestrator.WorkerScaleInState, error)
+	BeginWorkerScaleIn(ctx context.Context, clusterID, nodeID, expectedServiceID, operationID string) (orchestrator.WorkerScaleInState, error)
+	VerifyWorkerScaleIn(ctx context.Context, clusterID, nodeID, expectedServiceID, operationID string) (orchestrator.WorkerScaleInState, error)
+	CancelWorkerScaleIn(ctx context.Context, clusterID, nodeID, expectedServiceID, operationID string) (orchestrator.WorkerScaleInState, error)
 }
 
 type capacityServiceProvider interface {
@@ -81,30 +81,30 @@ func (s *CapacityService) ListScaleInCandidates(ctx context.Context, request *pr
 }
 
 func (s *CapacityService) BeginWorkerScaleIn(ctx context.Context, request *proxygrpc.WorkerScaleInRequest) (*proxygrpc.WorkerScaleInState, error) {
-	return s.runWorkerScaleIn(ctx, request, "begin", func(ctx context.Context, clusterID, nodeID, expectedServiceID string) (orchestrator.WorkerScaleInState, error) {
-		return s.provider.BeginWorkerScaleIn(ctx, clusterID, nodeID, expectedServiceID)
+	return s.runWorkerScaleIn(ctx, request, "begin", func(ctx context.Context, clusterID, nodeID, expectedServiceID, operationID string) (orchestrator.WorkerScaleInState, error) {
+		return s.provider.BeginWorkerScaleIn(ctx, clusterID, nodeID, expectedServiceID, operationID)
 	})
 }
 
 func (s *CapacityService) VerifyWorkerScaleIn(ctx context.Context, request *proxygrpc.WorkerScaleInRequest) (*proxygrpc.WorkerScaleInState, error) {
-	return s.runWorkerScaleIn(ctx, request, "verify", func(ctx context.Context, clusterID, nodeID, expectedServiceID string) (orchestrator.WorkerScaleInState, error) {
-		return s.provider.VerifyWorkerScaleIn(ctx, clusterID, nodeID, expectedServiceID)
+	return s.runWorkerScaleIn(ctx, request, "verify", func(ctx context.Context, clusterID, nodeID, expectedServiceID, operationID string) (orchestrator.WorkerScaleInState, error) {
+		return s.provider.VerifyWorkerScaleIn(ctx, clusterID, nodeID, expectedServiceID, operationID)
 	})
 }
 
 func (s *CapacityService) CancelWorkerScaleIn(ctx context.Context, request *proxygrpc.WorkerScaleInRequest) (*proxygrpc.WorkerScaleInState, error) {
-	return s.runWorkerScaleIn(ctx, request, "cancel", func(ctx context.Context, clusterID, nodeID, expectedServiceID string) (orchestrator.WorkerScaleInState, error) {
-		return s.provider.CancelWorkerScaleIn(ctx, clusterID, nodeID, expectedServiceID)
+	return s.runWorkerScaleIn(ctx, request, "cancel", func(ctx context.Context, clusterID, nodeID, expectedServiceID, operationID string) (orchestrator.WorkerScaleInState, error) {
+		return s.provider.CancelWorkerScaleIn(ctx, clusterID, nodeID, expectedServiceID, operationID)
 	})
 }
 
-type workerScaleInCall func(context.Context, string, string, string) (orchestrator.WorkerScaleInState, error)
+type workerScaleInCall func(context.Context, string, string, string, string) (orchestrator.WorkerScaleInState, error)
 
 func (s *CapacityService) runWorkerScaleIn(ctx context.Context, request *proxygrpc.WorkerScaleInRequest, operation string, call workerScaleInCall) (*proxygrpc.WorkerScaleInState, error) {
 	if !hasCapacityServiceBearer(ctx, s.token) {
 		return nil, status.Error(codes.PermissionDenied, "permission denied")
 	}
-	clusterID, nodeID, expectedServiceID, err := validatedWorkerScaleInRequest(request)
+	clusterID, nodeID, expectedServiceID, operationID, err := validatedWorkerScaleInRequest(request)
 	if err != nil {
 		return nil, err
 	}
@@ -112,7 +112,7 @@ func (s *CapacityService) runWorkerScaleIn(ctx context.Context, request *proxygr
 		return nil, status.Error(codes.Unavailable, "worker scale-in is unavailable")
 	}
 
-	state, err := call(ctx, clusterID, nodeID, expectedServiceID)
+	state, err := call(ctx, clusterID, nodeID, expectedServiceID, operationID)
 	if err != nil {
 		return nil, workerScaleInStatus(operation, err)
 	}
@@ -132,22 +132,25 @@ func validatedClusterID(request *proxygrpc.ListScaleInCandidatesRequest) (string
 	return clusterID.String(), nil
 }
 
-func validatedWorkerScaleInRequest(request *proxygrpc.WorkerScaleInRequest) (string, string, string, error) {
+func validatedWorkerScaleInRequest(request *proxygrpc.WorkerScaleInRequest) (string, string, string, string, error) {
 	if request == nil {
-		return "", "", "", status.Error(codes.InvalidArgument, "request is required")
+		return "", "", "", "", status.Error(codes.InvalidArgument, "request is required")
 	}
 	clusterID, err := uuid.Parse(request.GetClusterId())
 	if err != nil {
-		return "", "", "", status.Error(codes.InvalidArgument, "invalid cluster ID")
+		return "", "", "", "", status.Error(codes.InvalidArgument, "invalid cluster ID")
 	}
 	if strings.TrimSpace(request.GetNodeId()) == "" {
-		return "", "", "", status.Error(codes.InvalidArgument, "node ID is required")
+		return "", "", "", "", status.Error(codes.InvalidArgument, "node ID is required")
 	}
 	if strings.TrimSpace(request.GetExpectedServiceInstanceId()) == "" {
-		return "", "", "", status.Error(codes.InvalidArgument, "expected service instance ID is required")
+		return "", "", "", "", status.Error(codes.InvalidArgument, "expected service instance ID is required")
+	}
+	if strings.TrimSpace(request.GetOperationId()) == "" {
+		return "", "", "", "", status.Error(codes.InvalidArgument, "operation ID is required")
 	}
 
-	return clusterID.String(), request.GetNodeId(), request.GetExpectedServiceInstanceId(), nil
+	return clusterID.String(), request.GetNodeId(), request.GetExpectedServiceInstanceId(), request.GetOperationId(), nil
 }
 
 func workerScaleInStatus(operation string, err error) error {
@@ -177,6 +180,7 @@ func workerScaleInResponse(state orchestrator.WorkerScaleInState) *proxygrpc.Wor
 		SnapshotUploadsInFlight:   state.SnapshotUploadsInFlight,
 		ShutdownReady:             state.ShutdownReady,
 		SandboxListEmpty:          state.SandboxListEmpty,
+		OperationId:               state.OperationID,
 		ObservedAt:                timestampOrNil(state.ObservedAt),
 	}
 }
@@ -248,14 +252,14 @@ func (a *APIStore) ListScaleInCandidates(ctx context.Context, clusterID string) 
 	return a.orchestrator.ListScaleInCandidates(ctx, clusterID)
 }
 
-func (a *APIStore) BeginWorkerScaleIn(ctx context.Context, clusterID, nodeID, expectedServiceID string) (orchestrator.WorkerScaleInState, error) {
-	return a.orchestrator.BeginWorkerScaleIn(ctx, clusterID, nodeID, expectedServiceID)
+func (a *APIStore) BeginWorkerScaleIn(ctx context.Context, clusterID, nodeID, expectedServiceID, operationID string) (orchestrator.WorkerScaleInState, error) {
+	return a.orchestrator.BeginWorkerScaleIn(ctx, clusterID, nodeID, expectedServiceID, operationID)
 }
 
-func (a *APIStore) VerifyWorkerScaleIn(ctx context.Context, clusterID, nodeID, expectedServiceID string) (orchestrator.WorkerScaleInState, error) {
-	return a.orchestrator.VerifyWorkerScaleIn(ctx, clusterID, nodeID, expectedServiceID)
+func (a *APIStore) VerifyWorkerScaleIn(ctx context.Context, clusterID, nodeID, expectedServiceID, operationID string) (orchestrator.WorkerScaleInState, error) {
+	return a.orchestrator.VerifyWorkerScaleIn(ctx, clusterID, nodeID, expectedServiceID, operationID)
 }
 
-func (a *APIStore) CancelWorkerScaleIn(ctx context.Context, clusterID, nodeID, expectedServiceID string) (orchestrator.WorkerScaleInState, error) {
-	return a.orchestrator.CancelWorkerScaleIn(ctx, clusterID, nodeID, expectedServiceID)
+func (a *APIStore) CancelWorkerScaleIn(ctx context.Context, clusterID, nodeID, expectedServiceID, operationID string) (orchestrator.WorkerScaleInState, error) {
+	return a.orchestrator.CancelWorkerScaleIn(ctx, clusterID, nodeID, expectedServiceID, operationID)
 }

@@ -94,7 +94,7 @@ variable "capacity_autoscaler_enabled" {
 
 variable "capacity_scale_in_enforced" {
   type        = bool
-  description = "Whether the capacity controller may terminate an exact client ASG instance"
+  description = "Whether the capacity controller may change client ASG instance scale-in protection"
   default     = false
 }
 

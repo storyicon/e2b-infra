@@ -46,22 +46,22 @@ func (o *Orchestrator) ListScaleInCandidates(_ context.Context, clusterIDRaw str
 	return candidates, nil
 }
 
-func (o *Orchestrator) BeginWorkerScaleIn(ctx context.Context, clusterIDRaw, nodeID, expectedServiceID string) (WorkerScaleInState, error) {
+func (o *Orchestrator) BeginWorkerScaleIn(ctx context.Context, clusterIDRaw, nodeID, expectedServiceID, operationID string) (WorkerScaleInState, error) {
 	node, err := o.scaleInNode(clusterIDRaw, nodeID)
 	if err != nil {
 		return WorkerScaleInState{}, err
 	}
 
-	return node.BeginWorkerScaleIn(ctx, expectedServiceID)
+	return node.BeginWorkerScaleIn(ctx, expectedServiceID, operationID)
 }
 
-func (o *Orchestrator) VerifyWorkerScaleIn(ctx context.Context, clusterIDRaw, nodeID, expectedServiceID string) (WorkerScaleInState, error) {
+func (o *Orchestrator) VerifyWorkerScaleIn(ctx context.Context, clusterIDRaw, nodeID, expectedServiceID, operationID string) (WorkerScaleInState, error) {
 	node, err := o.scaleInNode(clusterIDRaw, nodeID)
 	if err != nil {
 		return WorkerScaleInState{}, err
 	}
 
-	state, err := node.ReadWorkerScaleInState(ctx, expectedServiceID)
+	state, err := node.ReadWorkerScaleInState(ctx, expectedServiceID, operationID)
 	if err != nil {
 		return WorkerScaleInState{}, err
 	}
@@ -72,13 +72,13 @@ func (o *Orchestrator) VerifyWorkerScaleIn(ctx context.Context, clusterIDRaw, no
 	return state, nil
 }
 
-func (o *Orchestrator) CancelWorkerScaleIn(ctx context.Context, clusterIDRaw, nodeID, expectedServiceID string) (WorkerScaleInState, error) {
+func (o *Orchestrator) CancelWorkerScaleIn(ctx context.Context, clusterIDRaw, nodeID, expectedServiceID, operationID string) (WorkerScaleInState, error) {
 	node, err := o.scaleInNode(clusterIDRaw, nodeID)
 	if err != nil {
 		return WorkerScaleInState{}, err
 	}
 
-	return node.CancelWorkerScaleIn(ctx, expectedServiceID)
+	return node.CancelWorkerScaleIn(ctx, expectedServiceID, operationID)
 }
 
 func (o *Orchestrator) scaleInNode(clusterIDRaw, nodeID string) (*nodemanager.Node, error) {

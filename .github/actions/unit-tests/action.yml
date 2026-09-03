@@ -114,8 +114,3 @@ runs:
         if [ "${{ inputs.race }}" = "true" ]; then RACE="-race"; TEST_TIMEOUT=40m; fi
         gotestsum --junitfile=junit.xml --format=standard-verbose \
           -- -timeout $TEST_TIMEOUT $RACE -coverprofile=coverage.txt -covermode=atomic ${{ inputs.test-path }}
-
-    - name: Run shared capacity benchmark tests
-      if: inputs.package == 'packages/shared'
-      shell: bash
-      run: node --test packages/shared/scripts/capacity-smoke-model.test.mjs

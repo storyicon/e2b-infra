@@ -35,7 +35,8 @@ message CapacitySnapshotResponse {
 }
 
 // Cached, non-customer worker data used only to select scale-in candidates.
-// Final termination eligibility must be established with VerifyWorkerScaleIn.
+// Final scale-in eligibility is established by an owned drain and fresh
+// VerifyWorkerScaleIn observations.
 message WorkerScaleInCandidate {
   string node_id = 1;
   string nomad_node_id = 2;
@@ -60,6 +61,9 @@ message WorkerScaleInRequest {
   string cluster_id = 1;
   string node_id = 2;
   string expected_service_instance_id = 3;
+  string operation_id = 4;
+  reserved 5;
+  reserved "termination_release_token";
 }
 
 // A real-time worker response. Counts are authoritative only when
@@ -77,6 +81,9 @@ message WorkerScaleInState {
   bool shutdown_ready = 9;
   bool sandbox_list_empty = 10;
   google.protobuf.Timestamp observed_at = 11;
+  string operation_id = 12;
+  reserved 13, 14;
+  reserved "termination_acquired", "termination_release_token";
 }
 
 // SandboxService is used by the client-proxy to resume sandboxes.

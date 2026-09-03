@@ -38,27 +38,39 @@ type ShutdownActivityProvider interface {
 
 type ShutdownState struct {
 	ServiceStatus         ServiceStatus
+	ScaleInOperationID    string
 	LiveSandboxes         uint64
 	SandboxStartsInFlight uint64
 	LifecycleCleanups     uint64
 	SnapshotUploads       uint64
+	ActivityQuiet         bool
 	Ready                 bool
 }
 
 func SnapshotShutdownState(info *ServiceInfo, sandboxes *sandbox.Map, activity ShutdownActivityProvider) ShutdownState {
-	admission := info.GetAdmissionState()
+	before := info.GetAdmissionState()
 	state := ShutdownState{
-		ServiceStatus:         admission.Status,
+		ServiceStatus:         before.Status,
 		LiveSandboxes:         uint64(sandboxes.Count()),
-		SandboxStartsInFlight: admission.SandboxStartsInFlight,
+		SandboxStartsInFlight: before.SandboxStartsInFlight,
 		LifecycleCleanups:     uint64(sandboxes.LifecycleCount()),
 		SnapshotUploads:       activity.SnapshotUploadsInFlight(),
 	}
-	state.Ready = admission.Status.Status == orchestratorinfo.ServiceInfoStatus_Draining &&
-		state.LiveSandboxes == 0 &&
-		state.SandboxStartsInFlight == 0 &&
+	after := info.GetAdmissionState()
+	state.ServiceStatus = after.Status
+	state.ScaleInOperationID = after.ControllerDrainOperationID
+	state.SandboxStartsInFlight = after.SandboxStartsInFlight
+	state.ActivityQuiet = state.LiveSandboxes == 0 &&
+		before.SandboxStartsInFlight == 0 &&
+		after.SandboxStartsInFlight == 0 &&
 		state.LifecycleCleanups == 0 &&
 		state.SnapshotUploads == 0
+	state.Ready = before.ControllerDrainOwned &&
+		after.ControllerDrainOwned &&
+		before.ControllerDrainOperationID != "" &&
+		before.ControllerDrainOperationID == after.ControllerDrainOperationID &&
+		after.Status.Status == orchestratorinfo.ServiceInfoStatus_Draining &&
+		state.ActivityQuiet
 
 	return state
 }
@@ -119,6 +131,7 @@ func (s *Server) ServiceInfo(ctx context.Context, _ *emptypb.Empty) (*orchestrat
 		LifecycleCleanupsInFlight:     shutdownState.LifecycleCleanups,
 		SnapshotUploadsInFlight:       shutdownState.SnapshotUploads,
 		ShutdownReady:                 shutdownState.Ready,
+		ScaleInOperationId:            shutdownState.ScaleInOperationID,
 
 		ServiceVersion: info.SourceVersion,
 		ServiceCommit:  info.SourceCommit,
@@ -186,6 +199,30 @@ func convertMachineInfo(machineInfo machineinfo.MachineInfo) *orchestratorinfo.M
 }
 
 func (s *Server) ServiceStatusOverride(ctx context.Context, req *orchestratorinfo.ServiceStatusChangeRequest) (*emptypb.Empty, error) {
+	return s.overrideServiceStatus(ctx, req)
+}
+
+func (s *Server) ConditionalServiceStatusOverride(ctx context.Context, req *orchestratorinfo.ServiceStatusChangeRequest) (*emptypb.Empty, error) {
+	if req.GetExpectedServiceId() == "" || req.GetOperationId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "expected service instance identity and operation ID are required")
+	}
+	if req.GetServiceStatus() != orchestratorinfo.ServiceInfoStatus_Draining && req.GetServiceStatus() != orchestratorinfo.ServiceInfoStatus_Healthy {
+		return nil, status.Error(codes.InvalidArgument, "controller drain status must be Draining or Healthy")
+	}
+
+	logger.L().Info(ctx, "controller drain status override request received", zap.String("status", req.GetServiceStatus().String()))
+	applied, identityMatched := s.info.OverrideControllerDrain(ctx, req.GetServiceStatus(), req.GetExpectedServiceId(), req.GetOperationId())
+	if !identityMatched {
+		return nil, status.Error(codes.FailedPrecondition, "service instance identity changed")
+	}
+	if !applied {
+		return nil, status.Error(codes.FailedPrecondition, "controller drain ownership conflict")
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
+func (s *Server) overrideServiceStatus(ctx context.Context, req *orchestratorinfo.ServiceStatusChangeRequest) (*emptypb.Empty, error) {
 	logger.L().Info(ctx, "service status override request received", zap.String("status", req.GetServiceStatus().String()))
 	applied, identityMatched := s.info.OverrideStatusForService(ctx, req.GetServiceStatus(), req.GetExpectedServiceId())
 	if !identityMatched {

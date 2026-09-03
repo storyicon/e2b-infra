@@ -10,7 +10,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/e2b-dev/infra/packages/capacity-controller/internal/controller"
 )
@@ -18,9 +17,8 @@ import (
 type AutoScalingClient interface {
 	DescribeAutoScalingGroups(ctx context.Context, params *autoscaling.DescribeAutoScalingGroupsInput, optFns ...func(*autoscaling.Options)) (*autoscaling.DescribeAutoScalingGroupsOutput, error)
 	DescribeInstanceRefreshes(ctx context.Context, params *autoscaling.DescribeInstanceRefreshesInput, optFns ...func(*autoscaling.Options)) (*autoscaling.DescribeInstanceRefreshesOutput, error)
-	DescribeScalingActivities(ctx context.Context, params *autoscaling.DescribeScalingActivitiesInput, optFns ...func(*autoscaling.Options)) (*autoscaling.DescribeScalingActivitiesOutput, error)
 	SetDesiredCapacity(ctx context.Context, params *autoscaling.SetDesiredCapacityInput, optFns ...func(*autoscaling.Options)) (*autoscaling.SetDesiredCapacityOutput, error)
-	TerminateInstanceInAutoScalingGroup(ctx context.Context, params *autoscaling.TerminateInstanceInAutoScalingGroupInput, optFns ...func(*autoscaling.Options)) (*autoscaling.TerminateInstanceInAutoScalingGroupOutput, error)
+	SetInstanceProtection(ctx context.Context, params *autoscaling.SetInstanceProtectionInput, optFns ...func(*autoscaling.Options)) (*autoscaling.SetInstanceProtectionOutput, error)
 }
 
 type EC2Client interface {
@@ -31,31 +29,7 @@ type ASGInstance = controller.ScaleInASGInstance
 
 type ASGSnapshot = controller.ScaleInASGSnapshot
 
-type TerminationReceipt = controller.ScaleInTerminationReceipt
-
-type ScalingActivity = controller.ScaleInActivity
-
-type TerminationReconciliation string
-
-const (
-	TerminationUnknown   TerminationReconciliation = "unknown"
-	TerminationPending   TerminationReconciliation = "pending"
-	TerminationCompleted TerminationReconciliation = "completed"
-	TerminationRejected  TerminationReconciliation = "rejected"
-)
-
-type TerminationBlockReason string
-
-const (
-	TerminationAllowed               TerminationBlockReason = ""
-	TerminationAtMinimum             TerminationBlockReason = "asg_at_minimum"
-	TerminationProcessSuspended      TerminationBlockReason = "terminate_process_suspended"
-	TerminationInstanceRefreshActive TerminationBlockReason = "instance_refresh_active"
-	TerminationInstanceMissing       TerminationBlockReason = "instance_not_in_asg"
-	TerminationInstanceNotInService  TerminationBlockReason = "instance_not_in_service"
-	TerminationInstanceUnhealthy     TerminationBlockReason = "instance_unhealthy"
-	TerminationInstanceProtected     TerminationBlockReason = "instance_protected"
-)
+const maxInstanceProtectionBatch = 50
 
 type ASG struct {
 	client    AutoScalingClient
@@ -83,7 +57,7 @@ func (a *ASG) Snapshot(ctx context.Context, asgName string) (ASGSnapshot, error)
 	if err != nil {
 		return ASGSnapshot{}, err
 	}
-	if group.AutoScalingGroupARN == nil || group.DesiredCapacity == nil || group.MinSize == nil || group.MaxSize == nil {
+	if group.AutoScalingGroupARN == nil || group.DesiredCapacity == nil || group.MinSize == nil || group.MaxSize == nil || group.NewInstancesProtectedFromScaleIn == nil {
 		return ASGSnapshot{}, fmt.Errorf("auto scaling group %q returned incomplete capacity metadata", asgName)
 	}
 
@@ -96,12 +70,13 @@ func (a *ASG) Snapshot(ctx context.Context, asgName string) (ASGSnapshot, error)
 	}
 
 	snapshot := ASGSnapshot{
-		Name:            asgName,
-		ARN:             *group.AutoScalingGroupARN,
-		DesiredCapacity: *group.DesiredCapacity,
-		MinSize:         *group.MinSize,
-		MaxSize:         *group.MaxSize,
-		Instances:       make(map[string]ASGInstance, len(group.Instances)),
+		Name:                             asgName,
+		ARN:                              *group.AutoScalingGroupARN,
+		DesiredCapacity:                  *group.DesiredCapacity,
+		MinSize:                          *group.MinSize,
+		MaxSize:                          *group.MaxSize,
+		NewInstancesProtectedFromScaleIn: *group.NewInstancesProtectedFromScaleIn,
+		Instances:                        make(map[string]ASGInstance, len(group.Instances)),
 	}
 	for _, process := range group.SuspendedProcesses {
 		if process.ProcessName != nil && *process.ProcessName == "Terminate" {
@@ -148,45 +123,33 @@ func (a *ASG) SetDesiredCapacity(ctx context.Context, asgName string, desired in
 	return controller.ScaleWriteMetadata{RequestID: requestID}, nil
 }
 
-func (a *ASG) TerminateInstance(ctx context.Context, instanceID string) (TerminationReceipt, error) {
-	output, err := a.client.TerminateInstanceInAutoScalingGroup(ctx, &autoscaling.TerminateInstanceInAutoScalingGroupInput{
-		InstanceId:                     aws.String(instanceID),
-		ShouldDecrementDesiredCapacity: aws.Bool(true),
-	}, func(options *autoscaling.Options) {
-		// This destructive API has no idempotency token. An ambiguous response is
-		// reconciled by reads and must never be retried by the SDK.
-		options.Retryer = aws.NopRetryer{}
+func (a *ASG) SetInstanceProtection(ctx context.Context, asgName string, instanceIDs []string, protected bool) error {
+	if asgName == "" {
+		return errors.New("Auto Scaling group name is required")
+	}
+	if len(instanceIDs) == 0 || len(instanceIDs) > maxInstanceProtectionBatch {
+		return fmt.Errorf("instance protection batch must contain 1 to %d instances", maxInstanceProtectionBatch)
+	}
+	seen := make(map[string]struct{}, len(instanceIDs))
+	for _, instanceID := range instanceIDs {
+		if instanceID == "" {
+			return errors.New("instance protection batch contains an empty instance ID")
+		}
+		if _, duplicate := seen[instanceID]; duplicate {
+			return fmt.Errorf("instance protection batch contains duplicate instance %q", instanceID)
+		}
+		seen[instanceID] = struct{}{}
+	}
+	_, err := a.client.SetInstanceProtection(ctx, &autoscaling.SetInstanceProtectionInput{
+		AutoScalingGroupName: aws.String(asgName),
+		InstanceIds:          instanceIDs,
+		ProtectedFromScaleIn: aws.Bool(protected),
 	})
 	if err != nil {
-		outcome := controller.ScaleInTerminationAmbiguous
-		var sendErr *smithyhttp.RequestSendError
-		var responseErr *smithyhttp.ResponseError
-		switch {
-		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.As(err, &sendErr):
-			// The client cannot prove whether AWS received the request.
-		case errors.As(err, &responseErr) && responseErr.HTTPStatusCode() >= 400 && responseErr.HTTPStatusCode() < 500:
-			// A complete 4xx response is an authoritative API rejection.
-			outcome = controller.ScaleInTerminationRejected
-		}
-
-		return TerminationReceipt{}, &controller.ScaleInTerminationError{
-			Outcome: outcome,
-			Err:     fmt.Errorf("terminate instance in Auto Scaling group: %w", err),
-		}
+		return fmt.Errorf("set Auto Scaling group instance protection to %t: %w", protected, err)
 	}
-	if output.Activity == nil || output.Activity.ActivityId == nil || *output.Activity.ActivityId == "" {
-		return TerminationReceipt{}, &controller.ScaleInTerminationError{
-			Outcome: controller.ScaleInTerminationAmbiguous,
-			Err:     errorsNewIncompleteTermination(instanceID),
-		}
-	}
-	requestID, _ := awsmiddleware.GetRequestIDMetadata(output.ResultMetadata)
 
-	return TerminationReceipt{
-		RequestID:  requestID,
-		ActivityID: *output.Activity.ActivityId,
-		Status:     string(output.Activity.StatusCode),
-	}, nil
+	return nil
 }
 
 func (a *ASG) populateLaunchTimes(ctx context.Context, instances map[string]ASGInstance) error {
@@ -234,74 +197,6 @@ func (a *ASG) populateLaunchTimes(ctx context.Context, instances map[string]ASGI
 	return nil
 }
 
-func (a *ASG) Activity(ctx context.Context, asgName, activityID string) (*ScalingActivity, error) {
-	output, err := a.client.DescribeScalingActivities(ctx, &autoscaling.DescribeScalingActivitiesInput{
-		ActivityIds:          []string{activityID},
-		AutoScalingGroupName: aws.String(asgName),
-		MaxRecords:           aws.Int32(1),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("describe Auto Scaling group activity: %w", err)
-	}
-	if len(output.Activities) == 0 {
-		return nil, nil
-	}
-	if len(output.Activities) != 1 || output.Activities[0].ActivityId == nil || output.Activities[0].AutoScalingGroupName == nil || output.Activities[0].StartTime == nil || *output.Activities[0].ActivityId != activityID || *output.Activities[0].AutoScalingGroupName != asgName {
-		return nil, fmt.Errorf("auto scaling activity %q returned conflicting identity", activityID)
-	}
-
-	return &ScalingActivity{
-		ID:        activityID,
-		ASGName:   asgName,
-		Status:    string(output.Activities[0].StatusCode),
-		StartedAt: *output.Activities[0].StartTime,
-	}, nil
-}
-
-func TerminationEligibility(snapshot ASGSnapshot, instanceID string) TerminationBlockReason {
-	if snapshot.DesiredCapacity <= snapshot.MinSize {
-		return TerminationAtMinimum
-	}
-	if snapshot.TerminateSuspended {
-		return TerminationProcessSuspended
-	}
-	if snapshot.ActiveInstanceRefresh {
-		return TerminationInstanceRefreshActive
-	}
-	instance, found := snapshot.Instances[instanceID]
-	if !found {
-		return TerminationInstanceMissing
-	}
-	if instance.LifecycleState != "InService" {
-		return TerminationInstanceNotInService
-	}
-	if instance.HealthStatus != "Healthy" {
-		return TerminationInstanceUnhealthy
-	}
-	if instance.ProtectedFromScaleIn {
-		return TerminationInstanceProtected
-	}
-
-	return TerminationAllowed
-}
-
-func ReconcileTermination(snapshot ASGSnapshot, instanceID string, activity *ScalingActivity) TerminationReconciliation {
-	if _, found := snapshot.Instances[instanceID]; !found {
-		return TerminationCompleted
-	}
-	if activity == nil || activity.ASGName != snapshot.Name {
-		return TerminationUnknown
-	}
-	switch activity.Status {
-	case "Failed", "Cancelled":
-		return TerminationRejected
-	case "PendingSpotBidPlacement", "WaitingForSpotInstanceRequestId", "WaitingForSpotInstanceId", "WaitingForInstanceId", "PreInService", "InProgress", "WaitingForELBConnectionDraining", "MidLifecycleAction", "WaitingForInstanceWarmup", "Successful", "WaitingForConnectionDraining", "WaitingForInPlaceUpdateToStart", "WaitingForInPlaceUpdateToFinalize", "InPlaceUpdateInProgress":
-		return TerminationPending
-	default:
-		return TerminationUnknown
-	}
-}
-
 func (a *ASG) describeGroup(ctx context.Context, asgName string) (*types.AutoScalingGroup, error) {
 	output, err := a.client.DescribeAutoScalingGroups(ctx, &autoscaling.DescribeAutoScalingGroupsInput{
 		AutoScalingGroupNames: []string{asgName},
@@ -334,8 +229,4 @@ func instanceRefreshIsActive(status types.InstanceRefreshStatus) bool {
 		// New AWS states fail closed until explicitly classified.
 		return true
 	}
-}
-
-func errorsNewIncompleteTermination(instanceID string) error {
-	return fmt.Errorf("terminate instance %q returned no scaling activity", instanceID)
 }

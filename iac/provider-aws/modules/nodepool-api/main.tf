@@ -37,7 +37,6 @@ data "aws_iam_policy_document" "capacity_autoscaler" {
     actions = [
       "autoscaling:DescribeAutoScalingGroups",
       "autoscaling:DescribeInstanceRefreshes",
-      "autoscaling:DescribeScalingActivities",
       "ec2:DescribeInstances",
     ]
     resources = ["*"]
@@ -47,7 +46,7 @@ data "aws_iam_policy_document" "capacity_autoscaler" {
     effect = "Allow"
     actions = concat(
       ["autoscaling:SetDesiredCapacity"],
-      var.capacity_scale_in_enforced ? ["autoscaling:TerminateInstanceInAutoScalingGroup"] : [],
+      var.capacity_scale_in_enforced ? ["autoscaling:SetInstanceProtection"] : [],
     )
     resources = [var.client_autoscaling_group_arn]
   }

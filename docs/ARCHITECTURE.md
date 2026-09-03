@@ -80,10 +80,9 @@ flowchart TB
     API --> PG & RD & CH
     API -->|"start-intent leases"| RD
     CC -->|"authenticated capacity snapshot"| API
-    CC -->|"SetDesiredCapacity"| ASG["AWS client-node ASG"]
+    CC -->|"SetDesiredCapacity + instance protection"| ASG["AWS client-node ASG"]
     CC -->|"private drain/verify RPC"| API
     CC -->|"owned drain metadata"| ORCH
-    CC -->|"exact instance termination"| ASG
     DashAPI --> PG & CH
     ORCH --> OS & CH
     TM --> OS
@@ -99,7 +98,7 @@ flowchart TB
 | Client proxy | `packages/client-proxy` | API nodes | Edge router: sandbox URL → correct node |
 | Envd | `packages/envd` | inside every VM | In-VM agent: process/filesystem API for SDKs |
 | Dashboard API | `packages/dashboard-api` | API nodes | Backend for the web dashboard (teams, builds, admin) |
-| Capacity controller | `packages/capacity-controller` | one API node allocation (AWS, optional) | Scales the client ASG out from de-duplicated workload and optionally reclaims verified-empty workers through an owned drain transaction |
+| Capacity controller | `packages/capacity-controller` | one API node allocation (AWS, optional) | Reconciles client ASG desired capacity from de-duplicated workload and optionally makes verified-empty workers eligible for normal ASG scale-in |
 
 Supporting packages: `packages/shared` (protos, telemetry, storage clients, feature flags),
 `packages/auth` (authentication library), `packages/db` (Postgres migrations + sqlc queries),
@@ -113,7 +112,8 @@ The control-plane entry point (Gin, OpenAPI-generated from `spec/openapi.yml`, p
 - **Resources**: sandboxes (create/list/kill/pause/resume/connect/timeout/metrics/logs),
   templates and builds, teams, volumes, API keys, secrets, admin operations.
 - **Auth** (via `packages/auth`): team API keys (`X-API-Key`, `e2b_` prefix), auth-provider JWTs
-  (OIDC), admin token. Backed by an auth DB (Postgres) with a Redis team cache.
+  (OIDC), and either an admin token or a service JWT verified from the configured admin JWKS.
+  Backed by an auth DB (Postgres) with a Redis team cache.
 - **Workload identity**: sandbox create accepts an optional `iam.tokens` map of caller-named
   workload-token definitions (each an exact `audience` and `tokenType`). A non-empty, validated
   map enables workload identity, whose identity the orchestrator derives from the sandbox's
@@ -163,6 +163,14 @@ The control-plane entry point (Gin, OpenAPI-generated from `spec/openapi.yml`, p
   falls back automatically. Kill, pause, expiry, and failed create remove the ledger only after
   worker/product cleanup is confirmed, so uncertain cleanup can temporarily overcount but cannot
   silently undercount live capacity.
+- **Workload-v2 Redis shaping**: every Redis-backed workload mutation (`Acquire`, heartbeat renew,
+  prepare, promote, deadline update, and remove) acquires a short-lived process-local permit. The
+  final running/routing catalog write uses the same gate after the worker is ready. The independent
+  `SANDBOX_WORKLOAD_COMMIT_CONCURRENCY` budget therefore bounds both admission/heartbeat bursts and
+  the final commit without holding a permit during placement, EC2 scale-out, guest startup, or
+  worker cleanup. Cancellation remains fail-closed, and the path adds no retry, timeout extension,
+  or legacy fallback. Status and mutation-failure logs report the gate alongside Redis pool
+  statistics.
 - **Secrets**: `/secrets` is the only public surface for secret management (create, list, get,
   update, delete). The API authenticates the caller with the customer alternatives above, converts
   the authenticated team UUID to the project UUID the backend knows, checks the `customer-secrets`
@@ -174,6 +182,16 @@ The control-plane entry point (Gin, OpenAPI-generated from `spec/openapi.yml`, p
   a marker to a value at sandbox egress, never here. Without a configured address, or with the flag
   off, the routes stay registered and answer 403. Responses are `Cache-Control: no-store`, request bodies are capped at 512 KiB, and values
   at 64 KiB.
+- **Rig passthrough**: admin endpoints under `/clusters/{clusterID}/rigs` manage a cluster's
+  orchestrator node pools ("rigs"). They list rigs, change rig capacity, list and terminate
+  instances, and read recent scaling errors. Every handler delegates to the cluster's edge service
+  (`/v1/rigs/...`) through the per-cluster HTTP client that the cluster sync keeps fresh. The API
+  holds no cloud credentials and makes no scaling decisions. The caller authenticates with an
+  admin credential and never holds the cluster's edge secret. Edge status codes pass through unchanged
+  (400, 404, 409, 501). An edge 401 becomes a 500: it means the API is misconfigured against the
+  cluster, not that the caller's token is invalid. A cluster with no rig management configured
+  returns an empty list. The local cluster has no edge deployment and answers 501 for every rig
+  operation.
 - **Extra listeners**: internal gRPC :5009 and edge gRPC :5109 expose `ResumeSandbox` so
   client-proxy can wake paused sandboxes on incoming traffic.
 - Reads ClickHouse for sandbox/team metrics endpoints. Sandbox and template-build logs default to
@@ -204,8 +222,11 @@ Key mechanisms (all under `pkg/sandbox/`):
   same value but can be lowered independently to protect node startup reliability without changing
   eventual capacity. An atomic in-flight reservation closes the race between the live sandbox
   count check and insertion into the running map, so concurrent creates cannot exceed that
-  configured node limit. This worker-side admission is the final authority across all API replicas;
-  API-side reservations only prevent avoidable request herding before the RPC reaches the worker.
+  configured node limit. The Sandbox factory acquires this worker-side admission before any VM,
+  network, or storage allocation and converts it into a tracked lifecycle before releasing it, so
+  API creates, resumes, prefetch VMs, and template-build VMs share one drain fence. This admission
+  is the final authority across all API replicas; API-side reservations only prevent avoidable
+  request herding before the RPC reaches the worker.
 
   Safe scale-in changes the worker from Healthy to Draining under the same synchronization boundary
   used by create/resume admission. A request admitted first is included in the worker's in-flight
@@ -232,7 +253,8 @@ Key mechanisms (all under `pkg/sandbox/`):
   reused; slot indexes are allocated locally against the node's netns state (leftover
   namespaces from a previous run are torn down by startup reclaim).
 - **Sandbox proxy** (:5007, `pkg/proxy/`): reverse-proxies incoming traffic from client-proxy to
-  the sandbox's slot IP and requested port, enforcing per-sandbox traffic access tokens.
+  the sandbox's slot IP and requested port over HTTP or configured HTTPS, enforcing per-sandbox
+  traffic access tokens. HTTPS backends may use self-signed certificates.
 - Writes sandbox lifecycle **events** and cgroup **host stats** to ClickHouse; exports metrics via
   OTel. Sandbox and template-build log writes go through a flag-resolved HTTP route: the legacy
   collector remains the fallback primary destination, and configured shadow destinations can mirror
@@ -282,9 +304,10 @@ the API's `ResumeSandbox` gRPC and retries — paused sandboxes wake transparent
 
 A separate REST service (port 3010, spec `spec/openapi-dashboard.yml`) consumed by the web
 dashboard, not the SDK: legacy team management/provisioning, template tags, build listings, admin
-bootstrap. The `disable-legacy-team-mutations` LaunchDarkly flag rejects legacy lifecycle writes
-with 412 after authentication; it leaves reads and the workspace API's management projection
-writes available. Team-scoped template and build read routes accept either dashboard user auth or
+bootstrap. Its admin routes accept either a shared admin token or a short-lived service JWT
+verified against the configured admin JWKS. The `disable-legacy-team-mutations` LaunchDarkly flag
+rejects legacy lifecycle writes with 412 after authentication; it leaves reads and the workspace
+API's management projection writes available. Team-scoped template and build read routes accept either dashboard user auth or
 team API key auth (`X-API-Key`). Its workspace-agnostic `/v1/management` operations are defined in the
 same dashboard OpenAPI contract and registered on the existing router. Their `AdminJWTAuth`
 OpenAPI security scheme accepts only short-lived service JWTs verified against the workspace-api
@@ -292,6 +315,10 @@ OpenAPI security scheme accepts only short-lived service JWTs verified against t
 `alg` metadata. Issuers and audiences are configured through the JSON `ADMIN_AUTH_PROVIDER_CONFIG` value —
 the same config shape as `AUTH_PROVIDER_CONFIG`. Talks to Postgres and ClickHouse; never talks to
 orchestrators.
+
+An issuer normally configures at least one accepted audience, binding a JWT to its intended target.
+An issuer may omit `audiences` only with no `audienceMatchPolicy`; this deliberately disables
+audience matching while issuer, signature, and temporal-claim verification remain required.
 
 The `/v1/management` operations are the cluster's half of a contract the workspace residency owns:
 project upsert (a project is a `public.teams` row created from a caller-supplied UUID; the tier is
@@ -314,6 +341,12 @@ already owned by a different user returns 409. A revocation removes only that Us
 `internal/management` with their post-commit cache eviction rather than in the handlers: auth
 caches member authorization, so each accepted command invalidates that User's authorization for
 the Project after commit.
+
+The management surface also owns a replay-safe cluster lifecycle. A caller registers a stable
+cluster UUID with immutable connection details, assigns it only to the named project, detaches that
+exact assignment before provider cleanup, and deletes the cluster only after no project references
+it. Replaying the same registration or assignment succeeds, while a changed descriptor, a different
+assignment, an inexact detach, or deletion of a referenced cluster returns a conflict.
 
 `DELETE /v1/management/projects/{teamID}` is declared and answers 501. `envs`, `snapshots` and
 `volumes` reference `teams` with `ON DELETE NO ACTION` and templates are only soft-deleted, so a
@@ -367,7 +400,8 @@ sequenceDiagram
     O->>E: POST /init (env vars, access token) — retried until ready
     E-->>O: 204
     O-->>API: Create OK
-    API->>R: intent outstanding -> handoff
+    API->>API: workload-v2 waits for a bounded commit permit
+    API->>R: intent outstanding -> handoff; prepare/promote workload
     API->>R: store running sandbox + routing catalog; remove owned handoff
     API-->>C: 201 sandbox {sandboxID, domain}
 ```
@@ -382,6 +416,17 @@ returns `DeadlineExceeded` with an exact retry-safe detail only after cleanup su
 may try one other node, for at most two guest-readiness attempts, without creating autoscaler
 demand. Cleanup failures are terminal. Firecracker exits, template errors, and unknown failures
 retain their existing hard-failure behavior.
+
+The capacity controller never treats the cached worker summary as termination proof. Its private
+API flow binds every Begin/Verify/Cancel request to both the node ID and the worker process's service
+instance ID. Verify combines a fresh InfoService snapshot with a live `Sandbox.List`; an identity
+change, stale or unsupported worker, non-empty list, or read failure preserves the host.
+
+Redis connection capacity and connection establishment are configured separately. `REDIS_POOL_SIZE`
+sets the steady-state command pool, while optional `REDIS_MAX_CONCURRENT_DIALS` limits simultaneous
+TCP/TLS handshakes for both standalone and cluster clients. Leaving the dial limit at zero preserves
+the go-redis default. Workload modes reject a non-positive commit budget, a commit budget larger than
+the pool, and a positive dial limit larger than the pool at startup instead of silently changing it.
 
 ### Sandbox traffic
 
@@ -471,6 +516,22 @@ sequenceDiagram
   The disk has crash-recovery semantics (unflushed pre-pause writes are lost), nothing durable
   is mutated (the memory snapshot survives untouched), and auto-resume never takes this path —
   traffic always memory-resumes.
+- **Pre-boot filesystem recovery**: every cold boot of a rootfs that was not frozen at pause
+  (`fs_quiesced` false/absent) runs a jailed `e2fsck -p -E journal_only` before the VM starts —
+  journal replay only, the same recovery the guest kernel would do at mount — so a `memory: false`
+  rescue and a legacy sync-fallback filesystem-only snapshot both mount a consistent disk. It
+  replays and exits without a full consistency scan, so the cost is bounded by journal content,
+  not filesystem size. Runs under the same confinement as the offline envd swap (unprivileged
+  transient unit, device access pinned to the sandbox's own NBD node). A clean replay boots;
+  anything else fails the start with the snapshot untouched but stays retryable. Journal replay
+  never condemns a snapshot: its exit codes cannot tell an unmountable filesystem apart from a
+  transient device fault, so every non-replayed outcome — an operational failure (timeout, I/O,
+  device error) or an e2fsck exit that is not a clean replay — is retryable, never a permanent
+  customer-facing verdict. In-file corruption that still mounts is likewise not condemned — replay
+  does not scan, so it boots. Whole-filesystem repair and condemning a rootfs are left to a
+  separate opt-in full-filesystem repair path. Gated by the `preboot-fs-recovery` flag, separate
+  from `fs-only-resume-api` because it also changes the behavior of existing filesystem-only cold
+  boots.
 - **Envd live-upgrade on resume**: the orchestrator can upgrade the sandbox's envd to a newer
   node-local build during resume (gated by the `envd-upgrade-target` flag in
   `packages/shared/pkg/featureflags`), via envd's `POST /upgrade` (see the envd section). It is
@@ -570,22 +631,53 @@ flowchart TB
   Safe scale-in is a separate `off` (default), `observe`, or `enforce` path available only with
   `start-intent-v1`. It retains configured headroom above current workload, waits for a stable
   surplus, and selects protocol-capable low-occupancy workers older than the minimum EC2 instance
-  age. The controller writes an owned Nomad drain marker before asking the exact worker service
-  instance to enter Draining. Empty workers can use the global rolling window; non-empty workers
-  also consume a 10% graceful-drain budget while their Sandboxes end naturally. It never migrates
-  or kills a Sandbox to reduce capacity.
+  age. Candidate occupancy includes running Sandboxes, worker-observed starts, and API placements
+  already in progress; the final worker read remains authoritative. Empty workers may use the
+  global 50-operation window; non-empty workers also consume a 10% graceful-drain budget while
+  their Sandboxes end naturally. Scale-in never migrates or kills a Sandbox.
 
-  Before each irreversible action the controller re-reads workload, Nomad ownership, worker
-  identity and shutdown state, ASG membership/health/protection, active instance refresh state, and
-  the ASG minimum. It then calls `TerminateInstanceInAutoScalingGroup` for that exact instance with
-  desired-capacity decrement enabled; it never substitutes a generic desired-capacity reduction.
-  Demand growth cancels uncommitted owned drains in Nomad-before-worker order, while scale-out keeps
-  priority if scale-in observations fail. Transport-ambiguous AWS outcomes remain isolated and are
-  reconciled by reads rather than retried. The controller has no listener or public route. The
-  exact-termination IAM action is present only in enforce mode and remains resource-scoped to the
-  named client ASG. The controller currently shares the API-node instance role and Nomad cluster
-  token with other colocated jobs; process-specific cloud/Nomad identity would require a separate
-  workload-identity mechanism and is not claimed by this deployment.
+  New sandbox-client ASG instances start with scale-in protection. A protected instance cannot be
+  selected by normal ASG scale-in. The controller writes an owned Nomad drain marker and asks the
+  exact worker service instance to enter Draining under a stable operation ID. Discovery carries
+  the full Nomad node UUID separately from the legacy shortened routing key, so a replacement
+  registration on the same EC2 instance cannot inherit an older operation. The Worker admission
+  lock makes Begin idempotent for the same operation and rejects a competing owner. While Draining,
+  the worker rejects new create/resume admissions. `shutdown_ready` requires live Sandboxes,
+  starts/resumes, lifecycle cleanup, and snapshot uploads all to be zero; the API also verifies a
+  fresh `Sandbox.List` is empty.
+
+  Only an owned Draining worker that passes fresh workload, Nomad, Worker, ASG membership, health,
+  lifecycle, instance-refresh, identity, and emptiness checks may have protection removed. Such an
+  unprotected safe worker is called **armed**: ASG may select it for normal scale-in, but the worker
+  remains Draining and Nomad-ineligible. Ordinary, busy, unknown, unhealthy, or identity-mismatched
+  instances remain protected. Protection does not prevent health-check replacement, Spot
+  interruption, or manual termination; those remain separate failure paths.
+
+  The controller lowers capacity only when the ASG is **settled**: member count equals desired
+  capacity, every member is `InService`, and no active refresh or previous termination is in
+  progress. It verifies that every unprotected member is armed, then writes one absolute target:
+  `desired - min(armed, desired-safeRequired, 50)`. While membership differs from desired, it waits
+  for that batch to converge before considering another. Because each reconciliation derives an
+  absolute target from current AWS state, a restart or an ambiguous response is recovered by a
+  fresh read rather than by repeating a relative decrement.
+
+  Demand growth always takes priority. The controller stops opening drains and, when membership is
+  above desired, first raises desired to at least the current member count and safe requirement.
+  It then re-protects surviving `InService` workers, confirms protection from a fresh ASG snapshot,
+  restores the matching Worker operation, and finally restores Nomad eligibility. A worker already
+  in `Terminating*` is never reopened; scale-out replaces that capacity. Unknown or contradictory
+  state fails closed by preserving or restoring protection and stopping scale-in, without blocking
+  scale-out.
+
+  Safe rollback follows the same ordering: raise desired to at least current membership, wait until
+  there is no pending normal scale-in deficit, protect every remaining instance, cancel owned
+  Worker drains, restore Nomad eligibility, and only then disable enforce mode or roll back the
+  controller. The controller has no listener or public route. Its enforce-only
+  `autoscaling:SetInstanceProtection` and existing `autoscaling:SetDesiredCapacity` permissions are
+  resource-scoped to the named client ASG; ASG/EC2 Describe calls remain read-only. The controller
+  currently shares the API-node instance role and Nomad cluster token with other colocated jobs;
+  process-specific cloud/Nomad identity would require a separate workload-identity mechanism and
+  is not claimed by this deployment.
   The legacy failure-ledger reader remains isolated for explicit operational rollback until the
   migration observation period is complete.
 - **Sandbox ("client") nodes** run the orchestrator as a Nomad *system* job via `raw_exec`

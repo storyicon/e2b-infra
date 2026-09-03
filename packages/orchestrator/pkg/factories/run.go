@@ -552,6 +552,7 @@ func run(config cfg.Config, opts Options) (success bool) {
 
 	featureFlags.SetDeploymentName(config.DomainName)
 	featureFlags.RegisterContextProvider(orchestratorContextProvider(nodeID, commitSHA))
+	featureFlags.RegisterContextProvider(instanceGroupContextProvider(config.InstanceGroupName))
 
 	// External sandbox logger routes through LaunchDarkly (LogsWriteConfigFlag),
 	// falling back to the fixed collector address. Created here so it can use the
@@ -1061,14 +1062,13 @@ func run(config cfg.Config, opts Options) (success bool) {
 		cancelCloseCtx()
 	}
 
-	// Mark service draining if not already.
-	// If service stats was previously changed via API, we don't want to override it.
+	// Entering process shutdown atomically revokes capacity-controller ownership
+	// of a drain without overwriting a concurrent fail-closed status.
 	logger.L().Info(ctx, "Starting drain phase", zap.Int("sandbox_count", sandboxes.Count()))
-	if status := serviceInfo.GetStatus().Status; status == orchestratorinfo.ServiceInfoStatus_Healthy || status == orchestratorinfo.ServiceInfoStatus_Standby {
-		serviceInfo.SetStatus(ctx, orchestratorinfo.ServiceInfoStatus_Draining)
-
+	previousStatus, draining := serviceInfo.BeginProcessShutdown(ctx)
+	if draining {
 		// Wait for draining state to propagate to all consumers
-		if !env.IsLocal() {
+		if previousStatus.Status != orchestratorinfo.ServiceInfoStatus_Draining && !env.IsLocal() {
 			time.Sleep(15 * time.Second)
 		}
 	}
