@@ -31,10 +31,12 @@ func (f *fakeAutoScalingClient) DescribeInstanceRefreshes(context.Context, *auto
 }
 func (f *fakeAutoScalingClient) SetDesiredCapacity(_ context.Context, input *autoscaling.SetDesiredCapacityInput, _ ...func(*autoscaling.Options)) (*autoscaling.SetDesiredCapacityOutput, error) {
 	f.setDesiredInput = input
+
 	return &autoscaling.SetDesiredCapacityOutput{}, nil
 }
 func (f *fakeAutoScalingClient) SetInstanceProtection(_ context.Context, input *autoscaling.SetInstanceProtectionInput, _ ...func(*autoscaling.Options)) (*autoscaling.SetInstanceProtectionOutput, error) {
 	f.protectionInput = input
+
 	return &autoscaling.SetInstanceProtectionOutput{}, f.protectionErr
 }
 
@@ -47,18 +49,22 @@ func (f fakeEC2Client) DescribeInstances(_ context.Context, input *ec2.DescribeI
 			instances = append(instances, ec2types.Instance{InstanceId: aws.String(id), LaunchTime: aws.Time(launch)})
 		}
 	}
+
 	return &ec2.DescribeInstancesOutput{Reservations: []ec2types.Reservation{{Instances: instances}}}, nil
 }
 
 func completeASG(count int) *fakeAutoScalingClient {
 	instances := make([]types.Instance, 0, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		instances = append(instances, types.Instance{InstanceId: aws.String(fmt.Sprintf("i-%d", i)), HealthStatus: aws.String("Healthy"), LifecycleState: types.LifecycleStateInService, ProtectedFromScaleIn: aws.Bool(true)})
 	}
+
 	return &fakeAutoScalingClient{groups: []types.AutoScalingGroup{{AutoScalingGroupName: aws.String("workers"), AutoScalingGroupARN: aws.String("arn:workers"), DesiredCapacity: aws.Int32(int32(count)), MinSize: aws.Int32(1), MaxSize: aws.Int32(1000), NewInstancesProtectedFromScaleIn: aws.Bool(true), Instances: instances}}}
 }
 
 func TestASGSnapshotReadsProtectionMembershipAndLaunchTime(t *testing.T) {
+	t.Parallel()
+
 	client := completeASG(1)
 	launch := time.Now().Add(-time.Hour).UTC()
 	snapshot, err := NewASG(client, fakeEC2Client{launchTimes: map[string]time.Time{"i-0": launch}}).Snapshot(t.Context(), "workers")
@@ -69,6 +75,8 @@ func TestASGSnapshotReadsProtectionMembershipAndLaunchTime(t *testing.T) {
 }
 
 func TestASGSnapshotRejectsUnknownGroupProtection(t *testing.T) {
+	t.Parallel()
+
 	client := completeASG(0)
 	client.groups[0].NewInstancesProtectedFromScaleIn = nil
 	_, err := NewASG(client, fakeEC2Client{}).Snapshot(t.Context(), "workers")
@@ -76,6 +84,8 @@ func TestASGSnapshotRejectsUnknownGroupProtection(t *testing.T) {
 }
 
 func TestASGDesiredCapacityRequiresExactCompleteGroup(t *testing.T) {
+	t.Parallel()
+
 	for _, tc := range []struct {
 		name   string
 		groups []types.AutoScalingGroup
@@ -87,6 +97,8 @@ func TestASGDesiredCapacityRequiresExactCompleteGroup(t *testing.T) {
 		{"missing desired", []types.AutoScalingGroup{{AutoScalingGroupName: aws.String("workers")}}, "no desired capacity"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			_, err := NewASG(&fakeAutoScalingClient{groups: tc.groups}, nil).DesiredCapacity(t.Context(), "workers")
 			require.ErrorContains(t, err, tc.want)
 		})
@@ -94,11 +106,15 @@ func TestASGDesiredCapacityRequiresExactCompleteGroup(t *testing.T) {
 }
 
 func TestASGSnapshotFailsClosedWhenEC2LaunchTimeIsMissing(t *testing.T) {
+	t.Parallel()
+
 	_, err := NewASG(completeASG(1), fakeEC2Client{launchTimes: map[string]time.Time{}}).Snapshot(t.Context(), "workers")
 	require.ErrorContains(t, err, "returned 0 of 1")
 }
 
 func TestSetInstanceProtectionValidatesAndForwardsBatch(t *testing.T) {
+	t.Parallel()
+
 	client := completeASG(0)
 	adapter := NewASG(client, nil)
 	require.NoError(t, adapter.SetInstanceProtection(t.Context(), "workers", []string{"i-1", "i-2"}, false))
@@ -112,6 +128,8 @@ func TestSetInstanceProtectionValidatesAndForwardsBatch(t *testing.T) {
 }
 
 func TestSetInstanceProtectionDoesNotInterpretAmbiguousError(t *testing.T) {
+	t.Parallel()
+
 	client := completeASG(0)
 	client.protectionErr = errors.New("response lost")
 	err := NewASG(client, nil).SetInstanceProtection(t.Context(), "workers", []string{"i-1"}, false)
@@ -119,6 +137,8 @@ func TestSetInstanceProtectionDoesNotInterpretAmbiguousError(t *testing.T) {
 }
 
 func TestSetDesiredCapacityUsesAbsoluteTarget(t *testing.T) {
+	t.Parallel()
+
 	client := completeASG(0)
 	_, err := NewASG(client, nil).SetDesiredCapacity(t.Context(), "workers", 450)
 	require.NoError(t, err)
@@ -127,6 +147,8 @@ func TestSetDesiredCapacityUsesAbsoluteTarget(t *testing.T) {
 }
 
 func TestASGSnapshotTreatsUnknownRefreshAsActive(t *testing.T) {
+	t.Parallel()
+
 	client := completeASG(0)
 	client.refreshes = []types.InstanceRefresh{{Status: types.InstanceRefreshStatus("FutureState")}}
 	snapshot, err := NewASG(client, fakeEC2Client{}).Snapshot(t.Context(), "workers")

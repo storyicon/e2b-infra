@@ -30,6 +30,7 @@ func (f *fakeCapacityServiceClient) ListScaleInCandidates(context.Context, *prox
 
 func (f *fakeCapacityServiceClient) BeginWorkerScaleIn(_ context.Context, request *proxygrpc.WorkerScaleInRequest, _ ...grpc.CallOption) (*proxygrpc.WorkerScaleInState, error) {
 	f.workerRequest = request
+
 	return f.workerResponse, f.err
 }
 
