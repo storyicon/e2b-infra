@@ -29,6 +29,7 @@ func (p *mutableShutdownActivity) SnapshotUploadsInFlight() uint64 {
 	if p.onSnapshot != nil {
 		p.onSnapshot()
 	}
+
 	return p.uploads
 }
 
