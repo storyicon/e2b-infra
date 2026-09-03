@@ -305,6 +305,7 @@ type worldInfrastructure struct{ world *scaleInWorld }
 func (i worldInfrastructure) Snapshot(context.Context, string) (ScaleInASGSnapshot, error) {
 	return i.world.cloud, nil
 }
+
 func (i worldInfrastructure) SetInstanceProtection(ctx context.Context, asg string, ids []string, protected bool) error {
 	return i.world.SetInstanceProtection(ctx, asg, ids, protected)
 }
@@ -981,7 +982,11 @@ func TestScaleInModel500WorkersUsesSettledBatchesOfAtMost50(t *testing.T) {
 		for _, id := range ids {
 			delete(w.cloud.Instances, id)
 		}
-		w.nodes = slices.DeleteFunc(w.nodes, func(node NomadScaleInNode) bool { _, member := w.cloud.Instances[node.NodeID]; return !member })
+		w.nodes = slices.DeleteFunc(w.nodes, func(node NomadScaleInNode) bool {
+			_, member := w.cloud.Instances[node.NodeID]
+
+			return !member
+		})
 	}
 	require.Equal(t, []int32{450, 400, 350, 300, 250, 200, 150, 100, 50, 1}, w.desiredWrites)
 }
