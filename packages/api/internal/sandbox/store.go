@@ -37,6 +37,7 @@ const sbxRemoveTimeout = 10 * time.Second
 // them without creating an import cycle back into package sandbox.
 type (
 	Storage            = sandboxtypes.Storage
+	CapacityStorage    = sandboxtypes.CapacityStorage
 	ReservationStorage = sandboxtypes.ReservationStorage
 	ReservationOwner   = sandboxtypes.ReservationOwner
 )
@@ -52,21 +53,24 @@ type Callbacks struct {
 }
 
 type Store struct {
-	storage   Storage
-	callbacks Callbacks
+	storage         Storage
+	capacityStorage CapacityStorage
+	callbacks       Callbacks
 
 	reservations ReservationStorage
 }
 
 func NewStore(
 	backend Storage,
+	capacityBackend CapacityStorage,
 	reservations ReservationStorage,
 	callbacks Callbacks,
 ) *Store {
 	return &Store{
-		storage:      backend,
-		reservations: reservations,
-		callbacks:    callbacks,
+		storage:         backend,
+		capacityStorage: capacityBackend,
+		reservations:    reservations,
+		callbacks:       callbacks,
 	}
 }
 
@@ -77,7 +81,7 @@ func (s *Store) Add(ctx context.Context, sandbox Sandbox, creation *CreationMeta
 }
 
 func (s *Store) AddCapacity(ctx context.Context, sandbox Sandbox, creation *CreationMetadata) error {
-	return s.add(ctx, sandbox, creation, s.storage.AddCapacity)
+	return s.add(ctx, sandbox, creation, s.capacityStorage.AddCapacity)
 }
 
 func (s *Store) add(ctx context.Context, sandbox Sandbox, creation *CreationMetadata, persist func(context.Context, Sandbox) error) error {

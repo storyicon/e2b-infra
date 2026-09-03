@@ -250,7 +250,8 @@ func newStartIntentTestOrchestratorWithReservation(t *testing.T) (*Orchestrator,
 	require.NoError(t, err)
 
 	reservations := newMemoryReservation()
-	store := sandbox.NewStore(newMemorySandboxStorage(), reservations, sandbox.Callbacks{
+	storage := newMemorySandboxStorage()
+	store := sandbox.NewStore(storage, storage, reservations, sandbox.Callbacks{
 		AddSandboxToRoutingTable: func(context.Context, sandbox.Sandbox) error { return nil },
 		AsyncNewlyCreatedSandbox: func(context.Context, sandbox.Sandbox, sandbox.CreationMetadata) {},
 	})

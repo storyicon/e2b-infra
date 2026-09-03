@@ -68,6 +68,7 @@ func newCreateSandboxTestOrchestratorWithFlags(t *testing.T, flagSource *ldtestd
 
 	store := sandbox.NewStore(
 		storage,
+		storage,
 		redisreservations.NewReservationStorage(client, storage.Notifier()),
 		sandbox.Callbacks{
 			AddSandboxToRoutingTable: func(context.Context, sandbox.Sandbox) error { return nil },

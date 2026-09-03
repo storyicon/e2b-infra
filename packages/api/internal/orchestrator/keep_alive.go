@@ -80,6 +80,7 @@ func (o *Orchestrator) KeepAliveFor(ctx context.Context, teamID uuid.UUID, sandb
 			return nil, &api.APIError{Code: http.StatusInternalServerError, ClientMsg: "Error when setting sandbox timeout", Err: err}
 		}
 	}
+
 	return &sbx, nil
 }
 

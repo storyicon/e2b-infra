@@ -234,6 +234,7 @@ func New(
 
 	o.sandboxStore = sandbox.NewStore(
 		redisStorage,
+		redisStorage,
 		redisreservations.NewReservationStorage(redisClient, redisStorage.Notifier()),
 		sandbox.Callbacks{
 			AddSandboxToRoutingTable: o.addSandboxToRoutingTable,
