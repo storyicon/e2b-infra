@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	orchestratorinfo "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator-info"
@@ -299,8 +300,8 @@ func TestControllerDrainAndAdmissionAreLinearized(t *testing.T) {
 			defer wg.Done()
 			<-start
 			applied, matched := info.OverrideControllerDrain(t.Context(), orchestratorinfo.ServiceInfoStatus_Draining, "service-current", "operation-1")
-			require.True(t, matched)
-			require.True(t, applied)
+			assert.True(t, matched)
+			assert.True(t, applied)
 		}()
 
 		close(start)

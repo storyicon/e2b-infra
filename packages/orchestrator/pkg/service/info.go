@@ -110,15 +110,6 @@ func (s *ServiceInfo) SetStatus(ctx context.Context, status orchestratorinfo.Ser
 	s.setStatus(ctx, status)
 }
 
-func (s *ServiceInfo) admissionStateLocked() AdmissionState {
-	return AdmissionState{
-		Status:                     s.status,
-		SandboxStartsInFlight:      s.sandboxStartsInFlight,
-		ControllerDrainOwned:       s.controllerDrainOwned,
-		ControllerDrainOperationID: s.controllerDrainOperationID,
-	}
-}
-
 // BeginProcessShutdown enters a lifecycle-owned drain without overwriting a
 // concurrent fail-closed status. The status check, ownership transfer, and
 // transition are atomic with admission and controller overrides.
@@ -178,7 +169,8 @@ func (s *ServiceInfo) OverrideControllerDrain(ctx context.Context, status orches
 		return false, false
 	}
 
-	if status == orchestratorinfo.ServiceInfoStatus_Draining {
+	switch status {
+	case orchestratorinfo.ServiceInfoStatus_Draining:
 		switch {
 		case s.status.Status == orchestratorinfo.ServiceInfoStatus_Healthy:
 			if s.completedDrainOperationID == operationID {
@@ -195,7 +187,7 @@ func (s *ServiceInfo) OverrideControllerDrain(ctx context.Context, status orches
 		default:
 			return false, true
 		}
-	} else if status == orchestratorinfo.ServiceInfoStatus_Healthy {
+	case orchestratorinfo.ServiceInfoStatus_Healthy:
 		if s.status.Status == orchestratorinfo.ServiceInfoStatus_Healthy && !s.controllerDrainOwned && s.completedDrainOperationID == operationID {
 			// The previous cancellation may have succeeded while its response was
 			// lost. Preserve an idempotent receipt for this process and operation.
@@ -207,7 +199,7 @@ func (s *ServiceInfo) OverrideControllerDrain(ctx context.Context, status orches
 		s.controllerDrainOwned = false
 		s.controllerDrainOperationID = ""
 		s.completedDrainOperationID = operationID
-	} else {
+	default:
 		return false, true
 	}
 
