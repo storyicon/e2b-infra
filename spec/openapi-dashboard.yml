@@ -1771,7 +1771,7 @@ paths:
 
   /admin/teams/{teamID}/cluster:
     get:
-      summary: Get a team's assigned cluster
+      summary: Assigned cluster for a team
       description: Returns the current cluster assignment without exposing cluster credentials.
       tags: [admin]
       security:
@@ -2015,7 +2015,7 @@ paths:
 
   /teams/{teamID}/status:
     get:
-      summary: Get team access status
+      summary: Team access status
       description: Returns whether the team is blocked or banned and its recorded blocked reason. Team-authenticated requests may read only the team they are scoped to.
       tags: [teams]
       security:
@@ -2041,7 +2041,7 @@ paths:
 
   /teams/{teamID}/limits:
     get:
-      summary: Get team limits
+      summary: Team limits
       description: Returns the team's tier and effective resource limits. Team-authenticated requests may read only the team they are scoped to.
       tags: [teams]
       security:
