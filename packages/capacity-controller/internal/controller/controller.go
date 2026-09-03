@@ -242,7 +242,7 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, cu
 			result.Aggregating = true
 			result = r.observeReadyNodes(ctx, result)
 
-			return r.reconcileExistingScaleInOperations(ctx, now, currentTime, snapshot.WorkloadCount, result), nil
+			return r.reconcileExistingScaleInOperations(ctx, currentTime, snapshot.WorkloadCount, result), nil
 		}
 		result.BatchTrigger = trigger
 		batch := r.startIntentBatch
@@ -291,13 +291,13 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, cu
 
 	result = r.observeReadyNodes(ctx, result)
 	if result.Scaled || result.Aggregating {
-		return r.reconcileExistingScaleInOperations(ctx, now, currentTime, snapshot.WorkloadCount, result), nil
+		return r.reconcileExistingScaleInOperations(ctx, currentTime, snapshot.WorkloadCount, result), nil
 	}
 
 	return r.reconcileScaleInAt(ctx, currentTime, snapshot.WorkloadCount, result, true)
 }
 
-func (r *Reconciler) reconcileExistingScaleInOperations(ctx context.Context, now time.Time, currentTime func() time.Time, workloadCount int64, result Result) Result {
+func (r *Reconciler) reconcileExistingScaleInOperations(ctx context.Context, currentTime func() time.Time, workloadCount int64, result Result) Result {
 	if r.config.ScaleInMode != ScaleInModeEnforce {
 		return result
 	}

@@ -26,14 +26,17 @@ type fakeAutoScalingClient struct {
 func (f *fakeAutoScalingClient) DescribeAutoScalingGroups(context.Context, *autoscaling.DescribeAutoScalingGroupsInput, ...func(*autoscaling.Options)) (*autoscaling.DescribeAutoScalingGroupsOutput, error) {
 	return &autoscaling.DescribeAutoScalingGroupsOutput{AutoScalingGroups: f.groups}, nil
 }
+
 func (f *fakeAutoScalingClient) DescribeInstanceRefreshes(context.Context, *autoscaling.DescribeInstanceRefreshesInput, ...func(*autoscaling.Options)) (*autoscaling.DescribeInstanceRefreshesOutput, error) {
 	return &autoscaling.DescribeInstanceRefreshesOutput{InstanceRefreshes: f.refreshes}, nil
 }
+
 func (f *fakeAutoScalingClient) SetDesiredCapacity(_ context.Context, input *autoscaling.SetDesiredCapacityInput, _ ...func(*autoscaling.Options)) (*autoscaling.SetDesiredCapacityOutput, error) {
 	f.setDesiredInput = input
 
 	return &autoscaling.SetDesiredCapacityOutput{}, nil
 }
+
 func (f *fakeAutoScalingClient) SetInstanceProtection(_ context.Context, input *autoscaling.SetInstanceProtectionInput, _ ...func(*autoscaling.Options)) (*autoscaling.SetInstanceProtectionOutput, error) {
 	f.protectionInput = input
 
