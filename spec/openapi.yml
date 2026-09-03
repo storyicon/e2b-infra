@@ -4382,7 +4382,7 @@ paths:
 
   /secrets/{secretID}:
     get:
-      summary: Get a secret
+      summary: Secret details
       description: Get one secret's metadata, selected by identifier or name.
       tags: [secrets]
       security:
