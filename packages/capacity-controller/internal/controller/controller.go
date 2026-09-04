@@ -307,8 +307,12 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, cu
 		return r.reconcileScaleInObservation(ctx, currentTime, snapshot.WorkloadCount, result, true, *steadyScaleInObservation)
 	}
 	if result.ScaleInReadError != nil {
+		// The read error is carried in Result for diagnostics while raw scale-out
+		// remains available to callers through the normal reconciliation result.
+		//nolint:nilerr // Scale-in observation failures are intentionally non-fatal to raw scale-out.
 		return result, nil
 	}
+
 	return r.reconcileScaleInAt(ctx, currentTime, snapshot.WorkloadCount, result, true)
 }
 

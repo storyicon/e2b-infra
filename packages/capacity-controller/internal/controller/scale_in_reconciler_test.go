@@ -1075,7 +1075,7 @@ func TestScaleInOpensAndRemovesOneFullEmptyWorkerBatch(t *testing.T) {
 	require.Equal(t, 49, w.beginCalls)
 	require.Empty(t, w.desiredWrites)
 
-	result, err = r.reconcileScaleIn(t.Context(), now.Add(2*time.Second), 0)
+	_, err = r.reconcileScaleIn(t.Context(), now.Add(2*time.Second), 0)
 	require.NoError(t, err)
 	require.Len(t, w.protectionWrites, 1)
 	require.Len(t, w.protectionWrites[0].ids, 49)
