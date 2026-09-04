@@ -634,7 +634,10 @@ flowchart TB
   age. Candidate occupancy includes running Sandboxes, worker-observed starts, and API placements
   already in progress; the final worker read remains authoritative. Empty workers may use the
   global 50-operation window; non-empty workers also consume a 10% graceful-drain budget while
-  their Sandboxes end naturally. Scale-in never migrates or kills a Sandbox.
+  their Sandboxes end naturally. A steady reconciliation shares one fresh Nomad, Worker, and full
+  ASG observation across compensation and scale-in planning; observations are never reused across
+  reconciliations, and safety-critical post-write checks still read fresh state. The lightweight
+  desired-capacity read excludes ASG instance details. Scale-in never migrates or kills a Sandbox.
 
   New sandbox-client ASG instances start with scale-in protection. A protected instance cannot be
   selected by normal ASG scale-in. The controller writes an owned Nomad drain marker and asks the
@@ -650,8 +653,11 @@ flowchart TB
   lifecycle, instance-refresh, identity, and emptiness checks may have protection removed. Such an
   unprotected safe worker is called **armed**: ASG may select it for normal scale-in, but the worker
   remains Draining and Nomad-ineligible. Ordinary, busy, unknown, unhealthy, or identity-mismatched
-  instances remain protected. Protection does not prevent health-check replacement, Spot
-  interruption, or manual termination; those remain separate failure paths.
+  instances remain protected. One reconciliation may open the full global window of 50 empty
+  workers, so the subsequent absolute desired-capacity write can consume one complete safe batch
+  instead of fragmenting it into smaller ASG convergence cycles. Protection does not prevent
+  health-check replacement, Spot interruption, or manual termination; those remain separate
+  failure paths.
 
   The controller lowers capacity only when the ASG is **settled**: member count equals desired
   capacity, every member is `InService`, and no active refresh or previous termination is in

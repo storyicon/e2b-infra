@@ -18,12 +18,15 @@ import (
 type fakeAutoScalingClient struct {
 	groups          []types.AutoScalingGroup
 	refreshes       []types.InstanceRefresh
+	describeInputs  []*autoscaling.DescribeAutoScalingGroupsInput
 	setDesiredInput *autoscaling.SetDesiredCapacityInput
 	protectionInput *autoscaling.SetInstanceProtectionInput
 	protectionErr   error
 }
 
-func (f *fakeAutoScalingClient) DescribeAutoScalingGroups(context.Context, *autoscaling.DescribeAutoScalingGroupsInput, ...func(*autoscaling.Options)) (*autoscaling.DescribeAutoScalingGroupsOutput, error) {
+func (f *fakeAutoScalingClient) DescribeAutoScalingGroups(_ context.Context, input *autoscaling.DescribeAutoScalingGroupsInput, _ ...func(*autoscaling.Options)) (*autoscaling.DescribeAutoScalingGroupsOutput, error) {
+	f.describeInputs = append(f.describeInputs, input)
+
 	return &autoscaling.DescribeAutoScalingGroupsOutput{AutoScalingGroups: f.groups}, nil
 }
 
@@ -75,6 +78,8 @@ func TestASGSnapshotReadsProtectionMembershipAndLaunchTime(t *testing.T) {
 	require.True(t, snapshot.NewInstancesProtectedFromScaleIn)
 	require.True(t, snapshot.Instances["i-0"].ProtectedFromScaleIn)
 	require.Equal(t, launch, *snapshot.Instances["i-0"].LaunchTime)
+	require.Len(t, client.describeInputs, 1)
+	require.True(t, aws.ToBool(client.describeInputs[0].IncludeInstances))
 }
 
 func TestASGSnapshotRejectsUnknownGroupProtection(t *testing.T) {
@@ -106,6 +111,17 @@ func TestASGDesiredCapacityRequiresExactCompleteGroup(t *testing.T) {
 			require.ErrorContains(t, err, tc.want)
 		})
 	}
+}
+
+func TestASGDesiredCapacityExcludesInstanceDetails(t *testing.T) {
+	t.Parallel()
+
+	client := completeASG(1)
+	desired, err := NewASG(client, nil).DesiredCapacity(t.Context(), "workers")
+	require.NoError(t, err)
+	require.Equal(t, int32(1), desired)
+	require.Len(t, client.describeInputs, 1)
+	require.False(t, aws.ToBool(client.describeInputs[0].IncludeInstances))
 }
 
 func TestASGSnapshotFailsClosedWhenEC2LaunchTimeIsMissing(t *testing.T) {

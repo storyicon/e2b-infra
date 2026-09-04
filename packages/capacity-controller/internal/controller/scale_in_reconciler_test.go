@@ -22,6 +22,7 @@ type scaleInWorld struct {
 	protectionErr            error
 	protectionErrBeforeApply bool
 	desiredErr               error
+	snapshotASGErr           error
 	listErr                  error
 	beginErr                 error
 	verifyErr                error
@@ -41,6 +42,10 @@ type scaleInWorld struct {
 	restoreCalls             int
 	completeCalls            int
 	beginCalls               int
+	desiredCalls             int
+	readyCalls               int
+	inventoryCalls           int
+	snapshotASGCalls         int
 	listCalls                int
 	verifyCalls              int
 	cancelCalls              int
@@ -105,10 +110,14 @@ func (w *scaleInWorld) Snapshot(context.Context, string) (CapacitySnapshot, erro
 }
 
 func (w *scaleInWorld) ReadyCount(context.Context, string) (int32, error) {
+	w.readyCalls++
+
 	return int32(len(w.nodes)), nil
 }
 
 func (w *scaleInWorld) DesiredCapacity(context.Context, string) (int32, error) {
+	w.desiredCalls++
+
 	return w.cloud.DesiredCapacity, nil
 }
 
@@ -120,6 +129,8 @@ func (w *scaleInWorld) SetDesiredCapacity(_ context.Context, _ string, desired i
 }
 
 func (w *scaleInWorld) Inventory(context.Context, string) ([]NomadScaleInNode, error) {
+	w.inventoryCalls++
+
 	return slices.Clone(w.nodes), nil
 }
 
@@ -303,7 +314,9 @@ func (w *scaleInWorld) SetInstanceProtection(_ context.Context, _ string, ids []
 type worldInfrastructure struct{ world *scaleInWorld }
 
 func (i worldInfrastructure) Snapshot(context.Context, string) (ScaleInASGSnapshot, error) {
-	return i.world.cloud, nil
+	i.world.snapshotASGCalls++
+
+	return i.world.cloud, i.world.snapshotASGErr
 }
 
 func (i worldInfrastructure) SetInstanceProtection(ctx context.Context, asg string, ids []string, protected bool) error {
@@ -311,9 +324,54 @@ func (i worldInfrastructure) SetInstanceProtection(ctx context.Context, asg stri
 }
 
 func newTestScaleInReconciler(w *scaleInWorld) *Reconciler {
-	cfg := &Config{Mode: ModeStartIntentV1, ClusterID: "cluster", NodePool: "default", ASGName: "workers", SlotsPerNode: 1, MinNodes: 1, MaxNodes: 1000, ReconcileTimeout: time.Minute, ScaleInMode: ScaleInModeEnforce, ScaleInHeadroom: 0, ScaleInStableFor: 0, ScaleInMinimumAge: 0, ScaleInTimeout: time.Hour}
+	cfg := &Config{Mode: ModeStartIntentV1, ClusterID: "cluster", NodePool: "default", ASGName: "workers", SlotsPerNode: 1, MinNodes: 1, MaxNodes: 1000, BatchIdleDuration: time.Millisecond, BatchMaxDuration: time.Second, ReconcileTimeout: time.Minute, ScaleInMode: ScaleInModeEnforce, ScaleInHeadroom: 0, ScaleInStableFor: 0, ScaleInMinimumAge: 0, ScaleInTimeout: time.Hour}
 
 	return NewWithScaleIn(cfg, nil, w, w, w, w, w, worldInfrastructure{w})
+}
+
+func TestStartIntentSteadyStateReusesOneScaleInObservation(t *testing.T) {
+	t.Parallel()
+
+	w := newScaleInWorld(3, true)
+	r := newTestScaleInReconciler(w)
+	r.config.ScaleInStableFor = time.Hour
+
+	result, err := r.Reconcile(t.Context(), time.Now())
+	require.NoError(t, err)
+	require.Equal(t, int32(2), result.ScaleInExcess)
+	require.Equal(t, 1, w.desiredCalls)
+	require.Zero(t, w.readyCalls)
+	require.Equal(t, 1, w.inventoryCalls)
+	require.Equal(t, 1, w.listCalls)
+	require.Equal(t, 1, w.snapshotASGCalls)
+	require.Empty(t, w.protectionWrites)
+	require.Empty(t, w.desiredWrites)
+
+	_, err = r.Reconcile(t.Context(), time.Now().Add(time.Second))
+	require.NoError(t, err)
+	require.Equal(t, 2, w.desiredCalls)
+	require.Zero(t, w.readyCalls)
+	require.Equal(t, 2, w.inventoryCalls)
+	require.Equal(t, 2, w.listCalls)
+	require.Equal(t, 2, w.snapshotASGCalls, "scale-in observations must not be cached across reconciles")
+}
+
+func TestStartIntentDoesNotRetryFailedScaleInObservationInSameReconcile(t *testing.T) {
+	t.Parallel()
+
+	w := newScaleInWorld(3, true)
+	w.snapshotASGErr = errors.New("throttled")
+
+	result, err := newTestScaleInReconciler(w).Reconcile(t.Context(), time.Now())
+	require.NoError(t, err, "scale-in observation must not block the raw scale-out path")
+	require.ErrorContains(t, result.ScaleInReadError, "throttled")
+	require.Equal(t, 1, w.desiredCalls)
+	require.Equal(t, 1, w.readyCalls, "independent readiness diagnostics remain available")
+	require.Equal(t, 1, w.inventoryCalls)
+	require.Equal(t, 1, w.listCalls)
+	require.Equal(t, 1, w.snapshotASGCalls)
+	require.Empty(t, w.protectionWrites)
+	require.Empty(t, w.desiredWrites)
 }
 
 func TestScaleInRepairsProtectionBaselineBeforeAnyDesiredWrite(t *testing.T) {
@@ -989,4 +1047,44 @@ func TestScaleInModel500WorkersUsesSettledBatchesOfAtMost50(t *testing.T) {
 		})
 	}
 	require.Equal(t, []int32{450, 400, 350, 300, 250, 200, 150, 100, 50, 1}, w.desiredWrites)
+}
+
+func TestScaleInOpensAndRemovesOneFullEmptyWorkerBatch(t *testing.T) {
+	t.Parallel()
+
+	w := newScaleInWorld(50, true)
+	r := newTestScaleInReconciler(w)
+	now := time.Now()
+	w.candidates = make([]ScaleInCandidateObservation, 0, len(w.nodes))
+	for _, node := range w.nodes {
+		state := w.workers[node.NodeID]
+		w.candidates = append(w.candidates, ScaleInCandidateObservation{
+			NodeID: node.NodeID, NomadNodeID: node.NomadNodeID, ServiceInstanceID: state.ServiceInstanceID,
+			ServiceStatus: "ready", ScaleInProtocolSupport: true, ObservedAt: now,
+		})
+	}
+
+	result, err := r.reconcileScaleIn(t.Context(), now, 0)
+	require.NoError(t, err)
+	require.False(t, result.ScaleInStable)
+	require.Empty(t, w.desiredWrites)
+
+	result, err = r.reconcileScaleIn(t.Context(), now.Add(time.Second), 0)
+	require.NoError(t, err)
+	require.Equal(t, int32(49), result.ScaleInDraining)
+	require.Equal(t, 49, w.beginCalls)
+	require.Empty(t, w.desiredWrites)
+
+	result, err = r.reconcileScaleIn(t.Context(), now.Add(2*time.Second), 0)
+	require.NoError(t, err)
+	require.Len(t, w.protectionWrites, 1)
+	require.Len(t, w.protectionWrites[0].ids, 49)
+	require.False(t, w.protectionWrites[0].protected)
+	require.Empty(t, w.desiredWrites)
+
+	result, err = r.reconcileScaleIn(t.Context(), now.Add(3*time.Second), 0)
+	require.NoError(t, err)
+	require.True(t, result.Scaled)
+	require.Equal(t, int32(1), result.TargetNodes)
+	require.Equal(t, []int32{1}, w.desiredWrites)
 }

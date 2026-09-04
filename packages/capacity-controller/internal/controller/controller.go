@@ -214,11 +214,12 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, cu
 	rawRequired := ceilDiv(snapshot.WorkloadCount, int64(r.config.SlotsPerNode))
 	required := rawRequired
 	rawGrowth := rawRequired > int64(desired)
+	var steadyScaleInObservation *scaleInObservation
 	// Raw demand growth takes priority over every scale-in observation. Apply
 	// that increase first; only then observe and compensate already-draining
 	// workers so continuous demand growth cannot starve either path.
 	if r.config.ScaleInMode == ScaleInModeEnforce && !rawGrowth {
-		compensatedRequired, scaleInErr := r.scaleOutRequiredForEnforceAt(ctx, currentTime, required)
+		observation, scaleInErr := r.readScaleInObservation(ctx, currentTime)
 		if scaleInErr != nil {
 			// Scale-in observations may only increase a scale-out target. If they
 			// are unavailable, reset stabilization and preserve the authoritative
@@ -226,9 +227,10 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, cu
 			if r.scaleIn != nil {
 				r.scaleIn.stabilizer.Reset()
 			}
-			result.ScaleInReadError = scaleInErr
+			result.ScaleInReadError = fmt.Errorf("read scale-in inputs before scale-out: %w", scaleInErr)
 		} else {
-			required = compensatedRequired
+			required = scaleOutRequiredFromObservation(required, observation)
+			steadyScaleInObservation = &observation
 		}
 	}
 	uncapped := max(int64(desired), required, int64(r.config.MinNodes))
@@ -240,7 +242,11 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, cu
 		if !ready {
 			result.TargetNodes = desired
 			result.Aggregating = true
-			result = r.observeReadyNodes(ctx, result)
+			if steadyScaleInObservation != nil {
+				result = observeReadyNodesFromInventory(result, steadyScaleInObservation.nomadNodes)
+			} else {
+				result = r.observeReadyNodes(ctx, result)
+			}
 
 			return r.reconcileExistingScaleInOperations(ctx, currentTime, snapshot.WorkloadCount, result), nil
 		}
@@ -289,11 +295,20 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, cu
 		r.startIntentBatch = startIntentBatch{}
 	}
 
-	result = r.observeReadyNodes(ctx, result)
+	if steadyScaleInObservation != nil {
+		result = observeReadyNodesFromInventory(result, steadyScaleInObservation.nomadNodes)
+	} else {
+		result = r.observeReadyNodes(ctx, result)
+	}
 	if result.Scaled || result.Aggregating {
 		return r.reconcileExistingScaleInOperations(ctx, currentTime, snapshot.WorkloadCount, result), nil
 	}
-
+	if steadyScaleInObservation != nil {
+		return r.reconcileScaleInObservation(ctx, currentTime, snapshot.WorkloadCount, result, true, *steadyScaleInObservation)
+	}
+	if result.ScaleInReadError != nil {
+		return result, nil
+	}
 	return r.reconcileScaleInAt(ctx, currentTime, snapshot.WorkloadCount, result, true)
 }
 
@@ -396,6 +411,17 @@ func (r *Reconciler) observeReadyNodes(ctx context.Context, result Result) Resul
 		return result
 	}
 	result.ReadyNodes = ready
+	result.ReadyNodesObserved = true
+
+	return result
+}
+
+func observeReadyNodesFromInventory(result Result, nodes []NomadScaleInNode) Result {
+	for _, node := range nodes {
+		if node.Ready && node.Eligible {
+			result.ReadyNodes++
+		}
+	}
 	result.ReadyNodesObserved = true
 
 	return result

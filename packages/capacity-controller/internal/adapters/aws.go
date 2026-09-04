@@ -41,7 +41,7 @@ func NewASG(client AutoScalingClient, ec2Client EC2Client) *ASG {
 }
 
 func (a *ASG) DesiredCapacity(ctx context.Context, asgName string) (int32, error) {
-	group, err := a.describeGroup(ctx, asgName)
+	group, err := a.describeGroup(ctx, asgName, false)
 	if err != nil {
 		return 0, err
 	}
@@ -53,7 +53,7 @@ func (a *ASG) DesiredCapacity(ctx context.Context, asgName string) (int32, error
 }
 
 func (a *ASG) Snapshot(ctx context.Context, asgName string) (ASGSnapshot, error) {
-	group, err := a.describeGroup(ctx, asgName)
+	group, err := a.describeGroup(ctx, asgName, true)
 	if err != nil {
 		return ASGSnapshot{}, err
 	}
@@ -197,9 +197,10 @@ func (a *ASG) populateLaunchTimes(ctx context.Context, instances map[string]ASGI
 	return nil
 }
 
-func (a *ASG) describeGroup(ctx context.Context, asgName string) (*types.AutoScalingGroup, error) {
+func (a *ASG) describeGroup(ctx context.Context, asgName string, includeInstances bool) (*types.AutoScalingGroup, error) {
 	output, err := a.client.DescribeAutoScalingGroups(ctx, &autoscaling.DescribeAutoScalingGroupsInput{
 		AutoScalingGroupNames: []string{asgName},
+		IncludeInstances:      aws.Bool(includeInstances),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("describe Auto Scaling group: %w", err)

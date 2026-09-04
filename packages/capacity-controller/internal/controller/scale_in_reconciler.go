@@ -11,8 +11,7 @@ import (
 )
 
 const (
-	maxScaleInProgressPerReconcile = 10
-	scaleInCandidateMaxAge         = 40 * time.Second
+	scaleInCandidateMaxAge = 40 * time.Second
 )
 
 type scaleInRuntime struct {
@@ -24,6 +23,13 @@ type scaleInRuntime struct {
 	operationCursor uint64
 	cancelCursor    uint64
 	candidateCursor uint64
+}
+
+type scaleInObservation struct {
+	nomadNodes       []NomadScaleInNode
+	workerCandidates []ScaleInCandidateObservation
+	cloud            ScaleInASGSnapshot
+	observedAt       time.Time
 }
 
 func NewWithScaleIn(config *Config, demand DemandReader, snapshot CapacitySnapshotReader, nodes NodeCounter, target ScaleTarget, inventory ScaleInNodeInventory, workers ScaleInWorkerControl, infrastructure ScaleInInfrastructure, audits ...AuditSink) *Reconciler {
@@ -41,26 +47,22 @@ func (r *Reconciler) scaleOutRequiredForEnforceAt(ctx context.Context, currentTi
 	if err := r.requireScaleInDependencies(); err != nil {
 		return 0, err
 	}
-	nomadNodes, err := r.scaleIn.inventory.Inventory(ctx, r.config.NodePool)
+	observation, err := r.readScaleInObservation(ctx, currentTime)
 	if err != nil {
-		return 0, fmt.Errorf("read owned drains before scale-out: %w", err)
-	}
-	workers, err := r.scaleIn.workers.ListScaleInCandidates(ctx, r.config.ClusterID)
-	if err != nil {
-		return 0, fmt.Errorf("read workers before scale-out: %w", err)
-	}
-	cloud, err := r.scaleIn.infrastructure.Snapshot(ctx, r.config.ASGName)
-	if err != nil {
-		return 0, fmt.Errorf("read ASG before scale-out: %w", err)
+		return 0, fmt.Errorf("read scale-in inputs before scale-out: %w", err)
 	}
 
+	return scaleOutRequiredFromObservation(rawRequired, observation), nil
+}
+
+func scaleOutRequiredFromObservation(rawRequired int64, observation scaleInObservation) int64 {
 	unavailable := make(map[string]struct{})
-	for _, node := range activeScaleInOperations(nomadNodes) {
-		instance, member := cloud.Instances[node.NodeID]
+	for _, node := range activeScaleInOperations(observation.nomadNodes) {
+		instance, member := observation.cloud.Instances[node.NodeID]
 		if !member {
 			continue
 		}
-		if instance.LifecycleState == "InService" && operationSupersededByReadyWorker(currentTime(), node, workers, nomadNodes) {
+		if instance.LifecycleState == "InService" && operationSupersededByReadyWorker(observation.observedAt, node, observation.workerCandidates, observation.nomadNodes) {
 			continue
 		}
 		unavailable[node.NodeID] = struct{}{}
@@ -69,10 +71,10 @@ func (r *Reconciler) scaleOutRequiredForEnforceAt(ctx context.Context, currentTi
 	// Once desired capacity is below current membership, that difference is an
 	// already-committed scale-in. Do not replace owned drains that ASG is already
 	// removing; only compensate drains that still occupy desired capacity.
-	committedScaleIn := max(int32(0), int32(len(cloud.Instances))-cloud.DesiredCapacity)
+	committedScaleIn := max(int32(0), int32(len(observation.cloud.Instances))-observation.cloud.DesiredCapacity)
 	uncommittedOwnedDrains := max(int32(0), int32(len(unavailable))-committedScaleIn)
 
-	return ScaleOutRequired(rawRequired, uncommittedOwnedDrains, ScaleInModeEnforce), nil
+	return ScaleOutRequired(rawRequired, uncommittedOwnedDrains, ScaleInModeEnforce)
 }
 
 func (r *Reconciler) requireScaleInDependencies() error {
@@ -98,25 +100,43 @@ func (r *Reconciler) reconcileScaleInAt(ctx context.Context, currentTime func() 
 		return result, err
 	}
 
-	nomadNodes, err := r.scaleIn.inventory.Inventory(ctx, r.config.NodePool)
+	observation, err := r.readScaleInObservation(ctx, currentTime)
 	if err != nil {
 		r.scaleIn.stabilizer.Reset()
 
-		return result, fmt.Errorf("read scale-in Nomad inventory: %w", err)
+		return result, err
+	}
+
+	return r.reconcileScaleInObservation(ctx, currentTime, workloadCount, result, allowNewDrains, observation)
+}
+
+func (r *Reconciler) readScaleInObservation(ctx context.Context, currentTime func() time.Time) (scaleInObservation, error) {
+	nomadNodes, err := r.scaleIn.inventory.Inventory(ctx, r.config.NodePool)
+	if err != nil {
+		return scaleInObservation{}, fmt.Errorf("read scale-in Nomad inventory: %w", err)
 	}
 	workerCandidates, err := r.scaleIn.workers.ListScaleInCandidates(ctx, r.config.ClusterID)
 	if err != nil {
-		r.scaleIn.stabilizer.Reset()
-
-		return result, fmt.Errorf("read worker scale-in candidates: %w", err)
+		return scaleInObservation{}, fmt.Errorf("read worker scale-in candidates: %w", err)
 	}
 	cloud, err := r.scaleIn.infrastructure.Snapshot(ctx, r.config.ASGName)
 	if err != nil {
-		r.scaleIn.stabilizer.Reset()
-
-		return result, fmt.Errorf("read scale-in ASG snapshot: %w", err)
+		return scaleInObservation{}, fmt.Errorf("read scale-in ASG snapshot: %w", err)
 	}
-	observationTime := currentTime()
+
+	return scaleInObservation{
+		nomadNodes:       nomadNodes,
+		workerCandidates: workerCandidates,
+		cloud:            cloud,
+		observedAt:       currentTime(),
+	}, nil
+}
+
+func (r *Reconciler) reconcileScaleInObservation(ctx context.Context, currentTime func() time.Time, workloadCount int64, result Result, allowNewDrains bool, observation scaleInObservation) (Result, error) {
+	nomadNodes := observation.nomadNodes
+	workerCandidates := observation.workerCandidates
+	cloud := observation.cloud
+	observationTime := observation.observedAt
 	r.pruneScaleInCooldown(observationTime, cloud.Instances)
 
 	nodes := mergeScaleInNodes(observationTime, nomadNodes, workerCandidates, cloud)
@@ -393,7 +413,7 @@ func (r *Reconciler) openDrains(ctx context.Context, currentTime func() time.Tim
 	}
 	var attempts, nonEmpty, draining, cancelled int32
 	for _, candidate := range rotateScaleInCandidates(EligibleScaleInCandidates(nodes, observationTime, r.config.ScaleInMinimumAge), r.scaleIn.candidateCursor) {
-		if available <= 0 || attempts >= maxScaleInProgressPerReconcile {
+		if available <= 0 || attempts >= ScaleInGlobalBudget {
 			break
 		}
 		if err := ctx.Err(); err != nil {
