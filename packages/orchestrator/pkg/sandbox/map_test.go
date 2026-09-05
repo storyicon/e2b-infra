@@ -24,6 +24,22 @@ func TestMapMarkRunningTracksLifecycle(t *testing.T) {
 	require.Len(t, sandboxes.LifecycleItems(), 1)
 }
 
+func TestMapTrackLifecycleBlocksCleanupWithoutMakingSandboxLive(t *testing.T) {
+	t.Parallel()
+
+	sandboxes := NewSandboxesMap()
+	sbx := testMapSandbox(t, "lifecycle-1")
+
+	sandboxes.TrackLifecycle(t.Context(), sbx)
+	require.Empty(t, sandboxes.Items())
+	require.Len(t, sandboxes.LifecycleItems(), 1)
+
+	// Promotion is idempotent with the already-tracked lifecycle.
+	sandboxes.MarkRunning(t.Context(), sbx)
+	require.Len(t, sandboxes.Items(), 1)
+	require.Len(t, sandboxes.LifecycleItems(), 1)
+}
+
 func TestMapLifecycleItemsRemainAfterMarkStopping(t *testing.T) {
 	t.Parallel()
 

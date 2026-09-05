@@ -11,6 +11,7 @@ import (
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	nomadapi "github.com/hashicorp/nomad/api"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -63,6 +64,10 @@ func (slogAuditSink) Record(event controller.ScaleAuditEvent) {
 		"error", event.Error,
 		"audit_dropped_total", event.AuditDroppedTotal,
 		"checkpoint_generated_epoch_ms", checkpointGeneratedEpochMs,
+		"scale_in_operation_id", event.ScaleInOperationID,
+		"scale_in_node_id", event.ScaleInNodeID,
+		"scale_in_stage", event.ScaleInStage,
+		"scale_in_reason", event.ScaleInReason,
 	)
 }
 
@@ -74,6 +79,7 @@ func run(ctx context.Context) error {
 
 	var demandReader controller.DemandReader
 	var snapshotReader controller.CapacitySnapshotReader
+	var scaleInWorkers controller.ScaleInWorkerControl
 	switch cfg.Mode {
 	case controller.ModeLegacyFailureLedger:
 		redisClient, err := sharedfactories.NewRedisClient(ctx, sharedfactories.RedisConfig{
@@ -108,10 +114,12 @@ func run(ctx context.Context) error {
 				slog.Error("close capacity snapshot gRPC connection", "error", err)
 			}
 		}()
-		snapshotReader = adapters.NewCapacitySnapshot(
+		capacityAdapter := adapters.NewCapacitySnapshot(
 			proxygrpc.NewCapacityServiceClient(conn),
 			cfg.CapacitySnapshotServiceToken,
 		)
+		snapshotReader = capacityAdapter
+		scaleInWorkers = capacityAdapter
 	default:
 		return fmt.Errorf("unsupported capacity demand mode %q", cfg.Mode)
 	}
@@ -127,7 +135,7 @@ func run(ctx context.Context) error {
 	audit := controller.NewAsyncAuditSink(slogAuditSink{}, 128)
 	defer audit.Close()
 
-	reconciler := controller.New(&controller.Config{
+	controllerConfig := &controller.Config{
 		Mode:              cfg.Mode,
 		ClusterID:         cfg.ClusterID,
 		NodePool:          cfg.NomadNodePool,
@@ -138,7 +146,20 @@ func run(ctx context.Context) error {
 		BatchIdleDuration: cfg.BatchIdleDuration,
 		BatchMaxDuration:  cfg.BatchMaxDuration,
 		ReconcileTimeout:  cfg.ReconcileTimeout,
-	}, demandReader, snapshotReader, adapters.NewNomad(nomadClient), adapters.NewASG(autoscaling.NewFromConfig(awsCfg)), audit)
+		ScaleInMode:       cfg.ScaleInMode,
+		ScaleInHeadroom:   cfg.ScaleInHeadroomPercent,
+		ScaleInStableFor:  cfg.ScaleInStabilization,
+		ScaleInMinimumAge: cfg.ScaleInMinimumNodeAge,
+		ScaleInTimeout:    cfg.ScaleInDrainTimeout,
+	}
+	nomadAdapter := adapters.NewNomad(nomadClient)
+	asgAdapter := adapters.NewASG(autoscaling.NewFromConfig(awsCfg), ec2.NewFromConfig(awsCfg))
+	var reconciler *controller.Reconciler
+	if cfg.ScaleInMode == controller.ScaleInModeOff {
+		reconciler = controller.New(controllerConfig, demandReader, snapshotReader, nomadAdapter, asgAdapter, audit)
+	} else {
+		reconciler = controller.NewWithScaleIn(controllerConfig, demandReader, snapshotReader, nomadAdapter, asgAdapter, nomadAdapter, scaleInWorkers, asgAdapter, audit)
+	}
 
 	ticker := time.NewTicker(cfg.ReconcileInterval)
 	defer ticker.Stop()
@@ -155,6 +176,13 @@ func run(ctx context.Context) error {
 				"desired_nodes", result.DesiredNodes,
 				"target_nodes", result.TargetNodes,
 				"capped", result.Capped,
+				"scale_in_safe_required", result.ScaleInSafeRequired,
+				"scale_in_accepting", result.ScaleInAccepting,
+				"scale_in_excess", result.ScaleInExcess,
+				"scale_in_draining", result.ScaleInDraining,
+				"scale_in_cancelled", result.ScaleInCancelled,
+				"scale_in_terminated", result.ScaleInTerminated,
+				"scale_in_stable", result.ScaleInStable,
 				"outcome", "error",
 				"error", err,
 			)
@@ -172,6 +200,13 @@ func run(ctx context.Context) error {
 				"capped", result.Capped,
 				"scaled", result.Scaled,
 				"aggregating", result.Aggregating,
+				"scale_in_safe_required", result.ScaleInSafeRequired,
+				"scale_in_accepting", result.ScaleInAccepting,
+				"scale_in_excess", result.ScaleInExcess,
+				"scale_in_draining", result.ScaleInDraining,
+				"scale_in_cancelled", result.ScaleInCancelled,
+				"scale_in_terminated", result.ScaleInTerminated,
+				"scale_in_stable", result.ScaleInStable,
 				"outcome", "success",
 			)
 			if result.ReadyNodesError != nil {
@@ -181,6 +216,15 @@ func run(ctx context.Context) error {
 					"target_nodes", result.TargetNodes,
 					"scaled", result.Scaled,
 					"error", result.ReadyNodesError,
+				)
+			}
+			if result.ScaleInReadError != nil {
+				slog.Warn("scale-in observation unavailable; scale-out used raw workload demand",
+					"mode", result.Mode,
+					"desired_nodes", result.DesiredNodes,
+					"target_nodes", result.TargetNodes,
+					"scaled", result.Scaled,
+					"error", result.ScaleInReadError,
 				)
 			}
 		}

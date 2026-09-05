@@ -30,7 +30,7 @@ func TestEvictSandbox_ReasonByAction(t *testing.T) {
 	counter, err := telemetry.GetCounter(noop.NewMeterProvider().Meter("github.com/e2b-dev/infra/packages/api/internal/orchestrator/evictor"), telemetry.ApiEvictorFsOnlyAutoPause)
 	require.NoError(t, err)
 
-	runOn := func(autoPause, autoPauseFilesystemOnly bool, fcVersion string) sandbox.RemoveOpts {
+	runOn := func(state sandbox.State, autoPause, autoPauseFilesystemOnly bool, fcVersion string) sandbox.RemoveOpts {
 		var got sandbox.RemoveOpts
 		called := false
 		e := &Evictor{
@@ -52,6 +52,8 @@ func TestEvictSandbox_ReasonByAction(t *testing.T) {
 		e.evictSandbox(t.Context(), sandbox.Sandbox{
 			SandboxID:               "sbx",
 			TeamID:                  uuid.New(),
+			ExecutionID:             "exec-1",
+			State:                   state,
 			AutoPause:               autoPause,
 			AutoPauseFilesystemOnly: autoPauseFilesystemOnly,
 			FirecrackerVersion:      fcVersion,
@@ -63,7 +65,7 @@ func TestEvictSandbox_ReasonByAction(t *testing.T) {
 		return got
 	}
 	run := func(autoPause, autoPauseFilesystemOnly bool) sandbox.RemoveOpts {
-		return runOn(autoPause, autoPauseFilesystemOnly, "v1.14-0.2.0")
+		return runOn(sandbox.StateRunning, autoPause, autoPauseFilesystemOnly, "v1.14-0.2.0")
 	}
 
 	t.Run("kill carries timeout reason", func(t *testing.T) {
@@ -74,6 +76,13 @@ func TestEvictSandbox_ReasonByAction(t *testing.T) {
 		assert.Equal(t, sandbox.StateActionKill, got.Action)
 		assert.True(t, got.Eviction)
 		assert.Equal(t, sandbox.KillReasonTimeout, got.Reason)
+	})
+
+	t.Run("removal is pinned to the scanned execution", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Equal(t, "exec-1", run(false, false).ExpectExecutionID)
+		assert.Equal(t, "exec-1", run(true, false).ExpectExecutionID)
 	})
 
 	t.Run("kill ignores the auto-pause snapshot kind", func(t *testing.T) {
@@ -114,26 +123,103 @@ func TestEvictSandbox_ReasonByAction(t *testing.T) {
 		assert.True(t, got.FilesystemOnly)
 	})
 
-	// The degrade: an fs-only policy on an FC whose release predates
-	// filesystem-only snapshots (or whose version cannot be parsed) must
-	// still PAUSE — with memory — never refuse or kill; a refusal here would
-	// retry the eviction forever and any later refusal strands the VM for
-	// the orphan reconciler.
-	t.Run("filesystem-only auto-pause degrades to memory on a pre-0.2.0 release", func(t *testing.T) {
+	// No version gate: the fs-only policy is honored on every FC version,
+	// legacy and unparsable included — producing a filesystem-only snapshot
+	// needs no version-gated capability.
+	t.Run("filesystem-only auto-pause is honored on a legacy release", func(t *testing.T) {
 		t.Parallel()
 
-		got := runOn(true, true, "v1.14.1_431f1fc")
+		got := runOn(sandbox.StateRunning, true, true, "v1.14.1_431f1fc")
 
 		assert.Equal(t, sandbox.StateActionPause, got.Action)
+		assert.True(t, got.FilesystemOnly)
+	})
+
+	t.Run("filesystem-only auto-pause is honored on an unparsable version", func(t *testing.T) {
+		t.Parallel()
+
+		got := runOn(sandbox.StateRunning, true, true, "")
+
+		assert.Equal(t, sandbox.StateActionPause, got.Action)
+		assert.True(t, got.FilesystemOnly)
+	})
+
+	t.Run("auto-pause leftover in killing is killed not paused", func(t *testing.T) {
+		t.Parallel()
+
+		got := runOn(sandbox.StateKilling, true, true, "v1.14-0.2.0")
+
+		assert.Equal(t, sandbox.StateActionKill, got.Action)
+		assert.True(t, got.Eviction)
+		assert.Equal(t, sandbox.KillReasonTimeout, got.Reason)
 		assert.False(t, got.FilesystemOnly)
 	})
 
-	t.Run("filesystem-only auto-pause degrades to memory on an unparsable version", func(t *testing.T) {
+	t.Run("auto-pause leftover that can still pause is paused", func(t *testing.T) {
 		t.Parallel()
 
-		got := runOn(true, true, "")
+		for _, state := range []sandbox.State{sandbox.StatePausing, sandbox.StateSnapshotting} {
+			t.Run(string(state), func(t *testing.T) {
+				t.Parallel()
 
-		assert.Equal(t, sandbox.StateActionPause, got.Action)
-		assert.False(t, got.FilesystemOnly)
+				got := runOn(state, true, true, "v1.14-0.2.0")
+
+				assert.Equal(t, sandbox.StateActionPause, got.Action)
+				assert.True(t, got.FilesystemOnly)
+			})
+		}
 	})
+}
+
+func TestCanTake(t *testing.T) {
+	t.Parallel()
+
+	assert.True(t, canTake(sandbox.StateRunning, sandbox.StateActionPause))
+	assert.True(t, canTake(sandbox.StatePausing, sandbox.StateActionPause))
+	assert.True(t, canTake(sandbox.StateSnapshotting, sandbox.StateActionPause))
+	assert.False(t, canTake(sandbox.StateKilling, sandbox.StateActionPause))
+	assert.True(t, canTake(sandbox.StateKilling, sandbox.StateActionKill))
+}
+
+func TestIsStaleDecision(t *testing.T) {
+	t.Parallel()
+
+	t.Run("state moved since the scan", func(t *testing.T) {
+		t.Parallel()
+
+		err := &sandbox.InvalidStateTransitionError{
+			CurrentState: sandbox.StateKilling,
+			TargetState:  sandbox.StatePausing,
+		}
+		assert.True(t, isStaleDecision(err, sandbox.StateRunning))
+		assert.True(t, isKnownEvictionError(err, sandbox.StateRunning))
+	})
+
+	t.Run("refusal from the scanned state stays a failure", func(t *testing.T) {
+		t.Parallel()
+
+		// An unknown state is refused from the same state it was scanned in.
+		// Nothing moved; the record is broken.
+		err := &sandbox.InvalidStateTransitionError{
+			CurrentState: "",
+			TargetState:  sandbox.StateKilling,
+		}
+		assert.False(t, isStaleDecision(err, ""))
+		assert.False(t, isKnownEvictionError(err, ""))
+	})
+
+	t.Run("other errors are not stale decisions", func(t *testing.T) {
+		t.Parallel()
+
+		assert.False(t, isStaleDecision(sandbox.ErrNotFound, sandbox.StateRunning))
+	})
+}
+
+func TestIsGone(t *testing.T) {
+	t.Parallel()
+
+	assert.True(t, isGone(sandbox.ErrNotFound))
+	assert.True(t, isGone(sandbox.ErrExecutionMismatch))
+	assert.True(t, isKnownEvictionError(sandbox.ErrExecutionMismatch, sandbox.StateRunning))
+	assert.False(t, isGone(sandbox.ErrEvictionNotNeeded))
 }

@@ -31,6 +31,7 @@ func newTestAutoResumeOrchestrator(t *testing.T) *Orchestrator {
 	return &Orchestrator{
 		sandboxStore: sandbox.NewStore(
 			storage,
+			storage,
 			redisreservations.NewReservationStorage(client, storage.Notifier()),
 			sandbox.Callbacks{
 				AddSandboxToRoutingTable: func(context.Context, sandbox.Sandbox) error { return nil },
@@ -61,10 +62,10 @@ func addSandbox(t *testing.T, o *Orchestrator, sbx sandbox.Sandbox) {
 
 func registerNode(o *Orchestrator, sbx sandbox.Sandbox, ip string) {
 	o.registerNode(&nodemanager.Node{
-		ID:               sbx.NodeID,
-		ClusterID:        sbx.ClusterID,
-		IPAddress:        ip,
-		NomadNodeShortID: "test-node",
+		ID:         sbx.NodeID,
+		ClusterID:  sbx.ClusterID,
+		IPAddress:  ip,
+		WorkloadID: "test-node",
 	})
 }
 

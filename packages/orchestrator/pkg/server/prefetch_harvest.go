@@ -15,12 +15,15 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
+	grpcCodes "google.golang.org/grpc/codes"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
 	sbxtemplate "github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
+	orchestratorgrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
+	orchestratorinfo "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator-info"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
@@ -152,9 +155,11 @@ type prefetchHarvester struct {
 	templates harvestTemplates
 	// uploadMetadata re-uploads the prefetch-enriched metadata object remotely.
 	uploadMetadata func(ctx context.Context, meta metadata.Template, objectMetadata storage.ObjectMetadata) error
-	// acquire bounds concurrent harvests; release frees the slot acquire took.
-	acquire func(context.Context) error
-	release func()
+	// acquire bounds concurrent harvests and returns one release for both the
+	// worker admission token and the start slot.
+	acquire func(context.Context) (func(), error)
+	// reapFailed makes an unproven throwaway cleanup fail closed for shutdown.
+	reapFailed func(context.Context, error)
 	// persistBudget caps the persist's wait on the in-flight snapshot upload.
 	// Zero means the upload's own retry budget, which is the only bound that
 	// cannot cut a still-landing upload short. Tests set it to keep the wait short.
@@ -168,8 +173,25 @@ func (s *Server) newPrefetchHarvester() *prefetchHarvester {
 		uploadMetadata: func(ctx context.Context, meta metadata.Template, objectMetadata storage.ObjectMetadata) error {
 			return metadata.UploadMetadata(ctx, s.persistence, meta, objectMetadata)
 		},
-		acquire: s.waitForAcquire,
-		release: func() { s.startingSandboxes.Release(1) },
+		acquire: func(ctx context.Context) (func(), error) {
+			if !s.info.AdmitSandboxStart() {
+				return nil, orchestratorgrpc.NewSandboxCreateError(grpcCodes.ResourceExhausted, orchestratorgrpc.SandboxNodeDrainingReason, "node is draining", true)
+			}
+			if err := s.waitForAcquire(ctx); err != nil {
+				s.info.FinishSandboxStart()
+
+				return nil, err
+			}
+
+			return func() {
+				s.startingSandboxes.Release(1)
+				s.info.FinishSandboxStart()
+			}, nil
+		},
+		reapFailed: func(ctx context.Context, err error) {
+			s.info.SetStatus(ctx, orchestratorinfo.ServiceInfoStatus_Unhealthy)
+			telemetry.ReportCriticalError(ctx, "prefetch harvest throwaway cleanup failed", err)
+		},
 	}
 }
 
@@ -377,14 +399,15 @@ func (h *prefetchHarvester) resumeMapping(
 	ctx context.Context,
 	sbx *sandbox.Sandbox,
 	buildID string,
-) (*metadata.MemoryPrefetchMapping, harvestOutcome, error) {
+) (mapping *metadata.MemoryPrefetchMapping, outcome harvestOutcome, retErr error) {
 	// Bound concurrent harvests the same way real starts are bounded, so a burst
 	// of pauses can't overcommit the node. If we can't acquire within the
 	// harvest deadline the run is simply skipped (best-effort).
-	if err := h.acquire(ctx); err != nil {
+	release, err := h.acquire(ctx)
+	if err != nil {
 		return nil, harvestSkipped, fmt.Errorf("acquire start slot: %w", err)
 	}
-	defer h.release()
+	defer release()
 
 	// Load the just-written snapshot from the LOCAL cache (warm): the harvest
 	// pays no cold GCS/NFS fetch, only a local re-fault. isSnapshot=true mirrors
@@ -440,11 +463,20 @@ func (h *prefetchHarvester) resumeMapping(
 	defer func() {
 		reapCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), harvestReapTimeout)
 		defer cancel()
-		if stopErr := resumedSbx.Stop(reapCtx); stopErr != nil {
+		stopErr := resumedSbx.Stop(reapCtx)
+		if stopErr != nil {
 			logger.L().Warn(reapCtx, "harvest: failed to stop throwaway", logger.WithSandboxID(runtime.SandboxID), zap.Error(stopErr))
 		}
-		if closeErr := resumedSbx.Close(reapCtx); closeErr != nil {
+		closeErr := resumedSbx.Close(reapCtx)
+		if closeErr != nil {
 			logger.L().Warn(reapCtx, "harvest: failed to close throwaway", logger.WithSandboxID(runtime.SandboxID), zap.Error(closeErr))
+		}
+		reapErr := errors.Join(stopErr, closeErr)
+		if reapErr != nil {
+			if h.reapFailed != nil {
+				h.reapFailed(reapCtx, reapErr)
+			}
+			retErr = errors.Join(retErr, fmt.Errorf("reap throwaway: %w", reapErr))
 		}
 	}()
 

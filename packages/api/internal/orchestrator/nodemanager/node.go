@@ -18,25 +18,46 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/machineinfo"
+	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
 )
 
-const UnknownNomadNodeShortID = "unknown"
+// nodeSource is the discovery source a node came from. The zero value is
+// deliberately invalid: a node has to say where it came from, rather than
+// having it inferred from whichever identity field happens to be unset.
+type nodeSource uint8
 
-type NomadServiceDiscovery struct {
-	NomadNodeShortID string
+const (
+	sourceUnset nodeSource = iota
+	sourceNodePlane
+	sourceClusterRegistry
+)
+
+type NodePlaneInstance struct {
+	WorkloadID string
+	// NomadNodeID is the full Nomad node UUID used for exact scale-in ownership.
+	NomadNodeID string
 
 	OrchestratorAddress string
 	IPAddress           string
+	Backend             string
 }
 
 type Node struct {
-	// Deprecated
-	NomadNodeShortID string
+	source nodeSource
+
+	// WorkloadID is set only by the node plane; the cluster registry keys on
+	// the machine instead.
+	WorkloadID string
+	// NomadNodeID is set only for instances discovered from Nomad.
+	NomadNodeID string
 
 	ID            string
 	ClusterID     uuid.UUID
 	IPAddress     string
 	SandboxDomain *string
+
+	// Backend is the discovery lister this node was found through.
+	Backend string
 
 	client *clusters.GRPCClient
 	status StatusInfo
@@ -54,6 +75,7 @@ type Node struct {
 	machineInfo machineinfo.MachineInfo
 	labels      map[string]struct{}
 	meta        NodeMetadata
+	scaleIn     scaleInObservation
 
 	PlacementMetrics PlacementMetrics
 	// consecutiveCreateUnavailable is replica-local passive health evidence.
@@ -67,7 +89,7 @@ func New(
 	ctx context.Context,
 	tracerProvider trace.TracerProvider,
 	meterProvider metric.MeterProvider,
-	discoveredNode NomadServiceDiscovery,
+	discoveredNode NodePlaneInstance,
 ) (*Node, error) {
 	client, err := NewClient(tracerProvider, meterProvider, discoveredNode.OrchestratorAddress)
 	if err != nil {
@@ -100,11 +122,14 @@ func New(
 	}
 
 	n := &Node{
-		NomadNodeShortID: discoveredNode.NomadNodeShortID,
-		ClusterID:        consts.LocalClusterID,
-		ID:               nodeInfo.GetNodeId(),
-		IPAddress:        discoveredNode.IPAddress,
-		SandboxDomain:    nil,
+		source:        sourceNodePlane,
+		WorkloadID:    discoveredNode.WorkloadID,
+		NomadNodeID:   discoveredNode.NomadNodeID,
+		ClusterID:     consts.LocalClusterID,
+		ID:            nodeInfo.GetNodeId(),
+		IPAddress:     discoveredNode.IPAddress,
+		SandboxDomain: nil,
+		Backend:       discoveredNode.Backend,
 
 		client: client,
 		status: StatusInfo{Status: nodeStatus, ChangedAt: nodeStatusChangedAt},
@@ -114,6 +139,7 @@ func New(
 	}
 
 	n.UpdateMetricsFromServiceInfoResponse(nodeInfo)
+	n.updateScaleInObservation(nodeInfo)
 	n.setMachineInfo(nodeInfo.GetMachineInfo())
 	n.setLabels(nodeInfo.GetLabels())
 
@@ -135,9 +161,10 @@ func NewClusterNode(ctx context.Context, client *clusters.GRPCClient, clusterID 
 	}
 
 	n := &Node{
-		NomadNodeShortID: UnknownNomadNodeShortID,
-		ClusterID:        clusterID,
-		ID:               i.NodeID,
+		source:    sourceClusterRegistry,
+		ClusterID: clusterID,
+		Backend:   i.Backend,
+		ID:        i.NodeID,
 		// API control-plane calls still use the cluster gRPC proxy, but edge/client
 		// proxies need the node IP address for data-plane sandbox traffic.
 		IPAddress:        i.LocalIPAddress,
@@ -158,6 +185,7 @@ func NewClusterNode(ctx context.Context, client *clusters.GRPCClient, clusterID 
 	}
 
 	n.UpdateMetricsFromServiceInfoResponse(nodeInfo)
+	n.updateScaleInObservation(nodeInfo)
 	n.setMachineInfo(nodeInfo.GetMachineInfo())
 	n.setLabels(nodeInfo.GetLabels())
 
@@ -165,7 +193,7 @@ func NewClusterNode(ctx context.Context, client *clusters.GRPCClient, clusterID 
 }
 
 func (n *Node) Close(ctx context.Context) error {
-	if n.IsNomadManaged() {
+	if n.DiscoveredByNodePlane() {
 		logger.L().Info(ctx, "Closing local node", logger.WithNodeID(n.ID))
 		if err := n.client.Close(); err != nil {
 			logger.L().Error(ctx, "Error closing client to node", zap.Error(err), logger.WithNodeID(n.ID))
@@ -183,8 +211,17 @@ func (n *Node) GetClient(ctx context.Context) (*clusters.GRPCClient, context.Con
 	return n.client, ctx
 }
 
+// DiscoveredByNodePlane reports whether the node came from the node-plane
+// listing rather than the cluster registry. Only the node plane can validate
+// membership against a fresh listing, so only it may evict on absence.
+func (n *Node) DiscoveredByNodePlane() bool {
+	return n.source == sourceNodePlane
+}
+
+// IsNomadManaged reports whether Nomad supplied the full node identity needed
+// to own and reconcile a scale-in drain.
 func (n *Node) IsNomadManaged() bool {
-	return n.NomadNodeShortID != UnknownNomadNodeShortID
+	return n.source == sourceNodePlane && n.Backend == servicediscovery.BackendNomad && n.NomadNodeID != ""
 }
 
 func (n *Node) IsClusterNode() bool {

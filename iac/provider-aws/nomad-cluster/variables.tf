@@ -156,6 +156,11 @@ variable "capacity_autoscaler_enabled" {
   default = false
 }
 
+variable "capacity_scale_in_enforced" {
+  type    = bool
+  default = false
+}
+
 variable "client_machine_type" {
   type = string
 }

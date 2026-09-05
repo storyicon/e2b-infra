@@ -180,6 +180,46 @@ variable "capacity_controller_reconcile_interval" {
   default     = "1s"
 }
 
+variable "capacity_controller_scale_in_mode" {
+  type        = string
+  description = "Safe scale-in mode: off, observe, or enforce"
+  default     = "off"
+
+  validation {
+    condition     = contains(["off", "observe", "enforce"], var.capacity_controller_scale_in_mode)
+    error_message = "capacity_controller_scale_in_mode must be off, observe, or enforce."
+  }
+}
+
+variable "capacity_controller_scale_in_headroom_percent" {
+  type        = number
+  description = "Additional workload headroom retained when calculating safe scale-in capacity"
+  default     = 10
+
+  validation {
+    condition     = var.capacity_controller_scale_in_headroom_percent >= 0
+    error_message = "capacity_controller_scale_in_headroom_percent must be non-negative."
+  }
+}
+
+variable "capacity_controller_scale_in_stabilization_duration" {
+  type        = string
+  description = "How long excess capacity must remain stable before scale-in starts"
+  default     = "2m"
+}
+
+variable "capacity_controller_scale_in_minimum_node_age" {
+  type        = string
+  description = "Minimum EC2 instance age before a sandbox node may be reclaimed"
+  default     = "10m"
+}
+
+variable "capacity_controller_scale_in_drain_timeout" {
+  type        = string
+  description = "Maximum time an owned scale-in operation may wait for an empty worker"
+  default     = "15m"
+}
+
 variable "capacity_controller_batch_idle_duration" {
   type        = string
   description = "How long start-intent workload may remain unchanged before a scale-out decision"

@@ -17,7 +17,6 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 
 	analyticscollector "github.com/e2b-dev/infra/packages/api/internal/analytics_collector"
 	"github.com/e2b-dev/infra/packages/api/internal/api"
@@ -26,7 +25,6 @@ import (
 	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
-	clustersdiscovery "github.com/e2b-dev/infra/packages/api/internal/clusters/discovery"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	managementv1 "github.com/e2b-dev/infra/packages/api/internal/secretsstore/management/v1"
@@ -41,52 +39,44 @@ import (
 	"github.com/e2b-dev/infra/packages/db/pkg/dberrors"
 	"github.com/e2b-dev/infra/packages/db/pkg/pool"
 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
-	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+	sharedclusters "github.com/e2b-dev/infra/packages/shared/pkg/clusters/discovery"
+	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logs/loki"
 	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
+	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery/kube"
+	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery/nomad"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	sharedutils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
-// newInClusterKubeClient builds a Kubernetes API client using the pod's
-// in-cluster ServiceAccount token. The api Pod must be running in K8s with a
-// projected SA token (the default for any pod with a ServiceAccount).
-func newInClusterKubeClient() (kubernetes.Interface, error) {
-	cfg, err := rest.InClusterConfig()
-	if err != nil {
-		return nil, fmt.Errorf("rest.InClusterConfig: %w", err)
-	}
-	c, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("kubernetes.NewForConfig: %w", err)
-	}
-
-	return c, nil
-}
-
 // kubeClientFactory builds the client the Kubernetes discovery backends list
 // pods with. Injected so the provider wiring is testable without a cluster.
-type kubeClientFactory func() (kubernetes.Interface, error)
+type kubeClientFactory func(ctx context.Context, endpoint string) (kubernetes.Interface, error)
 
 // serviceDiscovery is the pair of discovery backends the API runs on: the node
 // plane (orchestrators) and the template-builder plane.
+// Both planes are the same interface over the same package now; they differ in
+// what they list, not in how.
 type serviceDiscovery struct {
 	nodes            servicediscovery.Discoverer
-	templateBuilders clustersdiscovery.Discovery
+	templateBuilders servicediscovery.Discoverer
 }
 
 // newServiceDiscovery builds both discovery planes for
 // cfg.ServiceDiscoveryProvider:
 //
-//	nomad      - both go through the local Nomad agent
-//	kubernetes - both list pods via the K8s API
-//	local      - both point at one statically configured address
-func newServiceDiscovery(config cfg.Config, newKube kubeClientFactory) (serviceDiscovery, error) {
-	switch config.ServiceDiscoveryProvider {
+//	nomad            - both go through the local Nomad agent
+//	kubernetes       - both list pods via the K8s API
+//	nomad+kubernetes - both are the deduplicated union of the two above
+//	local            - both point at one statically configured address
+func newServiceDiscovery(ctx context.Context, config cfg.Config, newKube kubeClientFactory, provider string) (serviceDiscovery, error) {
+	switch provider {
 	case cfg.ServiceDiscoveryProviderKubernetes:
-		return newKubernetesServiceDiscovery(config, newKube)
+		return newKubernetesServiceDiscovery(ctx, config, newKube)
+	case cfg.ServiceDiscoveryProviderNomadKubernetes:
+		return newComposedServiceDiscovery(ctx, config, newKube)
 	case cfg.ServiceDiscoveryProviderLocal:
 		return newLocalServiceDiscovery(config)
 	default: // ServiceDiscoveryProviderNomad
@@ -94,20 +84,56 @@ func newServiceDiscovery(config cfg.Config, newKube kubeClientFactory) (serviceD
 	}
 }
 
-func newKubernetesServiceDiscovery(config cfg.Config, newKube kubeClientFactory) (serviceDiscovery, error) {
-	client, err := newKube()
+// newComposedServiceDiscovery unions the Nomad and Kubernetes backends on both
+// planes. Nomad is the primary, so its entries win a dedup conflict and its own
+// union over the legacy node listing stays nested intact inside this one.
+func newComposedServiceDiscovery(ctx context.Context, config cfg.Config, newKube kubeClientFactory) (serviceDiscovery, error) {
+	nomadPlanes, err := newNomadServiceDiscovery(config)
+	if err != nil {
+		return serviceDiscovery{}, err
+	}
+
+	kubePlanes, err := newKubernetesServiceDiscovery(ctx, config, newKube)
+	if err != nil {
+		return serviceDiscovery{}, err
+	}
+
+	return serviceDiscovery{
+		nodes:            servicediscovery.NewMerged(nomadPlanes.nodes, kubePlanes.nodes),
+		templateBuilders: servicediscovery.NewMerged(nomadPlanes.templateBuilders, kubePlanes.templateBuilders),
+	}, nil
+}
+
+// serviceDiscoveryProvider resolves which provider to build. A provider the
+// operator named always wins, including nomad: someone running a local Nomad
+// agent has to be able to say so. Only an unset provider defaults, and it
+// defaults to local in a local environment because no Nomad agent runs there
+// and the builder plane would otherwise dial nothing.
+func serviceDiscoveryProvider(config cfg.Config, localEnv bool) string {
+	if config.ServiceDiscoveryProvider != "" {
+		return config.ServiceDiscoveryProvider
+	}
+
+	if localEnv {
+		return cfg.ServiceDiscoveryProviderLocal
+	}
+
+	return cfg.ServiceDiscoveryProviderNomad
+}
+
+func newKubernetesServiceDiscovery(ctx context.Context, config cfg.Config, newKube kubeClientFactory) (serviceDiscovery, error) {
+	client, err := newKube(ctx, config.K8sAPIEndpoint)
 	if err != nil {
 		return serviceDiscovery{}, fmt.Errorf("kubernetes client: %w", err)
 	}
 
 	return serviceDiscovery{
-		nodes: servicediscovery.NewKubernetes(
+		nodes: kube.NewPods(
 			client,
 			config.K8sNamespace,
 			config.K8sOrchestratorPodLabelSelector,
 		),
-		templateBuilders: clustersdiscovery.NewKubernetesDiscovery(
-			consts.LocalClusterID,
+		templateBuilders: kube.NewPods(
 			client,
 			config.K8sNamespace,
 			config.K8sTemplateManagerPodLabelSelector,
@@ -121,18 +147,12 @@ func newLocalServiceDiscovery(config cfg.Config) (serviceDiscovery, error) {
 		return serviceDiscovery{}, fmt.Errorf("local orchestrator discovery: %w", err)
 	}
 
-	// The local orchestrator doubles as the template builder when it is
-	// started with ORCHESTRATOR_SERVICES=orchestrator,template-manager, so
-	// point builder discovery at the same address. Instances that do not
-	// report the TemplateBuilder role (the darwin dummy orchestrator) are
-	// registered with IsBuilder=false and never selected for builds, which
-	// keeps the dummy setup behaving as before.
-	templateBuilders, err := clustersdiscovery.NewStaticFromAddress(config.LocalOrchestratorAddress)
-	if err != nil {
-		return serviceDiscovery{}, fmt.Errorf("local template builder discovery: %w", err)
-	}
-
-	return serviceDiscovery{nodes: nodes, templateBuilders: templateBuilders}, nil
+	// The local orchestrator doubles as the template builder when it is started
+	// with ORCHESTRATOR_SERVICES=orchestrator,template-manager, so both planes
+	// point at the same address — the same backend, now that there is only one.
+	// An instance that does not report the TemplateBuilder role (the darwin
+	// dummy) registers with IsBuilder=false and is never selected for builds.
+	return serviceDiscovery{nodes: nodes, templateBuilders: nodes}, nil
 }
 
 func newNomadServiceDiscovery(config cfg.Config) (serviceDiscovery, error) {
@@ -144,7 +164,7 @@ func newNomadServiceDiscovery(config cfg.Config) (serviceDiscovery, error) {
 		return serviceDiscovery{}, fmt.Errorf("nomad client: %w", err)
 	}
 
-	nodes := servicediscovery.NewNomad(client, config.NomadOrchestratorServiceNames)
+	nodes := nomad.NewServices(client, config.NomadOrchestratorServiceNames)
 	// Migration fallback: orchestrator jobs deployed from jobspecs that
 	// predate the service port-label fix register their service with an
 	// empty Address, so service discovery alone would miss them until
@@ -154,12 +174,12 @@ func newNomadServiceDiscovery(config cfg.Config) (serviceDiscovery, error) {
 	// once no legacy jobs remain. The pool is hardcoded: legacy jobs only
 	// ever ran on the "default" pool.
 	if config.NomadOrchestratorLegacyDiscoveryEnabled {
-		nodes = servicediscovery.NewMerged(nodes, servicediscovery.NewNomadNodePool(client, "default"))
+		nodes = servicediscovery.NewMerged(nodes, nomad.NewNodePool(client, "default"))
 	}
 
 	return serviceDiscovery{
 		nodes:            nodes,
-		templateBuilders: clustersdiscovery.NewLocalDiscovery(consts.LocalClusterID, client),
+		templateBuilders: nomad.NewAllocations(client, sharedclusters.FilterTemplateBuilders),
 	}, nil
 }
 
@@ -263,7 +283,9 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 		logger.L().Fatal(ctx, "Initializing Posthog client", zap.Error(posthogErr))
 	}
 
-	sd, err := newServiceDiscovery(config, newInClusterKubeClient)
+	provider := serviceDiscoveryProvider(config, env.IsLocal())
+
+	sd, err := newServiceDiscovery(ctx, config, kube.NewClient, provider)
 	if err != nil {
 		logger.L().Fatal(ctx, "Initializing service discovery", zap.Error(err))
 	}
@@ -300,7 +322,7 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 		logger.L().Fatal(ctx, "failed to create snapshot build query semaphore", zap.Error(err))
 	}
 
-	orch, err := orchestrator.New(ctx, config, tel, sd.nodes, posthogClient, redisClient, sqlcDB, clusters, featureFlags, accessTokenGenerator, snapshotCache, snapshotUpsertSem)
+	orch, err := orchestrator.New(ctx, config, tel, sd.nodes, provider == cfg.ServiceDiscoveryProviderLocal, posthogClient, redisClient, sqlcDB, clusters, featureFlags, accessTokenGenerator, snapshotCache, snapshotUpsertSem)
 	if err != nil {
 		logger.L().Fatal(ctx, "Initializing Orchestrator client", zap.Error(err))
 	}

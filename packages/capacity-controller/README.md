@@ -1,8 +1,9 @@
 # Capacity controller
 
-The capacity controller scales an AWS Auto Scaling group out from E2B's
-cluster-scoped sandbox workload. It does not scale in and it does not accept
-public traffic. `CAPACITY_DEMAND_MODE` selects exactly one input:
+The capacity controller scales an AWS Auto Scaling group from E2B's
+cluster-scoped sandbox workload. Scale-out is always available. Safe scale-in
+is separately gated and disabled by default. The process accepts no public
+traffic. `CAPACITY_DEMAND_MODE` selects exactly one input:
 
 - `legacy-failure-ledger` reads pending, fulfilled, and direct-success state
   from Redis.
@@ -42,8 +43,101 @@ Current ASG desired includes nodes that are starting but not yet Nomad ready,
 so low ready count does not request the same nodes twice. This mode has no
 process-local burst baseline and recomputes the same target after restart.
 
-Run one controller replica. Legacy burst state remains process-local for the
-explicit rollback mode.
+## Safe scale-in
+
+Safe scale-in is available only with `start-intent-v1` and has three explicit
+modes:
+
+- `off` performs no scale-in reads or writes and is the default.
+- `observe` calculates candidates and budgets without changing Nomad, workers,
+  or AWS.
+- `enforce` runs bounded, recoverable drain and ASG reconciliation.
+
+The controller retains workload headroom and requires excess accepting capacity
+to remain stable before opening a drain. Candidate summaries are only a cheap
+filter. Each transaction then binds the Nomad node, EC2 instance, and worker
+service-instance identity and follows this order:
+
+```text
+owned Nomad drain -> worker Draining -> live empty verification
+                  -> final workload/Nomad/worker/ASG re-read
+                  -> remove instance scale-in protection (armed)
+                  -> set absolute ASG desired capacity
+```
+
+The worker rejects new create/resume admissions once Draining wins its admission
+lock. It reports `shutdown_ready` only after live sandboxes, starts/resumes,
+lifecycle cleanup, and snapshot uploads all reach zero. The API additionally
+requires a fresh `Sandbox.List` to be empty. The controller never migrates or
+kills a sandbox to make a node empty.
+
+New sandbox-client ASG instances start with instance scale-in protection. Normal
+ASG scale-in cannot select a protected instance. Only a worker that has a
+controller-owned drain, matching operation and service identity, current
+`shutdown_ready=true`, a fresh empty `Sandbox.List`, and healthy `InService`
+infrastructure may have protection removed. Such a worker is **armed**: ASG may
+select it, but Worker and Nomad admission remain closed until it leaves the group
+or is safely restored. Ordinary, busy, unknown, unhealthy, and mismatched
+instances remain protected.
+
+The ASG is **settled** when member count equals desired capacity, every member is
+`InService`, and no previous termination or active instance refresh is in
+progress. Only then may the controller lower desired capacity:
+
+```text
+reduction = min(armed_count, desired - safe_required, 50)
+target_desired = desired - reduction
+```
+
+At most 50 owned operations may be active, matching the protection API batch
+limit. Empty workers may use that rolling window; non-empty graceful drains are
+additionally limited to 10% of ready workers. After an absolute desired write,
+the controller waits until membership converges before starting another batch.
+A lost response or controller restart is handled by reading current desired,
+membership, lifecycle, and protection again; no process-local token or relative
+decrement is required.
+
+A demand increase stops new drains. If membership is above desired, the
+controller first raises desired to at least current membership and safe demand,
+removing the pending scale-in deficit. It then protects each surviving
+`InService` armed worker, confirms that protection from a fresh ASG read,
+restores the matching Worker operation, and restores Nomad eligibility last.
+Workers already in `Terminating*` stay Draining and scale-out supplies any
+replacement capacity. Scale-out keeps its existing raw-workload formula if any
+scale-in observation fails.
+
+The following table is the authoritative transition contract. An operation may
+perform only the write shown for its observed state. Every retry first reads the
+current state again; a successful write with a lost response therefore converges
+through the same row or the next row instead of relying on process memory.
+
+| Observed state | Owner | Only permitted next write | Re-entry condition | Terminal condition |
+| --- | --- | --- | --- | --- |
+| Protected ordinary worker | none | mark the Nomad node draining with a new operation ID | candidate identity and all safety inputs are fresh | Nomad marker is owned by the operation |
+| Owned Nomad drain | operation ID | begin the matching Worker drain | Nomad node, EC2 instance, and Worker service identity still match | Worker reports the same operation as Draining |
+| Owned Worker drain | operation ID | remove instance scale-in protection | a fresh empty Sandbox list and `shutdown_ready=true` still match | a fresh ASG snapshot reports the instance unprotected (`armed`) |
+| Armed, settled ASG | operation ID | set absolute desired capacity | every unprotected member is an owned, freshly verified armed worker | the selected instance leaves ASG membership |
+| Departed instance | operation ID | complete the Nomad termination marker | instance is absent from fresh ASG membership | operation is complete |
+| Surviving operation that must recover | operation ID | restore instance scale-in protection | instance remains `InService`; demand or safety state requires recovery | a fresh ASG snapshot reports the instance protected |
+| Protected owned drain | operation ID | mark the Nomad operation `restoring` | the original Nomad identity is still isolated | restoring marker is durable |
+| Restoring operation | operation ID | cancel the matching Worker drain | Worker service identity still matches; replay of a completed cancel is allowed only for the same operation | Worker is Healthy while Nomad remains isolated |
+| Restoring operation with a Healthy Worker | operation ID | restore Nomad eligibility | the original Nomad node is still isolated, or a prior restore is observed | Nomad is ready and eligible |
+| Restored operation | operation ID | complete the restore marker | Worker is Healthy and Nomad is ready and eligible | operation is complete |
+| Protected worker whose old Nomad/Worker identity was replaced | old operation ID | restore and complete only the old Nomad marker | replacement identity is independently ready and eligible | old operation is complete; replacement Worker is untouched |
+
+The only capacity-reducing write is the absolute desired-capacity update, and it
+is allowed only when every unprotected member is an owned armed operation. A
+replacement Worker never inherits or cancels the previous Worker's operation.
+
+Instance protection constrains normal ASG scale-in only. It does not prevent a
+health-check replacement, Spot interruption, or manual termination. Unknown or
+contradictory state fails closed: the controller preserves or restores
+protection and stops scale-in, but does not block scale-out.
+
+Run one controller replica operationally. A restart or brief rolling overlap is
+safe because Worker ownership and cloud writes are replayable from observable
+state. Legacy burst state remains process-local only in the explicit legacy
+demand mode.
 
 ## Configuration
 
@@ -73,14 +167,25 @@ Optional:
 - `MIN_NODES` (default `1`)
 - `MAX_NODES` (default `30`)
 - `RECONCILE_INTERVAL` (default `1s`)
+- `SCALE_IN_MODE` (`off`, `observe`, or `enforce`; default `off`)
+- `SCALE_IN_HEADROOM_PERCENT` (default `10`)
+- `SCALE_IN_STABILIZATION_DURATION` (default `2m`)
+- `SCALE_IN_MIN_NODE_AGE` (default `10m`)
+- `SCALE_IN_DRAIN_TIMEOUT` (default `15m`)
 
 Nomad configuration uses the standard Nomad client environment variables,
 including `NOMAD_ADDR`, `NOMAD_TOKEN`, `NOMAD_CACERT`, `NOMAD_CLIENT_CERT`, and
 `NOMAD_CLIENT_KEY`. AWS credentials use the default AWS SDK credential chain;
 no credential is accepted as a controller-specific setting.
 
-The runtime role only needs read access to the configured ASG plus
-`autoscaling:SetDesiredCapacity` for that exact group. Redis authentication
+The runtime role needs ASG/EC2 describe access plus
+`autoscaling:SetDesiredCapacity` for the exact configured ASG. Terraform adds
+`autoscaling:SetInstanceProtection` for that group only when
+`SCALE_IN_MODE=enforce`; off and observe deployments do not receive it. Enforce
+also requires the sandbox-client ASG to protect new instances by default. The
+controller establishes and re-reads the protection baseline for existing
+members before lowering desired capacity.
+The Nomad token needs node write access to the configured node pool. Redis authentication
 must use TLS; the shared Redis factory rejects a plaintext password. The
 capacity snapshot address must resolve to the API's private internal gRPC
 listener. The service token is sent as bearer metadata and is never logged.
@@ -109,6 +214,14 @@ restart it before changing the API writer. Keep the API in `dual-write` until
 the rollback is verified. Do not remove the legacy namespace, fulfilled/direct
 success accounting, or dual-write path until the new mode has completed its
 defined stable observation period.
+
+Safe scale-in has an additional rollback order. Do not stop or downgrade the
+controller while armed workers exist or member count is above desired. First
+raise desired to at least current membership, wait until there is no pending
+normal scale-in deficit, protect every remaining ASG member, cancel the matching
+Worker drains, and restore Nomad eligibility last. After fresh reads confirm no
+armed worker or owned drain remains, switch `SCALE_IN_MODE` to `off` or deploy
+the previous controller. Restoring exact-termination permission is not required.
 
 Before enabling the Terraform job, upload its private S3 artifact for the
 active AWS environment:
@@ -148,79 +261,3 @@ Every scale decision uses the latest workload snapshot; a successful write
 ends that batch, and later unmet demand starts a new one without waiting for
 the requested nodes to become Nomad-ready. A controller restart discards its
 in-memory batch timestamps and starts from a new snapshot.
-
-## Cold-start benchmark
-
-`packages/shared/scripts/run-capacity-smoke.mjs` measures demand-driven scale-out
-from a known baseline. It requires an explicit `E2B_TEMPLATE_ALIAS`; the repository
-does not contain a deployment-specific template name. The runner also requires a
-run-scoped observer JSONL file through `CAPACITY_OBSERVER_EVENTS_PATH` and fails
-before creating workload if the observer contract or SDK transport limits are not
-satisfied. Every observer record must end with a newline; the newline is the
-commit boundary that lets the runner distinguish a published record from a
-concurrent partial append.
-
-Formal acceptance requires the first observer event to be a post-T0 cold
-baseline recorded before the runner creates workload. The runner resets its
-latency clock only after this barrier, so observer startup delay is not counted
-as Sandbox cold-start latency. Controller audit events must contain one process
-identity, contiguous write sequences, paired started/finished phases, and a
-zero-loss checkpoint newer than the final admission/capacity/guest evidence. Every successful target
-must equal the capacity required by the workload visible at that decision;
-progressive `[1, 5, 25]` and single-step `[1, 25]` scale-out are both valid when
-their decisions are correct. The observer must also archive complete ASG
-instance-launch scaling activities, and ASG desired, EC2 InService, and Nomad ready must finish
-at the expected node count without overshoot. Missing or conflicting evidence
-invalidates the benchmark rather than being treated as proof that no hidden
-scale write occurred.
-
-Admission milestones use the first and last matching API journal timestamps,
-not the observer polling timestamp. Negative cross-stage durations are rejected
-instead of being published as performance evidence.
-
-After all sandbox requests succeed, the runner waits up to 30 seconds for the
-asynchronous observer to record that final capacity state. Override this bound
-with `CAPACITY_OBSERVER_SETTLE_TIMEOUT_MS` when the observer samples less
-frequently. The runner still fails closed if the evidence remains incomplete.
-
-The load generator must run without AWS credential-provider environment variables
-and with IMDS blocked. It never calls Auto Scaling and never retries
-`Sandbox.create`; infrastructure observations come from the separate read-only
-observer. The observer implementation is
-`packages/shared/scripts/capacity-smoke-observer.py`; every deployment-specific
-account, region, profile, ASG, systemd unit, and Nomad URL is a required command
-argument rather than a repository default. Its minimal IAM policy is
-`packages/shared/scripts/capacity-smoke-observer-policy.json`. AWS Auto Scaling
-does not support resource-level restrictions for these Describe actions, so the
-observer additionally verifies the explicit account and passes exactly one ASG
-name to both APIs. This policy is not attached to the controller or load
-generator by Terraform.
-
-The observer must start before the shared future T0. After T0, it waits for a
-successful zero-workload controller snapshot, records current ASG/Nomad state,
-and publishes the cold baseline. The runner waits at this barrier before creating
-workload. The observer then collects run-scoped admission counts, controller audit
-events, current capacity, and fully paginated scaling activities. Example:
-
-```sh
-python3 packages/shared/scripts/capacity-smoke-observer.py \
-  --run-id "$BENCHMARK_RUN_ID" \
-  --t0 "$BENCHMARK_START_EPOCH_MS" \
-  --output "$CAPACITY_OBSERVER_EVENTS_PATH" \
-  --target 500 \
-  --credential-source instance-role \
-  --aws-region "$AWS_REGION" \
-  --expected-aws-account "$EXPECTED_AWS_ACCOUNT" \
-  --asg-name "$AWS_ASG_NAME" \
-  --api-unit "$API_SYSTEMD_UNIT" \
-  --controller-unit "$CAPACITY_CONTROLLER_SYSTEMD_UNIT" \
-  --nomad-nodes-url http://127.0.0.1:4646/v1/nodes \
-  --capacity-mode dual-write
-```
-
-Run the deterministic model and observer tests with:
-
-```sh
-node --test packages/shared/scripts/capacity-smoke-model.test.mjs
-python3 -m unittest packages/shared/scripts/capacity-smoke-observer_test.py
-```

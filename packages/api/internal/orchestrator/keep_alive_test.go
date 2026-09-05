@@ -99,7 +99,7 @@ func TestKeepAliveWorkloadDeadlineOrdering(t *testing.T) {
 			o, reservations := newStartIntentTestOrchestratorWithReservation(t)
 			o.capacityDemandMode = cfg.SandboxCapacityDemandModeWorkloadV2
 			o.workloadLeaseStore = workloads
-			o.sandboxStore = sandbox.NewStore(storage, reservations, sandbox.Callbacks{
+			o.sandboxStore = sandbox.NewStore(storage, storage, reservations, sandbox.Callbacks{
 				AddSandboxToRoutingTable: func(context.Context, sandbox.Sandbox) error { return nil },
 				AsyncNewlyCreatedSandbox: func(context.Context, sandbox.Sandbox, sandbox.CreationMetadata) {},
 			})

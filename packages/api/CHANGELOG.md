@@ -1,5 +1,108 @@
 # Changelog
 
+## 0.10.0 (2026-09-03)
+
+
+### Features
+
+* **api:** report egress proxy usage in product analytics (1049c80)
+
+
+### Bug Fixes
+
+* **api:** chunk Reconcile MGETs to 256 keys per command (bc61e07)
+* **api:** stop retrying pause on already-killing leftovers (df365d4)
+
+
+### Performance Improvements
+
+* **api:** bound sandbox-store MGETs to 256 keys per command (a49f2d1)
+
+## 0.9.0 (2026-09-02)
+
+
+### Features
+
+* **api:** add service JWT authentication (3374207)
+* **api:** make network rule domain limit configurable (291ae2c)
+* **orchestrator:** snapshot-admission pre-flight for pause and checkpoint (flag-gated) (b47217c)
+
+## 0.8.0 (2026-09-01)
+
+
+### Features
+
+* **api:** accept HTTPS backend ports on sandbox create (c395e9b)
+* **api:** filter sandbox placement by orchestrator release (7e433ac)
+
+## 0.7.0 (2026-08-28)
+
+
+### Features
+
+* **servicediscovery:** union orchestrator discovery across both schedulers (df09b1d)
+
+## 0.6.2 (2026-08-27)
+
+
+### Bug Fixes
+
+* **api:** drop the evictor's fs-only version degrade (d765459)
+
+
+### Miscellaneous Chores
+
+* **api:** fix comment & linter (d0903da)
+
+## 0.6.1 (2026-08-27)
+
+
+### Bug Fixes
+
+* **api:** don't check for fs-only pause support (15f5a24)
+
+## 0.6.0 (2026-08-27)
+
+
+### Features
+
+* **network:** accept wildcard transform domains (838ed57)
+
+
+### Bug Fixes
+
+* **api:** include template and build IDs in create errors (929b6b7)
+
+## 0.5.1 (2026-08-27)
+
+
+### Code Refactoring
+
+* **api:** retire the api's second discovery mechanism (1360629)
+* name node identity for what it identifies (62af6f7)
+* **servicediscovery:** one package per backend (ae36dd9)
+
+## 0.5.0 (2026-08-26)
+
+
+### Features
+
+* **api:** admin rig passthrough for remote clusters (6586f22)
+* **snapshots:** gate in-place checkpoint and fs-only snapshots on FC release &gt;= 0.2.0 (c7b5dff)
+
+
+### Bug Fixes
+
+* **api:** deregister node when its grpc connection is shut down (44d9dad)
+* **api:** fail the snapshot build when a pause is rejected (036a174)
+* **api:** finish snapshot builds on client disconnect (bd31fc4)
+
+
+### Code Refactoring
+
+* **api:** reuse the filesystem-only snapshot predicate (7829b43)
+* rename the discovery package for what it discovers (2c8ad0d)
+
 ## 0.4.0 (2026-08-25)
 
 

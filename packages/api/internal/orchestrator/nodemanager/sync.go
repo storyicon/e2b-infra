@@ -71,6 +71,7 @@ func (n *Node) Sync(ctx context.Context, store *sandbox.Store) error {
 		)
 		// Update host metrics from service info
 		n.UpdateMetricsFromServiceInfoResponse(nodeInfo)
+		n.updateScaleInObservation(nodeInfo)
 
 		orphanCandidates, instancesErr := n.GetOrphanCandidates(ctx)
 		if instancesErr != nil {
