@@ -32,6 +32,17 @@ type scaleInObservation struct {
 	observedAt       time.Time
 }
 
+type scaleInObservationReader struct {
+	reconciler  *Reconciler
+	currentTime func() time.Time
+	attempted   bool
+	observation scaleInObservation
+	err         error
+	nomadRead   bool
+	nomadNodes  []NomadScaleInNode
+	nomadErr    error
+}
+
 func NewWithScaleIn(config *Config, demand DemandReader, snapshot CapacitySnapshotReader, nodes NodeCounter, target ScaleTarget, inventory ScaleInNodeInventory, workers ScaleInWorkerControl, infrastructure ScaleInInfrastructure, audits ...AuditSink) *Reconciler {
 	reconciler := New(config, demand, snapshot, nodes, target, audits...)
 	reconciler.scaleIn = &scaleInRuntime{inventory: inventory, workers: workers, infrastructure: infrastructure, cooldown: make(map[string]time.Time)}
@@ -44,10 +55,8 @@ func (r *Reconciler) scaleOutRequiredForEnforce(ctx context.Context, now time.Ti
 }
 
 func (r *Reconciler) scaleOutRequiredForEnforceAt(ctx context.Context, currentTime func() time.Time, rawRequired int64) (int64, error) {
-	if err := r.requireScaleInDependencies(); err != nil {
-		return 0, err
-	}
-	observation, err := r.readScaleInObservation(ctx, currentTime)
+	reader := newScaleInObservationReader(r, currentTime)
+	observation, err := reader.Read(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("read scale-in inputs before scale-out: %w", err)
 	}
@@ -93,16 +102,19 @@ func (r *Reconciler) reconcileScaleIn(ctx context.Context, now time.Time, worklo
 // from fresh Nomad, Worker, and ASG state. Process-local fields only rate-limit
 // idempotent work and are never required to recover correctness.
 func (r *Reconciler) reconcileScaleInAt(ctx context.Context, currentTime func() time.Time, workloadCount int64, result Result, allowNewDrains bool) (Result, error) {
+	return r.reconcileScaleInWithObservationReader(ctx, currentTime, workloadCount, result, allowNewDrains, newScaleInObservationReader(r, currentTime))
+}
+
+func (r *Reconciler) reconcileScaleInWithObservationReader(ctx context.Context, currentTime func() time.Time, workloadCount int64, result Result, allowNewDrains bool, reader *scaleInObservationReader) (Result, error) {
 	if r.config.ScaleInMode == "" || r.config.ScaleInMode == ScaleInModeOff {
 		return result, nil
 	}
-	if err := r.requireScaleInDependencies(); err != nil {
-		return result, err
-	}
 
-	observation, err := r.readScaleInObservation(ctx, currentTime)
+	observation, err := reader.Read(ctx)
 	if err != nil {
-		r.scaleIn.stabilizer.Reset()
+		if r.scaleIn != nil {
+			r.scaleIn.stabilizer.Reset()
+		}
 
 		return result, err
 	}
@@ -110,26 +122,75 @@ func (r *Reconciler) reconcileScaleInAt(ctx context.Context, currentTime func() 
 	return r.reconcileScaleInObservation(ctx, currentTime, workloadCount, result, allowNewDrains, observation)
 }
 
-func (r *Reconciler) readScaleInObservation(ctx context.Context, currentTime func() time.Time) (scaleInObservation, error) {
-	nomadNodes, err := r.scaleIn.inventory.Inventory(ctx, r.config.NodePool)
-	if err != nil {
-		return scaleInObservation{}, fmt.Errorf("read scale-in Nomad inventory: %w", err)
-	}
-	workerCandidates, err := r.scaleIn.workers.ListScaleInCandidates(ctx, r.config.ClusterID)
-	if err != nil {
-		return scaleInObservation{}, fmt.Errorf("read worker scale-in candidates: %w", err)
-	}
-	cloud, err := r.scaleIn.infrastructure.Snapshot(ctx, r.config.ASGName)
-	if err != nil {
-		return scaleInObservation{}, fmt.Errorf("read scale-in ASG snapshot: %w", err)
-	}
+func newScaleInObservationReader(reconciler *Reconciler, currentTime func() time.Time) *scaleInObservationReader {
+	return &scaleInObservationReader{reconciler: reconciler, currentTime: currentTime}
+}
 
-	return scaleInObservation{
-		nomadNodes:       nomadNodes,
+func (r *scaleInObservationReader) Read(ctx context.Context) (scaleInObservation, error) {
+	if r.attempted {
+		return r.observation, r.err
+	}
+	r.attempted = true
+	if err := r.reconciler.requireScaleInDependencies(); err != nil {
+		r.err = err
+
+		return scaleInObservation{}, err
+	}
+	r.nomadRead = true
+	r.nomadNodes, r.nomadErr = r.reconciler.scaleIn.inventory.Inventory(ctx, r.reconciler.config.NodePool)
+	if r.nomadErr != nil {
+		r.err = fmt.Errorf("read scale-in Nomad inventory: %w", r.nomadErr)
+
+		return scaleInObservation{}, r.err
+	}
+	workerCandidates, err := r.reconciler.scaleIn.workers.ListScaleInCandidates(ctx, r.reconciler.config.ClusterID)
+	if err != nil {
+		r.err = fmt.Errorf("read worker scale-in candidates: %w", err)
+
+		return scaleInObservation{}, r.err
+	}
+	cloud, err := r.reconciler.scaleIn.infrastructure.Snapshot(ctx, r.reconciler.config.ASGName)
+	if err != nil {
+		r.err = fmt.Errorf("read scale-in ASG snapshot: %w", err)
+
+		return scaleInObservation{}, r.err
+	}
+	r.observation = scaleInObservation{
+		nomadNodes:       r.nomadNodes,
 		workerCandidates: workerCandidates,
 		cloud:            cloud,
-		observedAt:       currentTime(),
-	}, nil
+		observedAt:       r.currentTime(),
+	}
+
+	return r.observation, nil
+}
+
+func (r *scaleInObservationReader) ObserveReadyNodes(result Result) (Result, bool) {
+	if !r.nomadRead {
+		return result, false
+	}
+	if r.nomadErr != nil {
+		result.ReadyNodesError = fmt.Errorf("count ready Nomad nodes: %w", r.nomadErr)
+
+		return result, true
+	}
+
+	return observeReadyNodesFromInventory(result, r.nomadNodes), true
+}
+
+// InvalidateSuccessful forces safety checks after an external write to read
+// fresh state. A failed observation remains sticky so one reconcile never
+// amplifies an upstream failure by retrying it immediately.
+func (r *scaleInObservationReader) InvalidateSuccessful() {
+	if r.attempted && r.err != nil {
+		return
+	}
+	r.attempted = false
+	r.observation = scaleInObservation{}
+	r.err = nil
+	r.nomadRead = false
+	r.nomadNodes = nil
+	r.nomadErr = nil
 }
 
 func (r *Reconciler) reconcileScaleInObservation(ctx context.Context, currentTime func() time.Time, workloadCount int64, result Result, allowNewDrains bool, observation scaleInObservation) (Result, error) {

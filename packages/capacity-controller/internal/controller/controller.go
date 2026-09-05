@@ -214,12 +214,12 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, cu
 	rawRequired := ceilDiv(snapshot.WorkloadCount, int64(r.config.SlotsPerNode))
 	required := rawRequired
 	rawGrowth := rawRequired > int64(desired)
-	var steadyScaleInObservation *scaleInObservation
+	scaleInObservation := newScaleInObservationReader(r, currentTime)
 	// Raw demand growth takes priority over every scale-in observation. Apply
 	// that increase first; only then observe and compensate already-draining
 	// workers so continuous demand growth cannot starve either path.
 	if r.config.ScaleInMode == ScaleInModeEnforce && !rawGrowth {
-		observation, scaleInErr := r.readScaleInObservation(ctx, currentTime)
+		observation, scaleInErr := scaleInObservation.Read(ctx)
 		if scaleInErr != nil {
 			// Scale-in observations may only increase a scale-out target. If they
 			// are unavailable, reset stabilization and preserve the authoritative
@@ -230,7 +230,6 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, cu
 			result.ScaleInReadError = fmt.Errorf("read scale-in inputs before scale-out: %w", scaleInErr)
 		} else {
 			required = scaleOutRequiredFromObservation(required, observation)
-			steadyScaleInObservation = &observation
 		}
 	}
 	uncapped := max(int64(desired), required, int64(r.config.MinNodes))
@@ -242,13 +241,13 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, cu
 		if !ready {
 			result.TargetNodes = desired
 			result.Aggregating = true
-			if steadyScaleInObservation != nil {
-				result = observeReadyNodesFromInventory(result, steadyScaleInObservation.nomadNodes)
-			} else {
-				result = r.observeReadyNodes(ctx, result)
+			result = r.observeReadyNodesForScaleIn(ctx, result, scaleInObservation)
+			if result.ScaleInReadError != nil {
+				//nolint:nilerr // Scale-in observation failures remain diagnostic-only for the raw scale-out path.
+				return result, nil
 			}
 
-			return r.reconcileExistingScaleInOperations(ctx, currentTime, snapshot.WorkloadCount, result), nil
+			return r.reconcileExistingScaleInOperations(ctx, currentTime, snapshot.WorkloadCount, result, scaleInObservation), nil
 		}
 		result.BatchTrigger = trigger
 		batch := r.startIntentBatch
@@ -268,13 +267,15 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, cu
 		}
 		result.Scaled = true
 		r.startIntentBatch = startIntentBatch{}
+		scaleInObservation.InvalidateSuccessful()
 
 		if r.config.ScaleInMode == ScaleInModeEnforce && rawGrowth && target < r.config.MaxNodes {
-			compensatedRequired, scaleInErr := r.scaleOutRequiredForEnforceAt(ctx, currentTime, int64(target))
+			observation, scaleInErr := scaleInObservation.Read(ctx)
 			if scaleInErr != nil {
 				r.scaleIn.stabilizer.Reset()
-				result.ScaleInReadError = scaleInErr
+				result.ScaleInReadError = fmt.Errorf("read scale-in inputs before scale-out: %w", scaleInErr)
 			} else {
+				compensatedRequired := scaleOutRequiredFromObservation(int64(target), observation)
 				compensatedTarget := clampInt32(compensatedRequired, r.config.MinNodes, r.config.MaxNodes)
 				if compensatedTarget > target {
 					if err := r.setDesiredCapacity(ctx, ScaleAuditEvent{
@@ -288,6 +289,7 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, cu
 					}
 					result.TargetNodes = compensatedTarget
 					result.Capped = compensatedRequired > int64(r.config.MaxNodes)
+					scaleInObservation.InvalidateSuccessful()
 				}
 			}
 		}
@@ -295,33 +297,24 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, cu
 		r.startIntentBatch = startIntentBatch{}
 	}
 
-	if steadyScaleInObservation != nil {
-		result = observeReadyNodesFromInventory(result, steadyScaleInObservation.nomadNodes)
-	} else {
-		result = r.observeReadyNodes(ctx, result)
-	}
-	if result.Scaled || result.Aggregating {
-		return r.reconcileExistingScaleInOperations(ctx, currentTime, snapshot.WorkloadCount, result), nil
-	}
-	if steadyScaleInObservation != nil {
-		return r.reconcileScaleInObservation(ctx, currentTime, snapshot.WorkloadCount, result, true, *steadyScaleInObservation)
-	}
+	result = r.observeReadyNodesForScaleIn(ctx, result, scaleInObservation)
 	if result.ScaleInReadError != nil {
-		// The read error is carried in Result for diagnostics while raw scale-out
-		// remains available to callers through the normal reconciliation result.
-		//nolint:nilerr // Scale-in observation failures are intentionally non-fatal to raw scale-out.
+		//nolint:nilerr // Scale-in observation failures remain diagnostic-only for the raw scale-out path.
 		return result, nil
 	}
+	if result.Scaled || result.Aggregating {
+		return r.reconcileExistingScaleInOperations(ctx, currentTime, snapshot.WorkloadCount, result, scaleInObservation), nil
+	}
 
-	return r.reconcileScaleInAt(ctx, currentTime, snapshot.WorkloadCount, result, true)
+	return r.reconcileScaleInWithObservationReader(ctx, currentTime, snapshot.WorkloadCount, result, true, scaleInObservation)
 }
 
-func (r *Reconciler) reconcileExistingScaleInOperations(ctx context.Context, currentTime func() time.Time, workloadCount int64, result Result) Result {
+func (r *Reconciler) reconcileExistingScaleInOperations(ctx context.Context, currentTime func() time.Time, workloadCount int64, result Result, scaleInObservation *scaleInObservationReader) Result {
 	if r.config.ScaleInMode != ScaleInModeEnforce {
 		return result
 	}
 
-	updated, err := r.reconcileScaleInAt(ctx, currentTime, workloadCount, result, false)
+	updated, err := r.reconcileScaleInWithObservationReader(ctx, currentTime, workloadCount, result, false, scaleInObservation)
 	if err != nil {
 		// Existing drain recovery is auxiliary to scale-out. Keep the raw demand
 		// path non-blocking while surfacing the exact recovery failure.
@@ -429,6 +422,19 @@ func observeReadyNodesFromInventory(result Result, nodes []NomadScaleInNode) Res
 	result.ReadyNodesObserved = true
 
 	return result
+}
+
+func (r *Reconciler) observeReadyNodesForScaleIn(ctx context.Context, result Result, scaleInObservation *scaleInObservationReader) Result {
+	useScaleInObservation := r.config.ScaleInMode == ScaleInModeEnforce ||
+		(r.config.ScaleInMode == ScaleInModeObserve && !result.Scaled && !result.Aggregating)
+	if useScaleInObservation {
+		_, _ = scaleInObservation.Read(ctx)
+		if observed, available := scaleInObservation.ObserveReadyNodes(result); available {
+			return observed
+		}
+	}
+
+	return r.observeReadyNodes(ctx, result)
 }
 
 func (r *Reconciler) reconcileLegacy(ctx context.Context, now time.Time) (Result, error) {

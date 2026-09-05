@@ -23,6 +23,7 @@ type scaleInWorld struct {
 	protectionErrBeforeApply bool
 	desiredErr               error
 	snapshotASGErr           error
+	inventoryErr             error
 	listErr                  error
 	beginErr                 error
 	verifyErr                error
@@ -105,6 +106,14 @@ func readyWorker(nodeID, serviceID, operationID string) WorkerScaleInState {
 	return WorkerScaleInState{NodeID: nodeID, ServiceInstanceID: serviceID, ServiceStatus: "Draining", ScaleInProtocolSupport: true, ScaleInOperationID: operationID, ShutdownReady: true, SandboxListEmpty: true}
 }
 
+func (w *scaleInWorld) resetObservationCounts() {
+	w.desiredCalls = 0
+	w.readyCalls = 0
+	w.inventoryCalls = 0
+	w.snapshotASGCalls = 0
+	w.listCalls = 0
+}
+
 func (w *scaleInWorld) Snapshot(context.Context, string) (CapacitySnapshot, error) {
 	return CapacitySnapshot{WorkloadCount: w.workload}, nil
 }
@@ -130,6 +139,9 @@ func (w *scaleInWorld) SetDesiredCapacity(_ context.Context, _ string, desired i
 
 func (w *scaleInWorld) Inventory(context.Context, string) ([]NomadScaleInNode, error) {
 	w.inventoryCalls++
+	if w.inventoryErr != nil {
+		return nil, w.inventoryErr
+	}
 
 	return slices.Clone(w.nodes), nil
 }
@@ -366,7 +378,47 @@ func TestStartIntentDoesNotRetryFailedScaleInObservationInSameReconcile(t *testi
 	require.NoError(t, err, "scale-in observation must not block the raw scale-out path")
 	require.ErrorContains(t, result.ScaleInReadError, "throttled")
 	require.Equal(t, 1, w.desiredCalls)
-	require.Equal(t, 1, w.readyCalls, "independent readiness diagnostics remain available")
+	require.Zero(t, w.readyCalls)
+	require.True(t, result.ReadyNodesObserved, "the successful Nomad inventory remains available for readiness diagnostics")
+	require.Equal(t, 1, w.inventoryCalls)
+	require.Equal(t, 1, w.listCalls)
+	require.Equal(t, 1, w.snapshotASGCalls)
+	require.Empty(t, w.protectionWrites)
+	require.Empty(t, w.desiredWrites)
+}
+
+func TestStartIntentDoesNotRetryFailedNomadInventoryForReadiness(t *testing.T) {
+	t.Parallel()
+
+	w := newScaleInWorld(3, true)
+	w.inventoryErr = errors.New("nomad unavailable")
+
+	result, err := newTestScaleInReconciler(w).Reconcile(t.Context(), time.Now())
+	require.NoError(t, err, "scale-in observation must not block the raw scale-out path")
+	require.ErrorContains(t, result.ScaleInReadError, "nomad unavailable")
+	require.ErrorContains(t, result.ReadyNodesError, "nomad unavailable")
+	require.False(t, result.ReadyNodesObserved)
+	require.Equal(t, 1, w.desiredCalls)
+	require.Zero(t, w.readyCalls, "the same Nomad list must not be retried through ReadyCount")
+	require.Equal(t, 1, w.inventoryCalls)
+	require.Zero(t, w.listCalls)
+	require.Zero(t, w.snapshotASGCalls)
+	require.Empty(t, w.protectionWrites)
+	require.Empty(t, w.desiredWrites)
+}
+
+func TestStartIntentObserveSteadyStateReusesOneScaleInObservation(t *testing.T) {
+	t.Parallel()
+
+	w := newScaleInWorld(3, true)
+	r := newTestScaleInReconciler(w)
+	r.config.ScaleInMode = ScaleInModeObserve
+	r.config.ScaleInStableFor = time.Hour
+
+	_, err := r.Reconcile(t.Context(), time.Now())
+	require.NoError(t, err)
+	require.Equal(t, 1, w.desiredCalls)
+	require.Zero(t, w.readyCalls)
 	require.Equal(t, 1, w.inventoryCalls)
 	require.Equal(t, 1, w.listCalls)
 	require.Equal(t, 1, w.snapshotASGCalls)
@@ -781,10 +833,88 @@ func TestEnforceScaleOutContinuesWhenScaleInObservationFails(t *testing.T) {
 	now := time.Now()
 	_, err := r.Reconcile(t.Context(), now)
 	require.NoError(t, err)
+	w.resetObservationCounts()
 	result, err := r.Reconcile(t.Context(), now.Add(2*time.Millisecond))
 	require.NoError(t, err)
 	require.Equal(t, []int32{2}, w.desiredWrites)
 	require.ErrorContains(t, result.ScaleInReadError, "observation unavailable")
+	require.Equal(t, 1, w.desiredCalls)
+	require.Zero(t, w.readyCalls)
+	require.True(t, result.ReadyNodesObserved, "the successful Nomad inventory remains available for readiness diagnostics")
+	require.Equal(t, 1, w.inventoryCalls)
+	require.Equal(t, 1, w.listCalls, "a failed scale-in observation must not be retried in the same reconcile")
+	require.Zero(t, w.snapshotASGCalls)
+	require.Empty(t, w.protectionWrites)
+}
+
+func TestEnforceMinimumCapacityWriteDoesNotRetryFailedObservation(t *testing.T) {
+	t.Parallel()
+
+	w := newScaleInWorld(1, true)
+	w.snapshotASGErr = errors.New("scale-in observation unavailable")
+	r := newTestScaleInReconciler(w)
+	r.config.MinNodes = 2
+	now := time.Now()
+	_, err := r.Reconcile(t.Context(), now)
+	require.NoError(t, err)
+	w.resetObservationCounts()
+
+	result, err := r.Reconcile(t.Context(), now.Add(2*time.Millisecond))
+	require.NoError(t, err)
+	require.Equal(t, []int32{2}, w.desiredWrites)
+	require.ErrorContains(t, result.ScaleInReadError, "observation unavailable")
+	require.Equal(t, 1, w.desiredCalls)
+	require.Zero(t, w.readyCalls)
+	require.True(t, result.ReadyNodesObserved, "the successful Nomad inventory remains available for readiness diagnostics")
+	require.Equal(t, 1, w.inventoryCalls)
+	require.Equal(t, 1, w.listCalls)
+	require.Equal(t, 1, w.snapshotASGCalls, "a failed observation must remain sticky after the capacity write")
+	require.Empty(t, w.protectionWrites)
+}
+
+func TestEnforceScaleOutReusesPostWriteObservation(t *testing.T) {
+	t.Parallel()
+
+	w := newScaleInWorld(1, true)
+	w.workload = 2
+	w.listErr = errors.New("hold scale-in recovery during aggregation")
+	r := newTestScaleInReconciler(w)
+	now := time.Now()
+	_, err := r.Reconcile(t.Context(), now)
+	require.NoError(t, err)
+	w.listErr = nil
+	w.resetObservationCounts()
+
+	result, err := r.Reconcile(t.Context(), now.Add(2*time.Millisecond))
+	require.NoError(t, err)
+	require.True(t, result.Scaled)
+	require.Equal(t, []int32{2}, w.desiredWrites)
+	require.Equal(t, 1, w.desiredCalls)
+	require.Zero(t, w.readyCalls)
+	require.Equal(t, 1, w.inventoryCalls)
+	require.Equal(t, 1, w.listCalls)
+	require.Equal(t, 1, w.snapshotASGCalls)
+	require.Empty(t, w.protectionWrites)
+}
+
+func TestScaleInObservationReaderRefreshesAfterInvalidation(t *testing.T) {
+	t.Parallel()
+
+	w := newScaleInWorld(2, true)
+	r := newTestScaleInReconciler(w)
+	reader := newScaleInObservationReader(r, time.Now)
+
+	first, err := reader.Read(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, int32(2), first.cloud.DesiredCapacity)
+	w.cloud.DesiredCapacity = 3
+	reader.InvalidateSuccessful()
+	second, err := reader.Read(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, int32(3), second.cloud.DesiredCapacity)
+	require.Equal(t, 2, w.inventoryCalls)
+	require.Equal(t, 2, w.listCalls)
+	require.Equal(t, 2, w.snapshotASGCalls)
 }
 
 func TestNomadMarkedRecoveryAndRestoringUseExactStateActions(t *testing.T) {
