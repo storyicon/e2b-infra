@@ -176,8 +176,8 @@ variable "capacity_controller_max_starting_per_node" {
 
 variable "capacity_controller_reconcile_interval" {
   type        = string
-  description = "Interval between capacity controller reconciliations"
-  default     = "1s"
+  description = "Interval between capacity controller reconciliations; shorter intervals increase shared AWS read API pressure"
+  default     = "5s"
 }
 
 variable "capacity_controller_scale_in_mode" {

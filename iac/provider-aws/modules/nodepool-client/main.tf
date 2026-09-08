@@ -169,6 +169,7 @@ resource "aws_autoscaling_group" "client" {
   vpc_zone_identifier   = var.vpc_private_subnets
   health_check_type     = "EC2"
   protect_from_scale_in = var.protect_from_scale_in
+  suspended_processes   = var.suspend_az_rebalance ? ["AZRebalance"] : []
 
   min_size         = var.min_size
   desired_capacity = var.cluster_size

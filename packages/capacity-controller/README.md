@@ -53,6 +53,35 @@ modes:
   or AWS.
 - `enforce` runs bounded, recoverable drain and ASG reconciliation.
 
+### AWS deployment defaults
+
+The AWS Terraform deployment defaults `capacity_controller_reconcile_interval`
+to `5s`; an explicit override still wins. The standalone binary retains its `1s`
+default. Five seconds reduces pressure on shared AWS read API limits, at the cost
+of up to four additional seconds before the next reconciliation compared with
+one second. This is not a guarantee against throttling: keep monitoring AWS
+errors and scale-in stabilization resets.
+
+With `capacity_controller_scale_in_mode = "enforce"`, Terraform suspends only
+`AZRebalance` on the sandbox-client ASG. Otherwise proactive AZ rebalancing can
+launch replacement instances during contraction, interrupt settled-membership
+checks, and restart the minimum-age wait for those new workers. Other node pools
+and the `Launch`, `Terminate`, `HealthCheck`, and `ReplaceUnhealthy` processes are
+unchanged. This is deployment configuration, not a new controller IAM permission.
+
+The trade-off is that existing AZ skew can persist; normal scale-out and scale-in
+still attempt to balance AZs. See [AWS process suspension behavior](https://docs.aws.amazon.com/autoscaling/ec2/userguide/understand-how-suspending-processes-affects-other-processes.html).
+In `off` or `observe`, Terraform configures no suspended processes on this ASG.
+Switching out of `enforce` therefore resumes proactive rebalancing: complete the
+safe rollback sequence below **before** applying that mode change, and account
+for replacement activity while AWS redistributes existing capacity.
+
+These settings do not change the 50-worker batch limit, stabilization window,
+minimum instance age, or termination proofs. Configuration validation alone does
+not establish full-fleet convergence time or production workload reliability.
+
+### Drain and recovery protocol
+
 The controller retains workload headroom and requires excess accepting capacity
 to remain stable before opening a drain. Candidate summaries are only a cheap
 filter. Each transaction then binds the Nomad node, EC2 instance, and worker

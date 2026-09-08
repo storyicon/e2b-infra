@@ -639,6 +639,13 @@ flowchart TB
   reconciliations, and safety-critical post-write checks still read fresh state. The lightweight
   desired-capacity read excludes ASG instance details. Scale-in never migrates or kills a Sandbox.
 
+  AWS Terraform defaults reconciliation to five seconds (explicit overrides remain supported;
+  the standalone binary defaults to one second). In `enforce`, it suspends only `AZRebalance`
+  on the sandbox-client ASG so proactive AZ replacement does not compete with contraction.
+  Ordinary scaling and unhealthy-instance replacement remain enabled, but existing AZ skew can
+  persist. Applying `off` or `observe` resumes proactive rebalancing, so the safe rollback
+  sequence below must complete before that Terraform change. No other node pool is affected.
+
   New sandbox-client ASG instances start with scale-in protection. A protected instance cannot be
   selected by normal ASG scale-in. The controller writes an owned Nomad drain marker and asks the
   exact worker service instance to enter Draining under a stable operation ID. Discovery carries

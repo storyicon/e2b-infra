@@ -76,6 +76,12 @@ variable "scale_in_protection_required" {
   default     = false
 }
 
+variable "suspend_az_rebalance" {
+  type        = bool
+  description = "Suspend proactive AZ replacement while the capacity controller owns safe scale-in"
+  default     = false
+}
+
 variable "machine_type" {
   type    = string
   default = "m8i.4xlarge"
