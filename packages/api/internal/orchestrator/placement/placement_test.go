@@ -44,8 +44,8 @@ func TestNodeExhaustedLogLevel(t *testing.T) {
 	require.Equal(t, zap.DebugLevel, nodeExhaustedLogLevel)
 }
 
-func (m *mockAlgorithm) chooseNode(ctx context.Context, nodes []*nodemanager.Node, nodesExcluded map[string]struct{}, requested nodemanager.SandboxResources, cpu CPURequirement, filterByLabels bool, requiredLabels []string) (*nodemanager.Node, error) {
-	args := m.Called(ctx, nodes, nodesExcluded, requested, cpu, filterByLabels, requiredLabels)
+func (m *mockAlgorithm) chooseNode(ctx context.Context, nodes []*nodemanager.Node, nodesExcluded map[string]struct{}, requested nodemanager.SandboxResources, cpu CPURequirement, features FeatureRequirement, filterByLabels bool, requiredLabels []string) (*nodemanager.Node, error) {
+	args := m.Called(ctx, nodes, nodesExcluded, requested, cpu, features, filterByLabels, requiredLabels)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
@@ -65,7 +65,7 @@ func TestPlaceSandbox_SuccessfulPlacement(t *testing.T) {
 
 	// Create a mock algorithm that returns node2
 	algorithm := &mockAlgorithm{}
-	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(node2, nil)
 
 	sbxRequest := &orchestrator.SandboxCreateRequest{
@@ -102,8 +102,8 @@ func TestPlaceSandboxSelectsAnotherNodeWhenCreateReservationsAreFull(t *testing.
 
 	nodes := []*nodemanager.Node{full, available}
 	algorithm := &mockAlgorithm{}
-	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(full, nil).Once()
-	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(available, nil).Once()
+	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(full, nil).Once()
+	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(available, nil).Once()
 
 	result, err := PlaceSandbox(t.Context(), algorithm, nodes, nil, testSbxRequest("new-sandbox"), CPURequirement{}, false, nil)
 	require.NoError(t, err)
@@ -133,8 +133,8 @@ func TestPlaceSandboxReturnsCapacityWhenAllCreateReservationsAreFull(t *testing.
 
 	nodes := []*nodemanager.Node{first, second}
 	algorithm := &mockAlgorithm{}
-	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(first, nil).Once()
-	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(second, nil).Once()
+	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(first, nil).Once()
+	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(second, nil).Once()
 
 	result, err := PlaceSandboxOncePerNode(t.Context(), algorithm, nodes, nil, testSbxRequest("new-sandbox"), CPURequirement{}, false, nil)
 	require.Error(t, err)
@@ -163,7 +163,7 @@ func TestPlaceSandboxPreferredNodeCannotBypassCreateReservation(t *testing.T) {
 
 	nodes := []*nodemanager.Node{preferred, available}
 	algorithm := &mockAlgorithm{}
-	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(available, nil).Once()
+	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(available, nil).Once()
 
 	result, err := PlaceSandbox(t.Context(), algorithm, nodes, preferred, testSbxRequest("new-sandbox"), CPURequirement{}, false, nil)
 	require.NoError(t, err)
@@ -181,7 +181,7 @@ func TestPlaceSandboxReleasesCreateReservationOnEveryTerminalOutcome(t *testing.
 		node := nodemanager.NewTestNode("success", api.NodeStatusReady, 0, 4)
 		node.PlacementMetrics.SetCreateConcurrencyLimit(1)
 		algorithm := &mockAlgorithm{}
-		algorithm.On("chooseNode", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(node, nil).Once()
+		algorithm.On("chooseNode", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(node, nil).Once()
 
 		_, err := PlaceSandbox(t.Context(), algorithm, []*nodemanager.Node{node}, nil, testSbxRequest("sandbox"), CPURequirement{}, false, nil)
 		require.NoError(t, err)
@@ -195,7 +195,7 @@ func TestPlaceSandboxReleasesCreateReservationOnEveryTerminalOutcome(t *testing.
 		node := nodemanager.NewTestNode("failure", api.NodeStatusReady, 0, 4, nodemanager.WithSandboxCreateError(status.Error(codes.Internal, "create failed")))
 		node.PlacementMetrics.SetCreateConcurrencyLimit(1)
 		algorithm := &mockAlgorithm{}
-		algorithm.On("chooseNode", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(node, nil).Once()
+		algorithm.On("chooseNode", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(node, nil).Once()
 
 		_, err := PlaceSandbox(t.Context(), algorithm, []*nodemanager.Node{node}, nil, testSbxRequest("sandbox"), CPURequirement{}, false, nil)
 		require.Error(t, err)
@@ -211,7 +211,7 @@ func TestPlaceSandboxReleasesCreateReservationOnEveryTerminalOutcome(t *testing.
 		started := make(chan struct{})
 		node.SetSandboxClient(&contextBlockingSandboxClient{started: started})
 		algorithm := &mockAlgorithm{}
-		algorithm.On("chooseNode", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(node, nil).Once()
+		algorithm.On("chooseNode", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(node, nil).Once()
 
 		ctx, cancel := context.WithCancel(t.Context())
 		result := make(chan error, 1)
@@ -248,7 +248,7 @@ func TestPlaceSandbox_WithPreferredNode(t *testing.T) {
 
 	// Test without preferred node - algorithm should be called
 	algorithm := &mockAlgorithm{}
-	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(node1, nil).Once()
 
 	resultNode, err := PlaceSandbox(ctx, algorithm, nodes, nil, sbxRequest, CPURequirement{}, false, nil)
@@ -272,7 +272,7 @@ func TestPlaceSandbox_ContextTimeout(t *testing.T) {
 	defer cancel()
 
 	algorithm := &mockAlgorithm{}
-	algorithm.On("chooseNode", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+	algorithm.On("chooseNode", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Run(func(_ mock.Arguments) {
 			// Simulate slow node selection
 			time.Sleep(10 * time.Millisecond)
@@ -322,7 +322,7 @@ func TestPlaceSandbox_AllNodesExcluded(t *testing.T) {
 	ctx := t.Context()
 
 	algorithm := &mockAlgorithm{}
-	algorithm.On("chooseNode", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+	algorithm.On("chooseNode", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(nil, errors.New("no nodes available"))
 
 	sbxRequest := &orchestrator.SandboxCreateRequest{
@@ -355,9 +355,9 @@ func TestPlaceSandbox_ResourceExhausted(t *testing.T) {
 
 	// Algorithm should be called twice - first returns node1 (exhausted), then node2 (succeeds)
 	algorithm := &mockAlgorithm{}
-	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(node1, nil).Once()
-	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(node2, nil).Once()
 
 	sbxRequest := &orchestrator.SandboxCreateRequest{
@@ -472,7 +472,7 @@ func TestPlaceSandbox_TriggersOptimisticUpdate(t *testing.T) {
 
 	// Mock algorithm directly returns node1
 	algorithm := &mockAlgorithm{}
-	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+	algorithm.On("chooseNode", mock.Anything, nodes, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(node1, nil)
 
 	// Request 2 vCPUs

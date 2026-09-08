@@ -32,3 +32,15 @@ func TestServiceInfoResponseCreateLimitRoundTrips(t *testing.T) {
 	require.NoError(t, proto.Unmarshal(payload, &decoded))
 	require.Equal(t, uint64(16), decoded.GetSandboxCreateConcurrencyLimit())
 }
+
+func TestLegacyServiceInfoDoesNotClaimSafeScaleInSupport(t *testing.T) {
+	t.Parallel()
+
+	legacyPayload, err := proto.Marshal(&ServiceInfoResponse{MetricSandboxesRunning: 0})
+	require.NoError(t, err)
+
+	var decoded ServiceInfoResponse
+	require.NoError(t, proto.Unmarshal(legacyPayload, &decoded))
+	require.False(t, decoded.GetSafeScaleInSupported())
+	require.False(t, decoded.GetShutdownReady())
+}

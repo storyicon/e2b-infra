@@ -120,6 +120,7 @@ type harvestProbe struct {
 	tmpls    *fakeHarvestTemplates
 	upload   *fakeHarvestUpload
 	released bool
+	reapErr  error
 
 	uploadCalled bool
 	uploadErr    error
@@ -153,11 +154,33 @@ func newHarvestProbe() *harvestProbe {
 
 			return p.uploadErr
 		},
-		acquire: func(context.Context) error { return p.acquireErr },
-		release: func() { p.released = true },
+		acquire: func(context.Context) (func(), error) {
+			if p.acquireErr != nil {
+				return nil, p.acquireErr
+			}
+
+			return func() { p.released = true }, nil
+		},
+		reapFailed: func(_ context.Context, err error) { p.reapErr = err },
 	}
 
 	return p
+}
+
+func TestHarvestRun_ReapFailureIsReportedAndFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	p := newHarvestProbe()
+	p.inst.stopErr = errors.New("stop failed")
+	p.inst.closeErr = errors.New("close failed")
+
+	_, outcome, err := p.run(t.Context(), false)
+
+	require.ErrorContains(t, err, "reap throwaway")
+	require.Equal(t, harvestSuccess, outcome, "the trace was collected before cleanup failed")
+	require.ErrorIs(t, p.reapErr, p.inst.stopErr)
+	require.ErrorIs(t, p.reapErr, p.inst.closeErr)
+	require.True(t, p.released, "the bounded start slot must still be released")
 }
 
 func (p *harvestProbe) run(ctx context.Context, consume bool) (int, harvestOutcome, error) {

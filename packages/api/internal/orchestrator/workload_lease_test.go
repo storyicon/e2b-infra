@@ -197,7 +197,8 @@ func TestCreateSandboxWorkloadLifecycleCommitsBeforeSuccessCallback(t *testing.T
 	o.routingCatalog = workloadTestCatalog{}
 	o.startIntentLeaseTTL = time.Minute
 	o.startIntentHeartbeatInterval = time.Hour
-	o.sandboxStore = sandbox.NewStore(newMemorySandboxStorage(), reservations, sandbox.Callbacks{
+	storage := newMemorySandboxStorage()
+	o.sandboxStore = sandbox.NewStore(storage, storage, reservations, sandbox.Callbacks{
 		AddSandboxToRoutingTable: func(context.Context, sandbox.Sandbox) error {
 			workloads.appendHistory("routing")
 

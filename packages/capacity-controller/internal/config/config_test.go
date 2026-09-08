@@ -31,6 +31,71 @@ func TestLoadUsesSafeDefaults(t *testing.T) { //nolint:paralleltest // environme
 	require.Equal(t, time.Duration(0), cfg.BatchIdleDuration)
 	require.Equal(t, time.Duration(0), cfg.BatchMaxDuration)
 	require.Equal(t, 10*time.Second, cfg.ReconcileTimeout)
+	require.Equal(t, "off", string(cfg.ScaleInMode))
+	require.Equal(t, 10, cfg.ScaleInHeadroomPercent)
+	require.Equal(t, 2*time.Minute, cfg.ScaleInStabilization)
+	require.Equal(t, 10*time.Minute, cfg.ScaleInMinimumNodeAge)
+	require.Equal(t, 15*time.Minute, cfg.ScaleInDrainTimeout)
+}
+
+func TestLoadSupportsExplicitScaleInModes(t *testing.T) {
+	for _, mode := range []string{"off", "observe", "enforce"} {
+		t.Run(mode, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("SCALE_IN_MODE", mode)
+			if mode != "off" {
+				t.Setenv("CAPACITY_DEMAND_MODE", "start-intent-v1")
+				t.Setenv("REDIS_URL", "")
+				t.Setenv("CAPACITY_SNAPSHOT_GRPC_ADDRESS", "api-internal-grpc.service.consul:5009")
+				t.Setenv("CAPACITY_SNAPSHOT_SERVICE_TOKEN", "service-token")
+				t.Setenv("START_INTENT_BATCH_IDLE_DURATION", "1s")
+				t.Setenv("START_INTENT_BATCH_MAX_DURATION", "10s")
+			}
+
+			cfg, err := Load()
+			require.NoError(t, err)
+			require.Equal(t, mode, string(cfg.ScaleInMode))
+		})
+	}
+}
+
+func TestLoadRejectsUnknownScaleInMode(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("SCALE_IN_MODE", "enabled")
+
+	_, err := Load()
+	require.ErrorContains(t, err, "SCALE_IN_MODE")
+}
+
+func TestLoadRequiresStartIntentModeForScaleIn(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("SCALE_IN_MODE", "observe")
+
+	_, err := Load()
+	require.ErrorContains(t, err, "start-intent-v1")
+}
+
+func TestLoadValidatesScaleInSettings(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "headroom", key: "SCALE_IN_HEADROOM_PERCENT", value: "-1"},
+		{name: "stabilization", key: "SCALE_IN_STABILIZATION_DURATION", value: "0s"},
+		{name: "minimum node age", key: "SCALE_IN_MIN_NODE_AGE", value: "0s"},
+		{name: "drain timeout", key: "SCALE_IN_DRAIN_TIMEOUT", value: "0s"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv(tt.key, tt.value)
+
+			_, err := Load()
+			require.ErrorContains(t, err, tt.key)
+		})
+	}
 }
 
 func TestLoadValidatesStartIntentBatchDurations(t *testing.T) {

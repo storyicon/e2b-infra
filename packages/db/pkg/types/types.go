@@ -85,13 +85,27 @@ type SandboxNetworkEgressConfig struct {
 const AllowPublicAccessDefault = true
 
 type SandboxNetworkIngressConfig struct {
-	AllowPublicAccess *bool   `json:"allowPublicAccess,omitempty"`
-	MaskRequestHost   *string `json:"maskRequestHost,omitempty"`
+	AllowPublicAccess *bool    `json:"allowPublicAccess,omitempty"`
+	MaskRequestHost   *string  `json:"maskRequestHost,omitempty"`
+	HTTPSPorts        []uint32 `json:"httpsPorts,omitempty"`
 }
 
 type SandboxNetworkConfig struct {
 	Egress  *SandboxNetworkEgressConfig  `json:"egress,omitempty"`
 	Ingress *SandboxNetworkIngressConfig `json:"ingress,omitempty"`
+}
+
+// HasEgressProxy reports whether a customer-supplied SOCKS5 egress proxy is
+// configured. The address is the single source of truth: credentials are
+// optional and are never set without it.
+func (c *SandboxNetworkConfig) HasEgressProxy() bool {
+	return c != nil && c.Egress != nil && c.Egress.EgressProxyAddress != ""
+}
+
+// HasEgressProxyAuth reports whether the egress proxy is configured with
+// RFC 1929 credentials.
+func (c *SandboxNetworkConfig) HasEgressProxyAuth() bool {
+	return c.HasEgressProxy() && c.Egress.EgressProxyUsername != ""
 }
 
 type SandboxVolumeMountConfig struct {

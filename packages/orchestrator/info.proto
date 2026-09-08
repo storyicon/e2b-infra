@@ -53,6 +53,8 @@ message ServiceInfoResponse {
   // Effective concurrent Sandbox.Create limit enforced by this worker.
   // Zero means the worker predates this field and did not advertise a limit.
   uint64 sandbox_create_concurrency_limit = 57;
+  // Safe scale-in fields are authoritative only when this capability is true.
+  bool safe_scale_in_supported = 58;
 
   int64 metric_vcpu_used = 101 [deprecated = true];
   int64 metric_memory_used_mb = 102 [deprecated = true];
@@ -80,13 +82,31 @@ message ServiceInfoResponse {
   uint64 metric_hugepages_used = 115;
   uint64 metric_hugepages_reserved = 116;
   uint64 metric_hugepage_size_bytes = 117;
+
+  uint64 sandbox_starts_in_flight = 118;
+  uint64 lifecycle_cleanups_in_flight = 119;
+  uint64 snapshot_uploads_in_flight = 120;
+  bool shutdown_ready = 121;
+  // Stable owner of a capacity-controller initiated drain.
+  string scale_in_operation_id = 122;
+  reserved 123, 124;
+  reserved "scale_in_termination_acquired", "scale_in_termination_release_token";
 }
 
 message ServiceStatusChangeRequest {
   ServiceInfoStatus service_status = 2;
+  // When set, the worker changes status only if this process identity matches.
+  string expected_service_id = 3;
+  // Stable owner required for controller Begin and Cancel transitions.
+  string operation_id = 4;
+  reserved 5;
+  reserved "expected_termination_release_token";
 }
 
 service InfoService {
   rpc ServiceInfo(google.protobuf.Empty) returns (ServiceInfoResponse);
   rpc ServiceStatusOverride(ServiceStatusChangeRequest) returns (google.protobuf.Empty);
+  // Dedicated conditional mutation endpoint. Older workers return
+  // UNIMPLEMENTED without applying the requested transition.
+  rpc ConditionalServiceStatusOverride(ServiceStatusChangeRequest) returns (google.protobuf.Empty);
 }

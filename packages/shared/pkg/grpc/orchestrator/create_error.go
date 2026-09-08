@@ -10,6 +10,7 @@ const (
 	SandboxCreateErrorDomain           = "e2b.orchestrator.sandbox.create"
 	SandboxGuestReadinessTimeoutReason = "SANDBOX_GUEST_READINESS_TIMEOUT"
 	SandboxCreateCleanupFailedReason   = "SANDBOX_CREATE_CLEANUP_FAILED"
+	SandboxNodeDrainingReason          = "NODE_DRAINING"
 	SandboxCreateRetrySafeMetadataKey  = "retry_safe"
 )
 
@@ -32,6 +33,16 @@ func NewSandboxCreateError(code codes.Code, reason, message string, retrySafe bo
 	}
 
 	return st.Err()
+}
+
+func IsSandboxNodeDraining(err error) bool {
+	if status.Code(err) != codes.ResourceExhausted {
+		return false
+	}
+
+	info, ok := SandboxCreateErrorInfo(err)
+
+	return ok && info.GetReason() == SandboxNodeDrainingReason
 }
 
 // SandboxCreateErrorInfo returns only details from this protocol domain.

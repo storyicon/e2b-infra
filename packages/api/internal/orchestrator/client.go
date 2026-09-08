@@ -13,17 +13,18 @@ import (
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
 )
 
 const nodeHealthCheckTimeout = time.Second * 2
 
-func (o *Orchestrator) connectToNode(ctx context.Context, discovered nodemanager.NomadServiceDiscovery) error {
+func (o *Orchestrator) connectToNode(ctx context.Context, discovered nodemanager.NodePlaneInstance) error {
 	ctx, childSpan := tracer.Start(ctx, "connect-to-node")
 	defer childSpan.End()
 
-	_, err, _ := o.connectGroup.Do(discovered.NomadNodeShortID, func() (any, error) {
+	_, err, _ := o.connectGroup.Do(discovered.WorkloadID, func() (any, error) {
 		// Re-check inside the singleflight to prevent race issues due to overwriting existing nodes in the map
-		if o.GetNodeByNomadShortID(discovered.NomadNodeShortID) != nil {
+		if o.GetNodeByWorkloadID(discovered.WorkloadID) != nil {
 			return nil, nil
 		}
 
@@ -123,18 +124,24 @@ func (o *Orchestrator) scopedNodeID(clusterID uuid.UUID, nodeID string) string {
 // because callers use it directly to dial the orchestrator gRPC server.
 //
 // (Name kept for blast-radius reasons; renaming touches >20 sites.)
-func (o *Orchestrator) listNomadNodes(ctx context.Context) ([]nodemanager.NomadServiceDiscovery, error) {
+func (o *Orchestrator) listNomadNodes(ctx context.Context) ([]nodemanager.NodePlaneInstance, error) {
 	instances, err := o.nodeDiscovery.ListInstances(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	result := make([]nodemanager.NomadServiceDiscovery, 0, len(instances))
+	result := make([]nodemanager.NodePlaneInstance, 0, len(instances))
 	for _, i := range instances {
-		result = append(result, nodemanager.NomadServiceDiscovery{
-			NomadNodeShortID:    i.ID,
+		nomadNodeID := ""
+		if i.Backend == servicediscovery.BackendNomad {
+			nomadNodeID = i.NodeID
+		}
+		result = append(result, nodemanager.NodePlaneInstance{
+			WorkloadID:          i.WorkloadID,
+			NomadNodeID:         nomadNodeID,
 			OrchestratorAddress: i.Address(),
 			IPAddress:           i.IPAddress,
+			Backend:             i.Backend,
 		})
 	}
 
@@ -186,7 +193,12 @@ func (o *Orchestrator) getOrConnectNode(ctx context.Context, clusterID uuid.UUID
 		connectCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheSyncTime)
 		defer cancel()
 
-		if clusterID == consts.LocalClusterID {
+		// The periodic loop already treats the local clusters registry as the
+		// only source of orchestrator nodes when it owns them; this path has to
+		// agree, or the same process registers twice — once under the node ID
+		// it reports over gRPC and once under its discovery item ID — and has
+		// its capacity and sandboxes counted twice.
+		if clusterID == consts.LocalClusterID && !o.localClusterOwnsOrchestrators {
 			o.discoverNomadNodes(connectCtx)
 		} else {
 			o.discoverClusterNode(connectCtx, clusterID)
@@ -215,11 +227,11 @@ func (o *Orchestrator) discoverNomadNodes(ctx context.Context) {
 	defer wg.Wait()
 
 	for _, n := range nomadNodes {
-		if o.GetNodeByNomadShortID(n.NomadNodeShortID) == nil {
+		if o.GetNodeByWorkloadID(n.WorkloadID) == nil {
 			wg.Go(func() {
 				if err := o.connectToNode(ctx, n); err != nil {
 					logger.L().Error(ctx, "Error connecting to Nomad node on demand",
-						zap.Error(err), zap.String("nomad_short_id", n.NomadNodeShortID))
+						zap.Error(err), zap.String("nomad_short_id", n.WorkloadID))
 				}
 			})
 		}
@@ -298,9 +310,9 @@ func (o *Orchestrator) GetClusterNodes(clusterID uuid.UUID) []*nodemanager.Node 
 }
 
 // Deprecated: use GetNode instead
-func (o *Orchestrator) GetNodeByNomadShortID(id string) *nodemanager.Node {
+func (o *Orchestrator) GetNodeByWorkloadID(id string) *nodemanager.Node {
 	for _, n := range o.nodes.Items() {
-		if n.NomadNodeShortID == id {
+		if n.WorkloadID == id {
 			return n
 		}
 	}

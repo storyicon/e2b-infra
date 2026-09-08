@@ -30,6 +30,11 @@ type Config struct {
 	BatchIdleDuration            time.Duration
 	BatchMaxDuration             time.Duration
 	ReconcileTimeout             time.Duration
+	ScaleInMode                  controller.ScaleInMode
+	ScaleInHeadroomPercent       int
+	ScaleInStabilization         time.Duration
+	ScaleInMinimumNodeAge        time.Duration
+	ScaleInDrainTimeout          time.Duration
 }
 
 func Load() (*Config, error) {
@@ -78,6 +83,30 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	scaleInModeValue := os.Getenv("SCALE_IN_MODE")
+	if scaleInModeValue == "" {
+		scaleInModeValue = string(controller.ScaleInModeOff)
+	}
+	scaleInMode, err := controller.ParseScaleInMode(scaleInModeValue)
+	if err != nil {
+		return nil, fmt.Errorf("SCALE_IN_MODE: %w", err)
+	}
+	scaleInHeadroomPercent, err := intEnv("SCALE_IN_HEADROOM_PERCENT", 10)
+	if err != nil {
+		return nil, err
+	}
+	scaleInStabilization, err := durationEnv("SCALE_IN_STABILIZATION_DURATION", 2*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	scaleInMinimumNodeAge, err := durationEnv("SCALE_IN_MIN_NODE_AGE", 10*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	scaleInDrainTimeout, err := durationEnv("SCALE_IN_DRAIN_TIMEOUT", 15*time.Minute)
+	if err != nil {
+		return nil, err
+	}
 
 	cfg := &Config{
 		Mode:                         mode,
@@ -99,6 +128,11 @@ func Load() (*Config, error) {
 		BatchIdleDuration:            batchIdleDuration,
 		BatchMaxDuration:             batchMaxDuration,
 		ReconcileTimeout:             reconcileTimeout,
+		ScaleInMode:                  scaleInMode,
+		ScaleInHeadroomPercent:       scaleInHeadroomPercent,
+		ScaleInStabilization:         scaleInStabilization,
+		ScaleInMinimumNodeAge:        scaleInMinimumNodeAge,
+		ScaleInDrainTimeout:          scaleInDrainTimeout,
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -160,6 +194,21 @@ func (c *Config) validate() error {
 	}
 	if c.ReconcileTimeout <= 0 {
 		return errors.New("RECONCILE_TIMEOUT must be positive")
+	}
+	if c.ScaleInHeadroomPercent < 0 {
+		return errors.New("SCALE_IN_HEADROOM_PERCENT must be non-negative")
+	}
+	if c.ScaleInStabilization <= 0 {
+		return errors.New("SCALE_IN_STABILIZATION_DURATION must be positive")
+	}
+	if c.ScaleInMinimumNodeAge <= 0 {
+		return errors.New("SCALE_IN_MIN_NODE_AGE must be positive")
+	}
+	if c.ScaleInDrainTimeout <= 0 {
+		return errors.New("SCALE_IN_DRAIN_TIMEOUT must be positive")
+	}
+	if c.ScaleInMode != controller.ScaleInModeOff && c.Mode != controller.ModeStartIntentV1 {
+		return errors.New("SCALE_IN_MODE observe or enforce requires CAPACITY_DEMAND_MODE=start-intent-v1")
 	}
 
 	return nil

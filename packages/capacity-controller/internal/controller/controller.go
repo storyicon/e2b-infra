@@ -59,30 +59,43 @@ type Config struct {
 	BatchIdleDuration time.Duration
 	BatchMaxDuration  time.Duration
 	ReconcileTimeout  time.Duration
+	ScaleInMode       ScaleInMode
+	ScaleInHeadroom   int
+	ScaleInStableFor  time.Duration
+	ScaleInMinimumAge time.Duration
+	ScaleInTimeout    time.Duration
 }
 
 type Result struct {
-	Mode               Mode
-	WorkloadCount      int64
-	PendingSandboxes   int64
-	TotalFulfilled     int64
-	TotalDirectSuccess int64
-	BurstDemand        int64
-	ReadyNodes         int32
-	ReadyNodesObserved bool
-	ReadyNodesError    error
-	DesiredNodes       int32
-	TargetNodes        int32
-	Capped             bool
-	Scaled             bool
-	Aggregating        bool
-	BatchTrigger       string
+	Mode                Mode
+	WorkloadCount       int64
+	PendingSandboxes    int64
+	TotalFulfilled      int64
+	TotalDirectSuccess  int64
+	BurstDemand         int64
+	ReadyNodes          int32
+	ReadyNodesObserved  bool
+	ReadyNodesError     error
+	DesiredNodes        int32
+	TargetNodes         int32
+	Capped              bool
+	Scaled              bool
+	Aggregating         bool
+	BatchTrigger        string
+	ScaleInSafeRequired int64
+	ScaleInAccepting    int32
+	ScaleInExcess       int32
+	ScaleInDraining     int32
+	ScaleInCancelled    int32
+	ScaleInTerminated   int32
+	ScaleInStable       bool
+	ScaleInReadError    error
 }
 
-// Reconciler deliberately supports scale-out only. The legacy mode keeps its
-// process-local burst accounting for explicit rollback. Start-intent mode is
-// level-triggered from an external workload snapshot and ASG desired capacity,
-// so it does not carry burst state across reconciliations.
+// The legacy mode keeps its process-local burst accounting for explicit
+// rollback. Start-intent mode is level-triggered from an external workload
+// snapshot and ASG desired capacity, so it does not carry burst state across
+// reconciliations. Scale-in is an optional, independently fail-closed path.
 type Reconciler struct {
 	config   *Config
 	demand   DemandReader
@@ -97,6 +110,7 @@ type Reconciler struct {
 	mu               sync.Mutex
 	burst            burst
 	startIntentBatch startIntentBatch
+	scaleIn          *scaleInRuntime
 }
 
 type startIntentBatch struct {
@@ -140,6 +154,10 @@ func New(config *Config, demand DemandReader, snapshot CapacitySnapshotReader, n
 func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Result, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	startedAt := time.Now()
+	currentTime := func() time.Time {
+		return now.Add(time.Since(startedAt))
+	}
 	if r.config.ReconcileTimeout <= 0 {
 		return Result{Mode: r.config.Mode}, errors.New("reconcile timeout must be positive")
 	}
@@ -160,13 +178,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Result, erro
 			return Result{Mode: r.config.Mode}, errors.New("start-intent batch idle duration must not exceed max duration")
 		}
 
-		return r.reconcileStartIntent(reconcileCtx, now)
+		return r.reconcileStartIntent(reconcileCtx, now, currentTime)
 	default:
 		return Result{Mode: r.config.Mode}, fmt.Errorf("unsupported capacity demand mode %q", r.config.Mode)
 	}
 }
 
-func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time) (Result, error) {
+func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time, currentTime func() time.Time) (Result, error) {
 	result := Result{Mode: ModeStartIntentV1}
 	if r.snapshot == nil {
 		return result, errors.New("start-intent capacity snapshot reader is required")
@@ -193,7 +211,27 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time) (R
 	}
 	result.DesiredNodes = desired
 
-	required := ceilDiv(snapshot.WorkloadCount, int64(r.config.SlotsPerNode))
+	rawRequired := ceilDiv(snapshot.WorkloadCount, int64(r.config.SlotsPerNode))
+	required := rawRequired
+	rawGrowth := rawRequired > int64(desired)
+	scaleInObservation := newScaleInObservationReader(r, currentTime)
+	// Raw demand growth takes priority over every scale-in observation. Apply
+	// that increase first; only then observe and compensate already-draining
+	// workers so continuous demand growth cannot starve either path.
+	if r.config.ScaleInMode == ScaleInModeEnforce && !rawGrowth {
+		observation, scaleInErr := scaleInObservation.Read(ctx)
+		if scaleInErr != nil {
+			// Scale-in observations may only increase a scale-out target. If they
+			// are unavailable, reset stabilization and preserve the authoritative
+			// pre-existing raw scale-out formula instead of blocking demand.
+			if r.scaleIn != nil {
+				r.scaleIn.stabilizer.Reset()
+			}
+			result.ScaleInReadError = fmt.Errorf("read scale-in inputs before scale-out: %w", scaleInErr)
+		} else {
+			required = scaleOutRequiredFromObservation(required, observation)
+		}
+	}
 	uncapped := max(int64(desired), required, int64(r.config.MinNodes))
 	result.Capped = uncapped > int64(r.config.MaxNodes)
 	target := clampInt32(uncapped, r.config.MinNodes, r.config.MaxNodes)
@@ -203,8 +241,13 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time) (R
 		if !ready {
 			result.TargetNodes = desired
 			result.Aggregating = true
+			result = r.observeReadyNodesForScaleIn(ctx, result, scaleInObservation)
+			if result.ScaleInReadError != nil {
+				//nolint:nilerr // Scale-in observation failures remain diagnostic-only for the raw scale-out path.
+				return result, nil
+			}
 
-			return r.observeReadyNodes(ctx, result)
+			return r.reconcileExistingScaleInOperations(ctx, currentTime, snapshot.WorkloadCount, result, scaleInObservation), nil
 		}
 		result.BatchTrigger = trigger
 		batch := r.startIntentBatch
@@ -224,11 +267,61 @@ func (r *Reconciler) reconcileStartIntent(ctx context.Context, now time.Time) (R
 		}
 		result.Scaled = true
 		r.startIntentBatch = startIntentBatch{}
+		scaleInObservation.InvalidateSuccessful()
+
+		if r.config.ScaleInMode == ScaleInModeEnforce && rawGrowth && target < r.config.MaxNodes {
+			observation, scaleInErr := scaleInObservation.Read(ctx)
+			if scaleInErr != nil {
+				r.scaleIn.stabilizer.Reset()
+				result.ScaleInReadError = fmt.Errorf("read scale-in inputs before scale-out: %w", scaleInErr)
+			} else {
+				compensatedRequired := scaleOutRequiredFromObservation(int64(target), observation)
+				compensatedTarget := clampInt32(compensatedRequired, r.config.MinNodes, r.config.MaxNodes)
+				if compensatedTarget > target {
+					if err := r.setDesiredCapacity(ctx, ScaleAuditEvent{
+						Mode:           r.config.Mode,
+						WorkloadCount:  snapshot.WorkloadCount,
+						CurrentDesired: target,
+						Target:         compensatedTarget,
+						BatchTrigger:   "drain-compensation",
+					}); err != nil {
+						return result, fmt.Errorf("compensate ASG desired capacity for draining workers to %d: %w", compensatedTarget, err)
+					}
+					result.TargetNodes = compensatedTarget
+					result.Capped = compensatedRequired > int64(r.config.MaxNodes)
+					scaleInObservation.InvalidateSuccessful()
+				}
+			}
+		}
 	} else {
 		r.startIntentBatch = startIntentBatch{}
 	}
 
-	return r.observeReadyNodes(ctx, result)
+	result = r.observeReadyNodesForScaleIn(ctx, result, scaleInObservation)
+	if result.ScaleInReadError != nil {
+		//nolint:nilerr // Scale-in observation failures remain diagnostic-only for the raw scale-out path.
+		return result, nil
+	}
+	if result.Scaled || result.Aggregating {
+		return r.reconcileExistingScaleInOperations(ctx, currentTime, snapshot.WorkloadCount, result, scaleInObservation), nil
+	}
+
+	return r.reconcileScaleInWithObservationReader(ctx, currentTime, snapshot.WorkloadCount, result, true, scaleInObservation)
+}
+
+func (r *Reconciler) reconcileExistingScaleInOperations(ctx context.Context, currentTime func() time.Time, workloadCount int64, result Result, scaleInObservation *scaleInObservationReader) Result {
+	if r.config.ScaleInMode != ScaleInModeEnforce {
+		return result
+	}
+
+	updated, err := r.reconcileScaleInWithObservationReader(ctx, currentTime, workloadCount, result, false, scaleInObservation)
+	if err != nil {
+		// Existing drain recovery is auxiliary to scale-out. Keep the raw demand
+		// path non-blocking while surfacing the exact recovery failure.
+		updated.ScaleInReadError = errors.Join(updated.ScaleInReadError, err)
+	}
+
+	return updated
 }
 
 func (r *Reconciler) setDesiredCapacity(ctx context.Context, audit ScaleAuditEvent) error {
@@ -307,17 +400,41 @@ func (r *Reconciler) startIntentBatchReady(now time.Time, workloadCount int64, d
 	return false, ""
 }
 
-func (r *Reconciler) observeReadyNodes(ctx context.Context, result Result) (Result, error) {
+func (r *Reconciler) observeReadyNodes(ctx context.Context, result Result) Result {
 	ready, readyErr := r.nodes.ReadyCount(ctx, r.config.NodePool)
 	if readyErr != nil {
 		result.ReadyNodesError = fmt.Errorf("count ready Nomad nodes: %w", readyErr)
 
-		return result, nil
+		return result
 	}
 	result.ReadyNodes = ready
 	result.ReadyNodesObserved = true
 
-	return result, nil
+	return result
+}
+
+func observeReadyNodesFromInventory(result Result, nodes []NomadScaleInNode) Result {
+	for _, node := range nodes {
+		if node.Ready && node.Eligible {
+			result.ReadyNodes++
+		}
+	}
+	result.ReadyNodesObserved = true
+
+	return result
+}
+
+func (r *Reconciler) observeReadyNodesForScaleIn(ctx context.Context, result Result, scaleInObservation *scaleInObservationReader) Result {
+	useScaleInObservation := r.config.ScaleInMode == ScaleInModeEnforce ||
+		(r.config.ScaleInMode == ScaleInModeObserve && !result.Scaled && !result.Aggregating)
+	if useScaleInObservation {
+		_, _ = scaleInObservation.Read(ctx)
+		if observed, available := scaleInObservation.ObserveReadyNodes(result); available {
+			return observed
+		}
+	}
+
+	return r.observeReadyNodes(ctx, result)
 }
 
 func (r *Reconciler) reconcileLegacy(ctx context.Context, now time.Time) (Result, error) {

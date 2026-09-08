@@ -119,7 +119,7 @@ func TestBestOfK_ChooseNode(t *testing.T) {
 	}
 
 	// Test selection - should work with proper config
-	selected, err := algo.chooseNode(ctx, nodes, excludedNodes, resources, CPURequirement{}, false, nil)
+	selected, err := algo.chooseNode(ctx, nodes, excludedNodes, resources, CPURequirement{}, FeatureRequirement{}, false, nil)
 	require.NoError(t, err)
 	assert.NotNil(t, selected)
 	assert.Contains(t, []string{"node1", "node2", "node3"}, selected.ID)
@@ -152,7 +152,7 @@ func TestBestOfK_ChooseNode_WithExclusions(t *testing.T) {
 		MiBMemory: 512,
 	}
 
-	selected, err := algo.chooseNode(ctx, nodes, excludedNodes, resources, CPURequirement{}, false, nil)
+	selected, err := algo.chooseNode(ctx, nodes, excludedNodes, resources, CPURequirement{}, FeatureRequirement{}, false, nil)
 	require.NoError(t, err)
 	// Should not select excluded node
 	assert.NotEqual(t, "node2", selected.ID)
@@ -176,7 +176,7 @@ func TestBestOfK_ChooseNode_NoAvailableNodes(t *testing.T) {
 		MiBMemory: 1024,
 	}
 
-	selected, err := algo.chooseNode(ctx, nodes, excludedNodes, resources, CPURequirement{}, false, nil)
+	selected, err := algo.chooseNode(ctx, nodes, excludedNodes, resources, CPURequirement{}, FeatureRequirement{}, false, nil)
 	var noNodesErr NoNodesAvailableError
 	require.ErrorAs(t, err, &noNodesErr)
 	assert.Nil(t, selected)
@@ -195,6 +195,7 @@ func TestBestOfK_ChooseNode_IncompatibleCPUIsNotCapacity(t *testing.T) {
 		map[string]struct{}{},
 		nodemanager.SandboxResources{CPUs: 1, MiBMemory: 512},
 		requirement,
+		FeatureRequirement{},
 		false,
 		nil,
 	)
@@ -216,6 +217,7 @@ func TestBestOfK_ChooseNode_TemporarilyExcludedNodesAreCapacity(t *testing.T) {
 		map[string]struct{}{node.ID: {}},
 		nodemanager.SandboxResources{CPUs: 1, MiBMemory: 512},
 		CPURequirement{},
+		FeatureRequirement{},
 		false,
 		nil,
 	)
@@ -354,7 +356,7 @@ func TestBestOfK_ChooseNode_ReturnsPlacementError(t *testing.T) {
 	machine := machineinfo.MachineInfo{CPUModelName: "Intel Ice Lake"}
 	requiredLabels := []string{"gpu"}
 
-	selected, err := algo.chooseNode(ctx, nodes, make(map[string]struct{}), resources, CPURequirement{Build: machine}, true, requiredLabels)
+	selected, err := algo.chooseNode(ctx, nodes, make(map[string]struct{}), resources, CPURequirement{Build: machine}, FeatureRequirement{}, true, requiredLabels)
 	require.Error(t, err)
 	assert.Nil(t, selected)
 
@@ -382,7 +384,7 @@ func TestBestOfK_Sample(t *testing.T) {
 	excludedNodes := make(map[string]struct{})
 
 	// Test sampling fewer nodes than available
-	sampled := algo.sample(nodes, config, excludedNodes, CPURequirement{}, false, nil)
+	sampled := algo.sample(nodes, config, excludedNodes, CPURequirement{}, FeatureRequirement{}, false, nil)
 	assert.LessOrEqual(t, len(sampled), 3)
 
 	// Check all sampled nodes are unique
@@ -395,7 +397,7 @@ func TestBestOfK_Sample(t *testing.T) {
 	// Test sampling with exclusions
 	excludedNodes["a"] = struct{}{}
 	excludedNodes["b"] = struct{}{}
-	sampled = algo.sample(nodes, config, excludedNodes, CPURequirement{}, false, nil)
+	sampled = algo.sample(nodes, config, excludedNodes, CPURequirement{}, FeatureRequirement{}, false, nil)
 
 	for _, n := range sampled {
 		assert.NotEqual(t, "a", n.ID)
@@ -430,7 +432,7 @@ func TestBestOfK_PowerOfKChoices(t *testing.T) {
 	selectedCounts := make(map[string]int)
 	successCount := 0
 	for range 100 {
-		selected, err := algo.chooseNode(ctx, nodes, excludedNodes, resources, CPURequirement{}, false, nil)
+		selected, err := algo.chooseNode(ctx, nodes, excludedNodes, resources, CPURequirement{}, FeatureRequirement{}, false, nil)
 		if err == nil && selected != nil {
 			selectedCounts[selected.ID]++
 			successCount++

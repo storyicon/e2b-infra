@@ -271,6 +271,35 @@ type RuntimeMetadata struct {
 	SandboxType SandboxType
 }
 
+// LogFields returns the identity fields for every line logged on this
+// sandbox's behalf. Ids that are not populated are omitted rather than emitted
+// blank.
+func (r RuntimeMetadata) LogFields() []zap.Field {
+	fields := make([]zap.Field, 0, 5)
+
+	for _, f := range []struct {
+		value string
+		field func(string) zap.Field
+	}{
+		{r.SandboxID, logger.WithSandboxID},
+		{r.TemplateID, logger.WithTemplateID},
+		{r.TeamID, logger.WithTeamID},
+		{r.BuildID, logger.WithBuildID},
+		{r.ExecutionID, logger.WithExecutionID},
+	} {
+		if f.value != "" {
+			fields = append(fields, f.field(f.value))
+		}
+	}
+
+	return fields
+}
+
+// Logger returns the process logger tagged with LogFields.
+func (r RuntimeMetadata) Logger() logger.Logger {
+	return logger.L().With(r.LogFields()...)
+}
+
 // sandboxLDContext builds an LD context with envd/kernel/FC-version attributes for
 // per-sandbox flag targeting. Team/template targeting comes from the team and
 // template contexts the caller embeds in ctx.
@@ -478,6 +507,13 @@ func (s *Sandbox) LoggerMetadata() sbxlogger.SandboxMetadata {
 	}
 }
 
+// log returns the internal orchestrator logger tagged with this sandbox's
+// identity. Not to be confused with LoggerMetadata, which feeds the separate,
+// customer-visible sandbox log stream.
+func (s *Sandbox) log() logger.Logger {
+	return s.Runtime.Logger()
+}
+
 // GetStartedAt returns the sandbox start time in a thread-safe manner.
 func (m *Metadata) GetStartedAt() time.Time {
 	m.rwmu.RLock()
@@ -603,16 +639,14 @@ func NewFactory(
 func (f *Factory) runNetworkAssignHook(ctx context.Context, sbx *Sandbox, reason NetworkAssignReason) {
 	defer func() {
 		if r := recover(); r != nil {
-			logger.L().Error(ctx, "sandbox network-assign hook panicked, continuing",
-				logger.WithSandboxID(sbx.Runtime.SandboxID),
+			sbx.log().Error(ctx, "sandbox network-assign hook panicked, continuing",
 				logger.WithLifecycleID(sbx.LifecycleID),
 				zap.Any("panic", r))
 		}
 	}()
 
 	if err := f.networkAssignHook.OnNetworkAssign(ctx, sbx, reason); err != nil {
-		logger.L().Warn(ctx, "sandbox network-assign hook failed, continuing",
-			logger.WithSandboxID(sbx.Runtime.SandboxID),
+		sbx.log().Warn(ctx, "sandbox network-assign hook failed, continuing",
 			logger.WithLifecycleID(sbx.LifecycleID),
 			zap.Error(err))
 	}
@@ -726,7 +760,7 @@ func (f *Factory) CreateSandbox(
 	go func() {
 		runErr := rootfsProvider.Start(execCtx)
 		if runErr != nil {
-			logger.L().Error(ctx, "rootfs overlay error", zap.Error(runErr))
+			runtime.Logger().Error(ctx, "rootfs overlay error", zap.Error(runErr))
 		}
 	}()
 
@@ -1022,6 +1056,10 @@ func (f *Factory) ResumeSandbox(
 
 	telemetry.ReportEvent(ctx, "created sandbox files")
 
+	// Identity shared by everything this resume logs on the sandbox's behalf:
+	// the uffd backend (and its serve loop) and the prefetcher.
+	sbxLogger := runtime.Logger()
+
 	// Uffd initialization
 	fcUffdPath := sandboxFiles.SandboxUffdSocketPath()
 	uffdPromise := utils.NewPromise(func() (*uffd.Uffd, error) {
@@ -1032,7 +1070,7 @@ func (f *Factory) ResumeSandbox(
 
 		telemetry.ReportEvent(ctx, "got template memfile")
 
-		return uffd.New(memfile, fcUffdPath), nil
+		return uffd.New(memfile, fcUffdPath, sbxLogger), nil
 	})
 
 	// Prefetching. Derive the prefetch context and register its cancel with the
@@ -1125,25 +1163,24 @@ func (f *Factory) ResumeSandbox(
 		}
 
 		telemetry.ReportEvent(ctx, "starting prefetcher")
-		l := logger.L().With(logger.WithSandboxID(runtime.SandboxID), logger.WithTemplateID(runtime.TemplateID), logger.WithTeamID(runtime.TeamID))
 
 		go func() {
 			// Init trace first, prefaulted (prod behavior). Start blocks until
 			// its fetch+copy complete, so it acts as a barrier before the
 			// last-cycle fetch begins.
 			if initMapping != nil {
-				p := prefetch.New(l, memfile, fcUffd, initMapping, f.featureFlags)
+				p := prefetch.New(sbxLogger, memfile, fcUffd, initMapping, f.featureFlags)
 				if err := p.Start(prefetchCtx); err != nil {
-					l.Error(ctx, "failed to start init prefetcher", zap.Error(err))
+					sbxLogger.Error(ctx, "failed to start init prefetcher", zap.Error(err))
 				}
 			}
 
 			// Last-cycle diff, fetch-only.
 			if lastCycleMapping != nil {
-				p := prefetch.New(l, memfile, fcUffd, lastCycleMapping, f.featureFlags)
+				p := prefetch.New(sbxLogger, memfile, fcUffd, lastCycleMapping, f.featureFlags)
 				p.Prefault = false
 				if err := p.Start(prefetchCtx); err != nil {
-					l.Error(ctx, "failed to start last-cycle prefetcher", zap.Error(err))
+					sbxLogger.Error(ctx, "failed to start last-cycle prefetcher", zap.Error(err))
 				}
 			}
 		}()
@@ -1179,7 +1216,7 @@ func (f *Factory) ResumeSandbox(
 		go func() {
 			runErr := overlay.Start(execCtx)
 			if runErr != nil {
-				logger.L().Error(ctx, "rootfs overlay error", zap.Error(runErr))
+				sbxLogger.Error(ctx, "rootfs overlay error", zap.Error(runErr))
 			}
 		}()
 
@@ -1197,7 +1234,6 @@ func (f *Factory) ResumeSandbox(
 			execCtx,
 			cleanup,
 			fcUffd,
-			runtime.SandboxID,
 		)
 		if err != nil {
 			return struct{}{}, fmt.Errorf("failed to serve memory: %w", err)
@@ -2112,6 +2148,10 @@ type MemorySnapshot struct {
 	// goroutine once it has swapped the deduped header in; it lets the dedup
 	// goroutine release the memfd the provisional source was serving from.
 	ProvisionalSwapDone func()
+	// ProvisionalCreatedAt, when non-zero, is the provisional header's birth at
+	// pause; the AddSnapshot swap goroutine records the dedup-duration metric
+	// from it.
+	ProvisionalCreatedAt time.Time
 	// BlockSize is captured synchronously at Pause time because NewUpload's
 	// compression validation needs it before the async dedup header resolves;
 	// the dedup memfile path produces a page-granular Diff.BlockSize() that
@@ -2354,12 +2394,18 @@ func (s *Sandbox) processMemorySnapshot(ctx context.Context, buildID uuid.UUID, 
 	// this is the synchronous path's.
 	cleanup.AddNoContext(ctx, memfileDiff.Close)
 
+	var provCreatedAt time.Time
+	if provMemfileHeader != nil {
+		provCreatedAt = time.Now()
+	}
+
 	return MemorySnapshot{
 		Diff:                  memfileDiff,
 		DiffHeader:            memfileDiffHeader,
 		ProvisionalDiffHeader: provMemfileHeader,
 		ProvisionalDiff:       provMemfileDiff,
 		ProvisionalSwapDone:   provMemfileSwapDone,
+		ProvisionalCreatedAt:  provCreatedAt,
 		BlockSize:             memfileHeader.Metadata.BlockSize,
 		header:                memfileHeader,
 		newBytes:              memfileDiffMetadata.Dirty.GetCardinality() * uint64(memfileDiffMetadata.BlockSize),
@@ -3248,7 +3294,7 @@ func (s *Sandbox) runDeferredRootfsExport(
 	// cost stays visible.
 	err := s.runRootfsSealCore(ctx, sealCache, buildID, blockSize, meta, diffPromise, false)
 	if err != nil {
-		logger.L().Error(ctx, "deferred rootfs export failed", zap.Error(err))
+		s.log().Error(ctx, "deferred rootfs export failed", zap.Error(err))
 	} else {
 		telemetry.ReportEvent(ctx, "rootfs diff sealed (deferred)")
 	}
@@ -3256,7 +3302,7 @@ func (s *Sandbox) runDeferredRootfsExport(
 	// The sandbox is torn down; the ejected cache is ours to close regardless of
 	// the export outcome.
 	if err := sealCache.Close(); err != nil {
-		logger.L().Warn(ctx, "closing ejected rootfs cache", zap.Error(err))
+		s.log().Warn(ctx, "closing ejected rootfs cache", zap.Error(err))
 	}
 }
 
@@ -3351,6 +3397,115 @@ func (s *Sandbox) EnsurePausable() error {
 	return nil
 }
 
+// SnapshotAdmissionOutcome labels how a snapshot-admission pre-flight ended.
+type SnapshotAdmissionOutcome string
+
+const (
+	// SnapshotAdmissionReady: admitted without waiting.
+	SnapshotAdmissionReady SnapshotAdmissionOutcome = "ready"
+	// SnapshotAdmissionReadyAfterWait: the parent header became durable inside
+	// the grace wait.
+	SnapshotAdmissionReadyAfterWait SnapshotAdmissionOutcome = "ready_after_wait"
+	// SnapshotAdmissionRefused: still deduplicating when the grace elapsed.
+	SnapshotAdmissionRefused SnapshotAdmissionOutcome = "refused"
+	// SnapshotAdmissionLatchedError: a latched seal failure means no valid
+	// snapshot can ever be produced; not retryable.
+	SnapshotAdmissionLatchedError SnapshotAdmissionOutcome = "latched_error"
+)
+
+// ErrSnapshotAdmissionPending marks a retryable admission refusal: the parent
+// memfile header was still deduplicating when the grace elapsed.
+var ErrSnapshotAdmissionPending = errors.New("parent memfile header is still deduplicating")
+
+// AwaitSnapshotAdmission is the pre-destructive snapshot-admission pre-flight:
+// "can this sandbox produce a valid snapshot right now?". It folds the
+// EnsurePausable latched-error checks together with the durable-parent
+// readiness check, so the Pause/Checkpoint handlers ask once, BEFORE any
+// destructive step. Readiness is monotonic per resumed sandbox (the
+// provisional->durable swap never reverts), so a positive answer cannot be
+// invalidated between this check and the snapshot.
+//
+// memorySnapshot=false (a filesystem-only pause) skips the durable-parent
+// wait entirely — an fs-only snapshot has no memory parent, so it can never
+// be refused here; only the latched checks apply.
+//
+// The wait runs on its own timer, never the RPC deadline. Returns:
+//   - (Ready|ReadyAfterWait, waited, nil): admitted, proceed.
+//   - (Refused, waited, ErrSnapshotAdmissionPending): refuse retryably.
+//   - (LatchedError, waited, err): permanently unpersistable; the caller's
+//     existing terminal handling applies.
+//   - ("", waited, ctx.Err()): the caller's context ended mid-wait; nothing
+//     was decided and the sandbox is untouched.
+func (s *Sandbox) AwaitSnapshotAdmission(ctx context.Context, grace time.Duration, memorySnapshot bool) (SnapshotAdmissionOutcome, time.Duration, error) {
+	ctx, span := tracer.Start(ctx, "snapshot-admission")
+	defer span.End()
+
+	outcome, waited, err := s.awaitSnapshotAdmission(ctx, grace, memorySnapshot)
+	span.SetAttributes(
+		attribute.String("outcome", string(outcome)),
+		attribute.Int64("waited_ms", waited.Milliseconds()),
+	)
+
+	return outcome, waited, err
+}
+
+func (s *Sandbox) awaitSnapshotAdmission(ctx context.Context, grace time.Duration, memorySnapshot bool) (SnapshotAdmissionOutcome, time.Duration, error) {
+	if err := s.EnsurePausable(); err != nil {
+		return SnapshotAdmissionLatchedError, 0, err
+	}
+
+	if !memorySnapshot {
+		return SnapshotAdmissionReady, 0, nil
+	}
+
+	memfile, err := s.Template.Memfile(ctx)
+	if err != nil {
+		// No memory parent to wait on (e.g. a filesystem-only boot); the
+		// snapshot path tolerates a missing memfile.
+		return SnapshotAdmissionReady, 0, nil
+	}
+
+	dh, ok := memfile.(interface {
+		DurableHeaderNow() (*header.Header, bool)
+		DurableHeader(ctx context.Context) (*header.Header, error)
+	})
+	if !ok {
+		return SnapshotAdmissionReady, 0, nil
+	}
+
+	if _, ready := dh.DurableHeaderNow(); ready {
+		return SnapshotAdmissionReady, 0, nil
+	}
+
+	// grace <= 0 yields an already-expired waitCtx: an instant probe. It must
+	// still go through DurableHeader, which returns an already-resolved error
+	// even under an expired context — a failed dedup classifies as latched,
+	// never as retryable-pending.
+	waitCtx, cancel := context.WithTimeout(ctx, grace)
+	defer cancel()
+
+	start := time.Now()
+	_, err = dh.DurableHeader(waitCtx)
+	waited := time.Since(start)
+
+	switch {
+	case err == nil:
+		return SnapshotAdmissionReadyAfterWait, waited, nil
+	case ctx.Err() != nil:
+		return "", waited, ctx.Err()
+	//nolint:errorlint // identity on purpose: timer expiry returns the raw
+	// sentinel, while a permanent dedup failure stored in the future WRAPS a
+	// context error — errors.Is would misread it as a pending swap.
+	case err == context.DeadlineExceeded && waitCtx.Err() != nil:
+		return SnapshotAdmissionRefused, waited, ErrSnapshotAdmissionPending
+	default:
+		// The durable future resolved with an error: the deduped header will
+		// never exist, so no valid memory snapshot can ever be produced —
+		// permanent, like a latched seal failure, not retryable.
+		return SnapshotAdmissionLatchedError, waited, err
+	}
+}
+
 // bestEffortEnvdReinit re-runs the envd /init a real resume makes, after an
 // in-place resume (success or error-cleanup path). The FC-paused window
 // stopped the guest's clocks; envd steps CLOCK_REALTIME from /init's host
@@ -3398,8 +3553,7 @@ func (s *Sandbox) bestEffortEnvdReinit(ctx context.Context) {
 	}()
 
 	if _, err := s.initEnvd(initCtx, StartTypeResume, false); err != nil {
-		logger.L().Warn(ctx, "envd re-init after in-place resume failed (guest clock may lag)",
-			logger.WithSandboxID(s.Runtime.SandboxID), zap.Error(err))
+		s.log().Warn(ctx, "envd re-init after in-place resume failed (guest clock may lag)", zap.Error(err))
 	}
 }
 
@@ -3437,7 +3591,7 @@ func (s *Sandbox) foldAndCloseSeal(ctx context.Context, sealCache *block.Cache) 
 		// failure here is a leaked file — not an incomplete cache — and must
 		// not feed the callers' latch. Mirrors the success-path seal close.
 		if closeErr := detached.Close(); closeErr != nil {
-			logger.L().Warn(ctx, "closing folded seal cache failed (leaked file)", zap.Error(closeErr))
+			s.log().Warn(ctx, "closing folded seal cache failed (leaked file)", zap.Error(closeErr))
 		}
 
 		return nil
@@ -3590,7 +3744,7 @@ func (s *Sandbox) runInPlaceRootfsExport(
 
 	err := s.runRootfsSealCore(ctx, sealCache, buildID, blockSize, meta, diffPromise, true)
 	if err != nil {
-		logger.L().Error(ctx, "in-place rootfs export failed", zap.Error(err))
+		s.log().Error(ctx, "in-place rootfs export failed", zap.Error(err))
 		// The checkpoint's artifact is lost (diffPromise already carries
 		// ErrDeferredSealFailed), but the SANDBOX must stay serviceable:
 		// sealDone is a write-once field on the long-lived Sandbox, and an
@@ -3603,7 +3757,7 @@ func (s *Sandbox) runInPlaceRootfsExport(
 		// seal signal SUCCESS; latch the error only if the fold-back itself
 		// fails, which is the genuinely unrecoverable-cache case.
 		if foldErr := s.foldAndCloseSeal(ctx, sealCache); foldErr != nil {
-			logger.L().Error(ctx, "in-place rootfs export fold-back failed", zap.Error(foldErr))
+			s.log().Error(ctx, "in-place rootfs export fold-back failed", zap.Error(foldErr))
 			_ = sealDone.SetError(fmt.Errorf("%w; folding the seal back also failed: %w", err, foldErr))
 
 			return
@@ -3618,14 +3772,14 @@ func (s *Sandbox) runInPlaceRootfsExport(
 	// diff again and the sealing slot frees for the next checkpoint.
 	detached, err := s.rootfs.FoldSealed(ctx)
 	if err != nil {
-		logger.L().Error(ctx, "folding sealed rootfs cache failed", zap.Error(err))
+		s.log().Error(ctx, "folding sealed rootfs cache failed", zap.Error(err))
 		_ = sealDone.SetError(fmt.Errorf("fold sealed rootfs cache: %w", err))
 
 		return
 	}
 	if detached != nil {
 		if closeErr := detached.Close(); closeErr != nil {
-			logger.L().Warn(ctx, "closing folded rootfs cache", zap.Error(closeErr))
+			s.log().Warn(ctx, "closing folded rootfs cache", zap.Error(closeErr))
 		}
 	}
 
@@ -3692,14 +3846,13 @@ func serveMemory(
 	ctx context.Context,
 	cleanup *Cleanup,
 	fcUffd *uffd.Uffd,
-	sandboxID string,
 ) error {
 	ctx, span := tracer.Start(ctx, "serve-memory")
 	defer span.End()
 
 	telemetry.ReportEvent(ctx, "created uffd")
 
-	if err := fcUffd.Start(ctx, sandboxID); err != nil {
+	if err := fcUffd.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start uffd: %w", err)
 	}
 

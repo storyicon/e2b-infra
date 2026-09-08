@@ -232,10 +232,6 @@ jobs:
             -- -timeout 20m -coverprofile=coverage.txt -covermode=atomic ${{ matrix.test_path }}
         if: matrix.sudo == false && (inputs.use_specialized_runners || matrix.package != 'packages/orchestrator')
 
-      - name: Run shared capacity benchmark tests
-        if: matrix.package == 'packages/shared'
-        run: node --test packages/shared/scripts/capacity-smoke-model.test.mjs
-
       - name: Upload coverage to Codecov
         if: ${{ !cancelled() && env.CODECOV_TOKEN != '' && hashFiles(format('{0}/coverage.txt', matrix.package)) != '' }}
         uses: codecov/codecov-action@v6

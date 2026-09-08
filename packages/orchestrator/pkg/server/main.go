@@ -89,6 +89,9 @@ type Server struct {
 	envdUpgradeHandover      metric.Int64Counter
 	envdUpgradeDuration      metric.Int64Histogram
 
+	pauseAdmissionCounter      metric.Int64Counter
+	pauseAdmissionWaitDuration metric.Int64Histogram
+
 	// uploadsWG tracks in-flight async snapshot uploads so a graceful shutdown
 	// can wait for them to finish instead of dropping them. uploadsInFlight is
 	// the live count, used to log drain progress during shutdown.
@@ -180,6 +183,18 @@ func New(ctx context.Context, cfg ServiceConfig) (*Server, error) {
 		return nil, fmt.Errorf("failed to register sandbox checkpoint counter: %w", err)
 	}
 	server.sandboxCheckpointCounter = sandboxCheckpointCounter
+
+	pauseAdmissionCounter, err := telemetry.GetCounter(meter, telemetry.OrchestratorSandboxPauseAdmissionCounterName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to register pause admission counter: %w", err)
+	}
+	server.pauseAdmissionCounter = pauseAdmissionCounter
+
+	pauseAdmissionWaitDuration, err := telemetry.GetHistogram(meter, telemetry.OrchestratorSandboxPauseAdmissionWaitDurationName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to register pause admission wait duration histogram: %w", err)
+	}
+	server.pauseAdmissionWaitDuration = pauseAdmissionWaitDuration
 
 	uploadFailedCounter, err := telemetry.GetCounter(meter, telemetry.OrchestratorSnapshotUploadFailedCounterName)
 	if err != nil {
@@ -352,11 +367,12 @@ func (s *Server) DrainSandboxes(ctx context.Context) error {
 	lastLoggedAt := startedAt
 
 	for {
-		remaining := s.sandboxFactory.Sandboxes.Count()
-		if remaining == 0 {
+		state := service.SnapshotShutdownState(s.info, s.sandboxFactory.Sandboxes, s)
+		remaining := int(state.LiveSandboxes)
+		if state.ActivityQuiet {
 			logger.L().Info(ctx, "graceful sandbox drain complete", zap.Int("live_sandboxes", remaining))
 
-			return s.waitSandboxLifecycles(ctx)
+			return nil
 		}
 
 		select {
@@ -382,8 +398,13 @@ func (s *Server) DrainSandboxes(ctx context.Context) error {
 	}
 }
 
-func (s *Server) waitSandboxLifecycles(ctx context.Context) error {
-	return s.sandboxFactory.Sandboxes.WaitLifecycles(ctx)
+func (s *Server) SnapshotUploadsInFlight() uint64 {
+	value := s.uploadsInFlight.Load()
+	if value < 0 {
+		return 0
+	}
+
+	return uint64(value)
 }
 
 func (s *Server) refreshStartingSandboxesLimit(ctx context.Context) {

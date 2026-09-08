@@ -125,7 +125,11 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	CapacityService_GetCapacitySnapshot_FullMethodName = "/proxy.CapacityService/GetCapacitySnapshot"
+	CapacityService_GetCapacitySnapshot_FullMethodName   = "/proxy.CapacityService/GetCapacitySnapshot"
+	CapacityService_ListScaleInCandidates_FullMethodName = "/proxy.CapacityService/ListScaleInCandidates"
+	CapacityService_BeginWorkerScaleIn_FullMethodName    = "/proxy.CapacityService/BeginWorkerScaleIn"
+	CapacityService_VerifyWorkerScaleIn_FullMethodName   = "/proxy.CapacityService/VerifyWorkerScaleIn"
+	CapacityService_CancelWorkerScaleIn_FullMethodName   = "/proxy.CapacityService/CancelWorkerScaleIn"
 )
 
 // CapacityServiceClient is the client API for CapacityService service.
@@ -136,6 +140,10 @@ const (
 // scale-out reconciliation.
 type CapacityServiceClient interface {
 	GetCapacitySnapshot(ctx context.Context, in *CapacitySnapshotRequest, opts ...grpc.CallOption) (*CapacitySnapshotResponse, error)
+	ListScaleInCandidates(ctx context.Context, in *ListScaleInCandidatesRequest, opts ...grpc.CallOption) (*ListScaleInCandidatesResponse, error)
+	BeginWorkerScaleIn(ctx context.Context, in *WorkerScaleInRequest, opts ...grpc.CallOption) (*WorkerScaleInState, error)
+	VerifyWorkerScaleIn(ctx context.Context, in *WorkerScaleInRequest, opts ...grpc.CallOption) (*WorkerScaleInState, error)
+	CancelWorkerScaleIn(ctx context.Context, in *WorkerScaleInRequest, opts ...grpc.CallOption) (*WorkerScaleInState, error)
 }
 
 type capacityServiceClient struct {
@@ -156,6 +164,46 @@ func (c *capacityServiceClient) GetCapacitySnapshot(ctx context.Context, in *Cap
 	return out, nil
 }
 
+func (c *capacityServiceClient) ListScaleInCandidates(ctx context.Context, in *ListScaleInCandidatesRequest, opts ...grpc.CallOption) (*ListScaleInCandidatesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListScaleInCandidatesResponse)
+	err := c.cc.Invoke(ctx, CapacityService_ListScaleInCandidates_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *capacityServiceClient) BeginWorkerScaleIn(ctx context.Context, in *WorkerScaleInRequest, opts ...grpc.CallOption) (*WorkerScaleInState, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(WorkerScaleInState)
+	err := c.cc.Invoke(ctx, CapacityService_BeginWorkerScaleIn_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *capacityServiceClient) VerifyWorkerScaleIn(ctx context.Context, in *WorkerScaleInRequest, opts ...grpc.CallOption) (*WorkerScaleInState, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(WorkerScaleInState)
+	err := c.cc.Invoke(ctx, CapacityService_VerifyWorkerScaleIn_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *capacityServiceClient) CancelWorkerScaleIn(ctx context.Context, in *WorkerScaleInRequest, opts ...grpc.CallOption) (*WorkerScaleInState, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(WorkerScaleInState)
+	err := c.cc.Invoke(ctx, CapacityService_CancelWorkerScaleIn_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CapacityServiceServer is the server API for CapacityService service.
 // All implementations must embed UnimplementedCapacityServiceServer
 // for forward compatibility.
@@ -164,6 +212,10 @@ func (c *capacityServiceClient) GetCapacitySnapshot(ctx context.Context, in *Cap
 // scale-out reconciliation.
 type CapacityServiceServer interface {
 	GetCapacitySnapshot(context.Context, *CapacitySnapshotRequest) (*CapacitySnapshotResponse, error)
+	ListScaleInCandidates(context.Context, *ListScaleInCandidatesRequest) (*ListScaleInCandidatesResponse, error)
+	BeginWorkerScaleIn(context.Context, *WorkerScaleInRequest) (*WorkerScaleInState, error)
+	VerifyWorkerScaleIn(context.Context, *WorkerScaleInRequest) (*WorkerScaleInState, error)
+	CancelWorkerScaleIn(context.Context, *WorkerScaleInRequest) (*WorkerScaleInState, error)
 	mustEmbedUnimplementedCapacityServiceServer()
 }
 
@@ -176,6 +228,18 @@ type UnimplementedCapacityServiceServer struct{}
 
 func (UnimplementedCapacityServiceServer) GetCapacitySnapshot(context.Context, *CapacitySnapshotRequest) (*CapacitySnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetCapacitySnapshot not implemented")
+}
+func (UnimplementedCapacityServiceServer) ListScaleInCandidates(context.Context, *ListScaleInCandidatesRequest) (*ListScaleInCandidatesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListScaleInCandidates not implemented")
+}
+func (UnimplementedCapacityServiceServer) BeginWorkerScaleIn(context.Context, *WorkerScaleInRequest) (*WorkerScaleInState, error) {
+	return nil, status.Error(codes.Unimplemented, "method BeginWorkerScaleIn not implemented")
+}
+func (UnimplementedCapacityServiceServer) VerifyWorkerScaleIn(context.Context, *WorkerScaleInRequest) (*WorkerScaleInState, error) {
+	return nil, status.Error(codes.Unimplemented, "method VerifyWorkerScaleIn not implemented")
+}
+func (UnimplementedCapacityServiceServer) CancelWorkerScaleIn(context.Context, *WorkerScaleInRequest) (*WorkerScaleInState, error) {
+	return nil, status.Error(codes.Unimplemented, "method CancelWorkerScaleIn not implemented")
 }
 func (UnimplementedCapacityServiceServer) mustEmbedUnimplementedCapacityServiceServer() {}
 func (UnimplementedCapacityServiceServer) testEmbeddedByValue()                         {}
@@ -216,6 +280,78 @@ func _CapacityService_GetCapacitySnapshot_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
+func _CapacityService_ListScaleInCandidates_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListScaleInCandidatesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CapacityServiceServer).ListScaleInCandidates(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CapacityService_ListScaleInCandidates_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CapacityServiceServer).ListScaleInCandidates(ctx, req.(*ListScaleInCandidatesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CapacityService_BeginWorkerScaleIn_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WorkerScaleInRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CapacityServiceServer).BeginWorkerScaleIn(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CapacityService_BeginWorkerScaleIn_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CapacityServiceServer).BeginWorkerScaleIn(ctx, req.(*WorkerScaleInRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CapacityService_VerifyWorkerScaleIn_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WorkerScaleInRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CapacityServiceServer).VerifyWorkerScaleIn(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CapacityService_VerifyWorkerScaleIn_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CapacityServiceServer).VerifyWorkerScaleIn(ctx, req.(*WorkerScaleInRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CapacityService_CancelWorkerScaleIn_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WorkerScaleInRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CapacityServiceServer).CancelWorkerScaleIn(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CapacityService_CancelWorkerScaleIn_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CapacityServiceServer).CancelWorkerScaleIn(ctx, req.(*WorkerScaleInRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // CapacityService_ServiceDesc is the grpc.ServiceDesc for CapacityService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -226,6 +362,22 @@ var CapacityService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetCapacitySnapshot",
 			Handler:    _CapacityService_GetCapacitySnapshot_Handler,
+		},
+		{
+			MethodName: "ListScaleInCandidates",
+			Handler:    _CapacityService_ListScaleInCandidates_Handler,
+		},
+		{
+			MethodName: "BeginWorkerScaleIn",
+			Handler:    _CapacityService_BeginWorkerScaleIn_Handler,
+		},
+		{
+			MethodName: "VerifyWorkerScaleIn",
+			Handler:    _CapacityService_VerifyWorkerScaleIn_Handler,
+		},
+		{
+			MethodName: "CancelWorkerScaleIn",
+			Handler:    _CapacityService_CancelWorkerScaleIn_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

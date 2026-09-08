@@ -47,6 +47,11 @@ jobs:
           terraform init -backend=false
           terraform validate
 
+      - name: Test client ASG scale-in configuration without cloud resources
+        if: matrix.provider == 'provider-aws'
+        working-directory: ./iac/provider-aws
+        run: terraform test -filter=tests/client_scale_in.tftest.hcl
+
   validate_terraform:
     needs: run-terraform-validation
     if: ${{ always() }}

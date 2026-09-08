@@ -78,6 +78,15 @@ resource "random_password" "capacity_snapshot_service_token" {
   special = false
 }
 
+check "capacity_scale_in_mode" {
+  assert {
+    condition = var.capacity_controller_scale_in_mode == "off" || (
+      var.capacity_autoscaler_enabled && var.capacity_controller_demand_mode == "start-intent-v1"
+    )
+    error_message = "capacity_controller_scale_in_mode observe or enforce requires capacity_autoscaler_enabled and capacity_controller_demand_mode=start-intent-v1."
+  }
+}
+
 locals {
   redis_port            = 6379
   ingress_port          = 8080
@@ -221,6 +230,11 @@ locals {
     REDIS_TLS_CA_BASE64              = local.redis_tls_ca_base64
     REDIS_TLS_ENABLED                = local.redis_tls_enabled
     REDIS_URL                        = local.redis_url
+    SCALE_IN_DRAIN_TIMEOUT           = var.capacity_controller_scale_in_drain_timeout
+    SCALE_IN_HEADROOM_PERCENT        = tostring(var.capacity_controller_scale_in_headroom_percent)
+    SCALE_IN_MIN_NODE_AGE            = var.capacity_controller_scale_in_minimum_node_age
+    SCALE_IN_MODE                    = var.capacity_controller_scale_in_mode
+    SCALE_IN_STABILIZATION_DURATION  = var.capacity_controller_scale_in_stabilization_duration
     SLOTS_PER_NODE                   = tostring(var.capacity_controller_slots_per_node)
   })
 
@@ -360,6 +374,7 @@ module "cluster" {
   client_cluster_min_size             = local.client_cluster_min_size
   client_cluster_max_size             = local.client_cluster_max_size
   capacity_autoscaler_enabled         = var.capacity_autoscaler_enabled
+  capacity_scale_in_enforced          = var.capacity_controller_scale_in_mode == "enforce"
   client_image_family_prefix          = var.client_image_family_prefix != "" ? var.client_image_family_prefix : local.ami_family_prefix
   client_machine_type                 = var.client_server_machine_type
   client_security_group_ids           = [aws_security_group.cluster_node.id]

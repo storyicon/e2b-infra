@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.12.0 (2026-09-02)
+
+
+### Features
+
+* **ext4:** allow enabling the directory index on the rootfs (4c50658)
+* **orchestrator:** stamp build.result on template build spans (087d56a)
+
+
+### Bug Fixes
+
+* **orchestrator:** close nbd descriptor before data-path teardown (57f7c58)
+* **orchestrator:** provision findutils so template finalize survives minimal RPM-family images (12b48d9)
+* **orchestrator:** publish cache cleaner image (3a0869d)
+* **orchestrator:** remove the fs-only pause version gate (3ecf457)
+
+
+### Code Refactoring
+
+* **orchestrator:** inject the logger into the uffd memory backend (4ca4bf9)
+
+## 0.11.0 (2026-08-29)
+
+
+### Features
+
+* **orch:** make a blocked NBD close attributable in traces (71495c2)
+
+
+### Bug Fixes
+
+* **orchestrator:** remove the cache file when a diff turns out to be empty (acc670b)
+* rate-limit stale log drop warnings (9e4d5c4)
+
+## 0.10.0 (2026-08-27)
+
+
+### Features
+
+* **orchestrator:** evaluate feature flags with an instance group context (cb05c1f)
+* **orchestrator:** let the sandbox proxy dial HTTPS backends (7434ff9)
+* **orchestrator:** manage the build-time envd via a build-envd-version flag, like kernel and firecracker (35f5a63)
+* **orchestrator:** pre-boot filesystem recovery for cold-boot resumes (e6b0067)
+* **snapshots:** gate in-place checkpoint and fs-only snapshots on FC release &gt;= 0.2.0 (c7b5dff)
+
+
+### Bug Fixes
+
+* **orchestrator:** drop raw debugfs output from offline-swap errors (621cdd9)
+* **orchestrator:** let release-please stamp the hard-coded version constant (7aa055b)
+* **orchestrator:** treat a failed or signalled e2fsck as a failed integrity check (6b03458)
+
 ## [0.2.0](https://github.com/e2b-dev/infra/compare/orchestrator-v0.1.0...orchestrator-v0.2.0) (2026-08-24)
 
 

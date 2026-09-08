@@ -21,7 +21,7 @@ import (
 
 // newTestStorage spins up a redis testcontainer and returns a fresh redis-backed
 // sandbox.Storage. The container and storage are cleaned up via t.Cleanup.
-func newTestStorage(t *testing.T) Storage {
+func newTestStorage(t *testing.T) *sandboxredis.Storage {
 	t.Helper()
 
 	client := redis_utils.SetupInstance(t)
@@ -239,7 +239,7 @@ func TestAdd_NewSandbox(t *testing.T) {
 			AsyncNewlyCreatedSandbox: tracker.TrackCreation("AsyncNewlyCreatedSandbox"),
 		}
 
-		store := NewStore(storage, reservations, callbacks)
+		store := NewStore(storage, storage, reservations, callbacks)
 		sbx := createTestSandbox()
 
 		// Execute
@@ -277,7 +277,7 @@ func TestAdd_NotNewlyCreated(t *testing.T) {
 			AddSandboxToRoutingTable: tracker.Track("AddSandboxToRoutingTable"),
 			AsyncNewlyCreatedSandbox: tracker.TrackCreation("AsyncNewlyCreatedSandbox"),
 		}
-		store := NewStore(storage, reservations, callbacks)
+		store := NewStore(storage, storage, reservations, callbacks)
 		sbx := createTestSandbox()
 
 		err := store.Add(ctx, sbx, nil)
@@ -308,7 +308,7 @@ func TestAdd_StorageErrors(t *testing.T) {
 			AddSandboxToRoutingTable: tracker.Track("AddSandboxToRoutingTable"),
 			AsyncNewlyCreatedSandbox: tracker.TrackCreation("AsyncNewlyCreatedSandbox"),
 		}
-		store := NewStore(mockStorage, reservations, callbacks)
+		store := NewStore(mockStorage, mockStorage, reservations, callbacks)
 		sbx := createTestSandbox()
 
 		err := store.Add(ctx, sbx, &CreationMetadata{})
@@ -332,7 +332,7 @@ func TestAdd_RoutingFailureIsReturnedBeforeCreationCallback(t *testing.T) {
 	routingErr := errors.New("routing unavailable")
 	creationCalled := make(chan struct{}, 1)
 	storage := &addOnlyStorage{}
-	store := NewStore(storage, &NoOpReservationStorage{}, Callbacks{
+	store := NewStore(storage, storage, &NoOpReservationStorage{}, Callbacks{
 		AddSandboxToRoutingTable: func(context.Context, Sandbox) error {
 			return routingErr
 		},
@@ -368,7 +368,7 @@ func TestAdd_ConcurrentCalls(t *testing.T) {
 			AddSandboxToRoutingTable: tracker.Track("AddSandboxToRoutingTable"),
 			AsyncNewlyCreatedSandbox: tracker.TrackCreation("AsyncNewlyCreatedSandbox"),
 		}
-		store := NewStore(storage, reservations, callbacks)
+		store := NewStore(storage, storage, reservations, callbacks)
 
 		teamID := uuid.New()
 		var wg sync.WaitGroup

@@ -15,8 +15,8 @@ import (
 //
 // ListInstances fails if either backend fails: the caller treats a discovery
 // error as "skip this cycle", which beats silently acting on a partial list.
-// A cached backend cannot fail this way (see the package doc), so beneath one
-// the same union degrades to stale entries instead.
+// A cached backend reports its refresh error too, so the union behaves the same
+// beneath one as above a lister.
 type mergedDiscovery struct {
 	primary  Discoverer
 	fallback Discoverer
@@ -48,7 +48,7 @@ func (d *mergedDiscovery) ListInstances(ctx context.Context) ([]Instance, error)
 	// UniqBy keeps the first occurrence per key, so primary entries shadow
 	// fallback entries with the same ID.
 	return lo.UniqBy(slices.Concat(primaryInstances, fallbackInstances), func(i Instance) string {
-		return i.ID
+		return i.WorkloadID
 	}), nil
 }
 

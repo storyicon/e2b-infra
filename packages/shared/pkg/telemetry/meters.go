@@ -22,11 +22,8 @@ const (
 	ApiOrchestratorCreatedSandboxes      CounterType = "api.orchestrator.created_sandboxes"
 	ApiOrchestratorResumeOriginNodeRemap CounterType = "api.orchestrator.resume_origin_node_remapped"
 	// ApiEvictorFsOnlyAutoPause counts timeout auto-pauses whose policy asked
-	// for a filesystem-only snapshot, labeled outcome=fs_only|degraded —
-	// degraded means the sandbox's Firecracker release predates fs-only
-	// support and the eviction fell back to a memory snapshot. The total is
-	// the eligibility denominator; the degraded share is the silent half of
-	// the version gate.
+	// for a filesystem-only snapshot. Unlabeled since the fs-only version
+	// gate was dropped: every counted eviction takes the fs-only path.
 	ApiEvictorFsOnlyAutoPause CounterType = "api.evictor.fs_only_auto_pause"
 	SandboxCreateMeterName    CounterType = "api.env.instance.started"
 
@@ -44,6 +41,11 @@ const (
 	OrchestratorHostBalanceDirtyPagesThreads CounterType = "orchestrator.host.balance_dirty_pages.threads"
 
 	OrchestratorSandboxKilledCounterName CounterType = "orchestrator.sandbox.killed"
+	// OrchestratorSandboxPauseAdmissionCounterName counts every snapshot-
+	// admission decision. refused is the told-the-caller-to-retry rate;
+	// ready_after_wait counts the grace paying off — their ratio tunes the
+	// grace flag.
+	OrchestratorSandboxPauseAdmissionCounterName CounterType = "orchestrator.sandbox.pause_admission"
 	// OrchestratorSandboxCheckpointCounterName counts Checkpoint RPCs by flow —
 	// the denominator that makes the in_place-labeled duration histograms
 	// cuttable as a ramp (what fraction went in-place, at what success rate).
@@ -120,6 +122,63 @@ const (
 	// upgrade. refire="false" is the count that actually moved sandboxes. The label is
 	// absent on every other result, where nothing was compared.
 	OrchestratorEnvdOfflineUpgradeAttempts CounterType = "orchestrator.envd.offline_upgrade.attempts"
+
+	// OrchestratorFsRecoveryRuns counts every pre-boot filesystem-recovery
+	// decision on a cold boot, by result and trigger. Recovery is journal replay
+	// only (`e2fsck -p -E journal_only`), so the results are:
+	//
+	//	skipped_quiesced
+	//	    the rootfs was frozen at pause; nothing to replay
+	//	replayed
+	//	    the journal was replayed (or regenerated, or there was nothing to do);
+	//	    the fs is mountable and the boot proceeded — the expected outcome for
+	//	    the admitted population, NOT a corruption signal.
+	//	failed_operational
+	//	    the run did not complete a clean replay AND e2fsck may have opened the
+	//	    device (an e2fsck non-replay exit, or a timeout that could have killed it
+	//	    mid-write). Fail closed — the start failed — but always retryable on
+	//	    another node, never a permanent snapshot verdict (its exit codes cannot
+	//	    tell an unmountable filesystem apart from a transient fault).
+	//	failed_open
+	//	    recovery could not run AND e2fsck provably never opened the device (the
+	//	    jail could not launch it, or the host cannot exec e2fsck), so the disk is
+	//	    what a flag-off cold boot would mount and the guest kernel replays the
+	//	    journal itself. The boot proceeded. A host-image signal — a non-trivial
+	//	    rate means the recovery tooling is broken fleet-wide (roll back), even
+	//	    though sandboxes still boot.
+	//
+	// A bounded "reason" attribute sub-labels each result so a ramp can act on it
+	// from a dashboard instead of grepping create-failure logs:
+	//
+	//	replayed:         nothing_to_do (no replay needed) | journal_replayed
+	//	                  (journal applied) — the efficacy split
+	//	failed_operational: timeout (Go deadline fired mid-run) | killed (the unit was
+	//	                  signalled mid-run — exit -1 or 128+N; OOM, RuntimeMaxSec,
+	//	                  external stop; NOT a tooling failure) | e2fsck_4 | e2fsck_8 |
+	//	                  e2fsck_other (e2fsck's
+	//	                  own non-replay exits — an unreplayable snapshot, expected and
+	//	                  small) | no_sentinel (ran but lost its result, or the pre-launch
+	//	                  device guard)
+	//	failed_open:      launcher_failure (the unit failed to START — e2fsck never ran) |
+	//	                  exec_failure (126/127: the host could not exec e2fsck) —
+	//	                  both host-image regressions, roll back
+	//	skipped_quiesced: quiesced
+	//
+	// It never carries a raw exit code or any tenant-influenced bytes.
+	//
+	// trigger separates the two admitted populations: "rescue" (the request
+	// demanded a filesystem boot of a memory snapshot) vs "legacy_fs_only"
+	// (a filesystem-only snapshot whose pause fell back to sync).
+	OrchestratorFsRecoveryRuns CounterType = "orchestrator.sandbox.fs_recovery.runs"
+
+	// OrchestratorFsRecoveryToolingUnsupported fires once per orchestrator process
+	// when the host e2fsck does not accept `-E journal_only` (probed against a
+	// nonexistent device, so it reads no filesystem). Expected to be flat zero: node
+	// images ship an e2fsprogs that has supported the option for years. A non-zero
+	// fleet sum means some node's tooling silently no-ops recovery (the guest kernel
+	// still replays at mount, so boots are unaffected) — a signal to fix that image,
+	// not a per-sandbox failure.
+	OrchestratorFsRecoveryToolingUnsupported CounterType = "orchestrator.sandbox.fs_recovery.tooling_unsupported"
 
 	// TemplateBuildCmdlineArgs counts template builds by the guest kernel command line
 	// parameters they actually booted with, after parsing and validation. This is the
@@ -215,10 +274,26 @@ const (
 	// directly to resume latency.
 	OrchestratorEnvdOfflineUpgradeDurationName HistogramType = "orchestrator.envd.offline_upgrade.duration"
 
+	// OrchestratorFsRecoveryDurationName is the wall-time of the jailed pre-boot
+	// journal-replay run on a cold boot, recorded for every outcome the run reaches
+	// (replayed/failed_operational) — only skipped_quiesced,
+	// which never runs e2fsck, has no duration sample. Replay is journal-bounded, so
+	// this should stay sub-second even on large filesystems. Labeled like
+	// OrchestratorFsRecoveryRuns.
+	OrchestratorFsRecoveryDurationName HistogramType = "orchestrator.sandbox.fs_recovery.duration"
+
 	// Pre-pause envd heap collapse round-trip duration (the pause-path cost of
 	// POST /collapse: network plus envd's madvise work), recorded once per pause
 	// when the collapse-envd-heap flag is on.
 	EnvdCollapseDurationHistogramName HistogramType = "orchestrator.sandbox.envd.collapse.duration"
+
+	// Background memfile dedup latency: provisional header creation at pause to
+	// the durable-header swap. Recorded once per swap; no attributes.
+	OrchestratorSandboxMemfileDedupDurationName HistogramType = "orchestrator.sandbox.memfile_dedup.duration"
+
+	// How long snapshot admission actually waited whenever it waited, labeled
+	// by outcome (ready_after_wait/refused only).
+	OrchestratorSandboxPauseAdmissionWaitDurationName HistogramType = "orchestrator.sandbox.pause_admission.wait.duration"
 
 	// Pause-resume prefetch harvest cost, recorded once per harvest attempt.
 	// duration is the SLOT-HOLD cost alone — the throwaway resume, its trace
@@ -345,31 +420,34 @@ const (
 )
 
 var counterDesc = map[CounterType]string{
-	SandboxCreateMeterName:                      "Number of currently waiting requests to create a new sandbox",
-	ApiOrchestratorCreatedSandboxes:             "Number of successfully created sandboxes",
-	ApiEvictorFsOnlyAutoPause:                   "Timeout auto-pauses with a filesystem-only policy, by outcome (fs_only or degraded-to-memory).",
-	ApiOrchestratorResumeOriginNodeRemap:        "Number of resume snapshots repointed to the fallback node a previous resume timed out on",
-	BuildResultCounterName:                      "Number of template build results",
-	BuildCacheResultCounterName:                 "Number of build cache results",
-	TeamSandboxCreated:                          "Counter of started sandboxes for the team in the interval",
-	OrchestratorHostBalanceDirtyPagesThreads:    "Cumulative stalled thread-polls during sandbox resume; rate() gives throttle intensity",
-	EnvdInitCalls:                               "Number of envd initialization calls",
-	EnvdCollapseChunks:                          "2 MiB chunks the pre-pause envd heap collapse attempted, by result",
-	OrchestratorSandboxKilledCounterName:        "Number of sandboxes killed, labeled by kill reason",
-	OrchestratorSandboxCheckpointCounterName:    "Number of sandbox checkpoints taken, labeled by in_place and success",
-	OrchestratorFPRResumeCounterName:            "Free-page-reporting resumes after a CoW window, labeled by outcome (inline, retry, fenced, fc_exited, abandoned)",
-	OrchestratorSnapshotUploadFailedCounterName: "Number of pause-snapshot uploads that never landed durably",
-	SandboxPauseFsQuiescedCounterName:           "Filesystem-only pauses by whether the rootfs was frozen (quiesced) vs sync fallback",
-	SandboxResumeWPModeCounterName:              "Sandbox resumes by write-protect tracking mode (sync|async)",
-	OrchestratorEnvdUpgradeAttempts:             "Resume-time envd live-upgrade attempts, by result and from/to version",
-	OrchestratorEnvdOfflineUpgradeAttempts:      "Cold-boot offline envd rootfs-swap attempts, by result and from/to version",
-	TemplateBuildCmdlineArgs:                    "Template builds by the guest kernel cmdline parameters applied",
-	OrchestratorEnvdUpgradeGated:                "Resumes the envd-upgrade-target flag targeted but the min-version gate skipped",
-	OrchestratorEnvdUpgradeHandover:             "Live-upgrade handover items by item (proc|retained|watcher) and result (ok|failed)",
-	PauseResumePrefetchHarvestAttempts:          "Pause-resume prefetch harvest attempts, by result",
-	TCPFirewallConnectionsTotal:                 "Total number of TCP firewall connections processed",
-	TCPFirewallErrorsTotal:                      "Total number of TCP firewall errors",
-	TCPFirewallDecisionsTotal:                   "Total number of TCP firewall allow/block decisions",
+	SandboxCreateMeterName:                       "Number of currently waiting requests to create a new sandbox",
+	ApiOrchestratorCreatedSandboxes:              "Number of successfully created sandboxes",
+	ApiEvictorFsOnlyAutoPause:                    "Timeout auto-pauses with a filesystem-only policy.",
+	ApiOrchestratorResumeOriginNodeRemap:         "Number of resume snapshots repointed to the fallback node a previous resume timed out on",
+	BuildResultCounterName:                       "Number of template build results",
+	BuildCacheResultCounterName:                  "Number of build cache results",
+	TeamSandboxCreated:                           "Counter of started sandboxes for the team in the interval",
+	OrchestratorHostBalanceDirtyPagesThreads:     "Cumulative stalled thread-polls during sandbox resume; rate() gives throttle intensity",
+	EnvdInitCalls:                                "Number of envd initialization calls",
+	EnvdCollapseChunks:                           "2 MiB chunks the pre-pause envd heap collapse attempted, by result",
+	OrchestratorSandboxKilledCounterName:         "Number of sandboxes killed, labeled by kill reason",
+	OrchestratorSandboxPauseAdmissionCounterName: "Snapshot-admission decisions, labeled by outcome (ready/ready_after_wait/refused/latched_error) and rpc (pause/checkpoint)",
+	OrchestratorSandboxCheckpointCounterName:     "Number of sandbox checkpoints taken, labeled by in_place and success",
+	OrchestratorFPRResumeCounterName:             "Free-page-reporting resumes after a CoW window, labeled by outcome (inline, retry, fenced, fc_exited, abandoned)",
+	OrchestratorSnapshotUploadFailedCounterName:  "Number of pause-snapshot uploads that never landed durably",
+	SandboxPauseFsQuiescedCounterName:            "Filesystem-only pauses by whether the rootfs was frozen (quiesced) vs sync fallback",
+	SandboxResumeWPModeCounterName:               "Sandbox resumes by write-protect tracking mode (sync|async)",
+	OrchestratorEnvdUpgradeAttempts:              "Resume-time envd live-upgrade attempts, by result and from/to version",
+	OrchestratorEnvdOfflineUpgradeAttempts:       "Cold-boot offline envd rootfs-swap attempts, by result and from/to version",
+	OrchestratorFsRecoveryRuns:                   "Pre-boot filesystem-recovery decisions on cold boots, by result and trigger",
+	OrchestratorFsRecoveryToolingUnsupported:     "Fires once per process when the host e2fsck rejects -E journal_only",
+	TemplateBuildCmdlineArgs:                     "Template builds by the guest kernel cmdline parameters applied",
+	OrchestratorEnvdUpgradeGated:                 "Resumes the envd-upgrade-target flag targeted but the min-version gate skipped",
+	OrchestratorEnvdUpgradeHandover:              "Live-upgrade handover items by item (proc|retained|watcher) and result (ok|failed)",
+	PauseResumePrefetchHarvestAttempts:           "Pause-resume prefetch harvest attempts, by result",
+	TCPFirewallConnectionsTotal:                  "Total number of TCP firewall connections processed",
+	TCPFirewallErrorsTotal:                       "Total number of TCP firewall errors",
+	TCPFirewallDecisionsTotal:                    "Total number of TCP firewall allow/block decisions",
 
 	IngressProxyConnectionsBlockedTotal: "Total number of ingress proxy connections blocked by connection limit",
 	CmuxErrorsTotal:                     "Total number of cmux connection multiplexer errors",
@@ -390,31 +468,34 @@ var counterDesc = map[CounterType]string{
 }
 
 var counterUnits = map[CounterType]string{
-	SandboxCreateMeterName:                      "{sandbox}",
-	ApiOrchestratorCreatedSandboxes:             "{sandbox}",
-	ApiEvictorFsOnlyAutoPause:                   "{pause}",
-	ApiOrchestratorResumeOriginNodeRemap:        "{snapshot}",
-	BuildResultCounterName:                      "{build}",
-	BuildCacheResultCounterName:                 "{layer}",
-	TeamSandboxCreated:                          "{sandbox}",
-	OrchestratorHostBalanceDirtyPagesThreads:    "{thread}",
-	EnvdInitCalls:                               "1",
-	EnvdCollapseChunks:                          "{chunk}",
-	OrchestratorSandboxKilledCounterName:        "{sandbox}",
-	OrchestratorSandboxCheckpointCounterName:    "{checkpoint}",
-	OrchestratorFPRResumeCounterName:            "{resume}",
-	OrchestratorSnapshotUploadFailedCounterName: "{snapshot}",
-	SandboxPauseFsQuiescedCounterName:           "{snapshot}",
-	SandboxResumeWPModeCounterName:              "{resume}",
-	OrchestratorEnvdUpgradeAttempts:             "{attempt}",
-	OrchestratorEnvdOfflineUpgradeAttempts:      "{attempt}",
-	TemplateBuildCmdlineArgs:                    "{build}",
-	OrchestratorEnvdUpgradeGated:                "{sandbox}",
-	OrchestratorEnvdUpgradeHandover:             "{item}",
-	PauseResumePrefetchHarvestAttempts:          "{attempt}",
-	TCPFirewallConnectionsTotal:                 "{connection}",
-	TCPFirewallErrorsTotal:                      "{error}",
-	TCPFirewallDecisionsTotal:                   "{decision}",
+	SandboxCreateMeterName:                       "{sandbox}",
+	ApiOrchestratorCreatedSandboxes:              "{sandbox}",
+	ApiEvictorFsOnlyAutoPause:                    "{pause}",
+	ApiOrchestratorResumeOriginNodeRemap:         "{snapshot}",
+	BuildResultCounterName:                       "{build}",
+	BuildCacheResultCounterName:                  "{layer}",
+	TeamSandboxCreated:                           "{sandbox}",
+	OrchestratorHostBalanceDirtyPagesThreads:     "{thread}",
+	EnvdInitCalls:                                "1",
+	EnvdCollapseChunks:                           "{chunk}",
+	OrchestratorSandboxKilledCounterName:         "{sandbox}",
+	OrchestratorSandboxPauseAdmissionCounterName: "{decision}",
+	OrchestratorSandboxCheckpointCounterName:     "{checkpoint}",
+	OrchestratorFPRResumeCounterName:             "{resume}",
+	OrchestratorSnapshotUploadFailedCounterName:  "{snapshot}",
+	SandboxPauseFsQuiescedCounterName:            "{snapshot}",
+	SandboxResumeWPModeCounterName:               "{resume}",
+	OrchestratorEnvdUpgradeAttempts:              "{attempt}",
+	OrchestratorEnvdOfflineUpgradeAttempts:       "{attempt}",
+	OrchestratorFsRecoveryRuns:                   "{run}",
+	OrchestratorFsRecoveryToolingUnsupported:     "{probe}",
+	TemplateBuildCmdlineArgs:                     "{build}",
+	OrchestratorEnvdUpgradeGated:                 "{sandbox}",
+	OrchestratorEnvdUpgradeHandover:              "{item}",
+	PauseResumePrefetchHarvestAttempts:           "{attempt}",
+	TCPFirewallConnectionsTotal:                  "{connection}",
+	TCPFirewallErrorsTotal:                       "{error}",
+	TCPFirewallDecisionsTotal:                    "{decision}",
 
 	IngressProxyConnectionsBlockedTotal: "{connection}",
 	CmuxErrorsTotal:                     "{error}",
@@ -571,23 +652,26 @@ func GetGaugeInt(meter metric.Meter, name GaugeIntType) (metric.Int64ObservableG
 var histogramDesc = map[HistogramType]string{
 	ApiRedisStoragePublisherPublishDuration: "Duration of a single Redis PUBLISH round-trip from the storage publisher",
 
-	BuildDurationHistogramName:                 "Time taken to build a template",
-	BuildPhaseDurationHistogramName:            "Time taken to build each phase of a template",
-	BuildStepDurationHistogramName:             "Time taken to build each step of a template",
-	BuildRootfsSizeHistogramName:               "Size of the built template rootfs in bytes",
-	OrchestratorSandboxCreateDurationName:      "Time taken to create a sandbox",
-	OrchestratorSandboxExecutionDurationName:   "Time a single sandbox execution ran, from the guest being ready until it stopped executing, labeled by stop reason",
-	OrchestratorEnvdUpgradeDurationName:        "Wall-time of a resume-time envd upgrade (delivery + trigger + WaitForEnvd)",
-	WaitForEnvdDurationHistogramName:           "Time taken for Envd to initialize successfully",
-	EnvdCollapseDurationHistogramName:          "Time taken for the pre-pause envd heap collapse round-trip",
-	GuestSyncDurationHistogramName:             "Time taken for the mandatory pre-pause guest sync (filesystem-only pause)",
-	PauseDurationHistogramName:                 "Time taken to pause a sandbox, labeled by fs_only (filesystem-only vs memory) and success",
-	SnapshotProcessMemoryDurationName:          "Time to export+diff the memory file during a pause snapshot (memory pauses only), labeled by success",
-	SnapshotProcessRootfsDurationName:          "Time to export+diff the rootfs during a pause snapshot, labeled by fs_only and success",
-	SnapshotRootfsSealDurationName:             "Time for the background deferred rootfs reflink seal (off the pause critical path), labeled by in_place and success",
-	SnapshotGuestFreezeDurationName:            "Wall time the guest is frozen during an in-place checkpoint, from the FC pause call to the in-place resume; success=false means the resume ran on the pause-failure cleanup path",
-	SnapshotMemorySealDurationName:             "Time for the background CoW-window memory capture (off the in-place resume critical path), labeled by success",
-	OrchestratorEnvdOfflineUpgradeDurationName: "Wall-time of the offline cold-boot envd rootfs swap (jailed debugfs)",
+	BuildDurationHistogramName:                        "Time taken to build a template",
+	BuildPhaseDurationHistogramName:                   "Time taken to build each phase of a template",
+	BuildStepDurationHistogramName:                    "Time taken to build each step of a template",
+	BuildRootfsSizeHistogramName:                      "Size of the built template rootfs in bytes",
+	OrchestratorSandboxCreateDurationName:             "Time taken to create a sandbox",
+	OrchestratorSandboxExecutionDurationName:          "Time a single sandbox execution ran, from the guest being ready until it stopped executing, labeled by stop reason",
+	OrchestratorEnvdUpgradeDurationName:               "Wall-time of a resume-time envd upgrade (delivery + trigger + WaitForEnvd)",
+	WaitForEnvdDurationHistogramName:                  "Time taken for Envd to initialize successfully",
+	EnvdCollapseDurationHistogramName:                 "Time taken for the pre-pause envd heap collapse round-trip",
+	GuestSyncDurationHistogramName:                    "Time taken for the mandatory pre-pause guest sync (filesystem-only pause)",
+	PauseDurationHistogramName:                        "Time taken to pause a sandbox, labeled by fs_only (filesystem-only vs memory) and success",
+	SnapshotProcessMemoryDurationName:                 "Time to export+diff the memory file during a pause snapshot (memory pauses only), labeled by success",
+	SnapshotProcessRootfsDurationName:                 "Time to export+diff the rootfs during a pause snapshot, labeled by fs_only and success",
+	SnapshotRootfsSealDurationName:                    "Time for the background deferred rootfs reflink seal (off the pause critical path), labeled by in_place and success",
+	SnapshotGuestFreezeDurationName:                   "Wall time the guest is frozen during an in-place checkpoint, from the FC pause call to the in-place resume; success=false means the resume ran on the pause-failure cleanup path",
+	SnapshotMemorySealDurationName:                    "Time for the background CoW-window memory capture (off the in-place resume critical path), labeled by success",
+	OrchestratorSandboxMemfileDedupDurationName:       "Background memfile dedup latency, from the provisional header's creation at pause to the durable-header swap",
+	OrchestratorSandboxPauseAdmissionWaitDurationName: "Time snapshot admission waited on the durable parent header whenever it waited, labeled by outcome (ready_after_wait/refused)",
+	OrchestratorEnvdOfflineUpgradeDurationName:        "Wall-time of the offline cold-boot envd rootfs swap (jailed debugfs)",
+	OrchestratorFsRecoveryDurationName:                "Wall-time of the jailed pre-boot e2fsck run on a cold boot",
 
 	PauseResumePrefetchHarvestDurationName:     "Time the pause-resume prefetch harvest held a start slot (throwaway resume, trace collection, reap)",
 	PauseResumePrefetchHarvestPagesName:        "Harvested resume-prefetch trace size in 2 MiB blocks, per successful harvest",
@@ -640,39 +724,42 @@ var histogramDesc = map[HistogramType]string{
 var histogramUnits = map[HistogramType]string{
 	ApiRedisStoragePublisherPublishDuration: "ms",
 
-	BuildDurationHistogramName:                    "ms",
-	BuildPhaseDurationHistogramName:               "ms",
-	BuildStepDurationHistogramName:                "ms",
-	BuildRootfsSizeHistogramName:                  "{By}",
-	OrchestratorSandboxCreateDurationName:         "ms",
-	OrchestratorSandboxExecutionDurationName:      "ms",
-	OrchestratorEnvdUpgradeDurationName:           "ms",
-	OrchestratorEnvdOfflineUpgradeDurationName:    "ms",
-	WaitForEnvdDurationHistogramName:              "ms",
-	EnvdCollapseDurationHistogramName:             "ms",
-	GuestSyncDurationHistogramName:                "ms",
-	PauseDurationHistogramName:                    "ms",
-	SnapshotProcessMemoryDurationName:             "ms",
-	SnapshotProcessRootfsDurationName:             "ms",
-	SnapshotRootfsSealDurationName:                "ms",
-	SnapshotGuestFreezeDurationName:               "ms",
-	SnapshotMemorySealDurationName:                "ms",
-	PauseResumePrefetchHarvestDurationName:        "ms",
-	PauseResumePrefetchHarvestPagesName:           "{page}",
-	PauseResumePrefetchSealWaitDurationName:       "ms",
-	PauseResumePrefetchPersistWaitDurationName:    "ms",
-	EnvdFreezeDurationHistogramName:               "ms",
-	EnvdFreezeSweepHistogramName:                  "ms",
-	EnvdFreezeWaitHistogramName:                   "ms",
-	EnvdFreezeVisitedHistogramName:                "{cgroup}",
-	EnvdFreezeAuditHistogramName:                  "{cgroup}",
-	EnvdFreezeCgroupsHistogramName:                "{cgroup}",
-	EnvdUnfreezeDurationHistogramName:             "ms",
-	UffdStartupPagesHistogramName:                 "{page}",
-	UffdStartupSourcePagesHistogramName:           "{page}",
-	UffdStartupBytesHistogramName:                 "{By}",
-	TCPFirewallConnectionDurationHistogramName:    "ms",
-	TCPFirewallConnectionsPerSandboxHistogramName: "{connection}",
+	BuildDurationHistogramName:                        "ms",
+	BuildPhaseDurationHistogramName:                   "ms",
+	BuildStepDurationHistogramName:                    "ms",
+	BuildRootfsSizeHistogramName:                      "{By}",
+	OrchestratorSandboxCreateDurationName:             "ms",
+	OrchestratorSandboxExecutionDurationName:          "ms",
+	OrchestratorEnvdUpgradeDurationName:               "ms",
+	OrchestratorEnvdOfflineUpgradeDurationName:        "ms",
+	OrchestratorFsRecoveryDurationName:                "ms",
+	WaitForEnvdDurationHistogramName:                  "ms",
+	EnvdCollapseDurationHistogramName:                 "ms",
+	GuestSyncDurationHistogramName:                    "ms",
+	PauseDurationHistogramName:                        "ms",
+	SnapshotProcessMemoryDurationName:                 "ms",
+	SnapshotProcessRootfsDurationName:                 "ms",
+	SnapshotRootfsSealDurationName:                    "ms",
+	SnapshotGuestFreezeDurationName:                   "ms",
+	SnapshotMemorySealDurationName:                    "ms",
+	OrchestratorSandboxMemfileDedupDurationName:       "ms",
+	OrchestratorSandboxPauseAdmissionWaitDurationName: "ms",
+	PauseResumePrefetchHarvestDurationName:            "ms",
+	PauseResumePrefetchHarvestPagesName:               "{page}",
+	PauseResumePrefetchSealWaitDurationName:           "ms",
+	PauseResumePrefetchPersistWaitDurationName:        "ms",
+	EnvdFreezeDurationHistogramName:                   "ms",
+	EnvdFreezeSweepHistogramName:                      "ms",
+	EnvdFreezeWaitHistogramName:                       "ms",
+	EnvdFreezeVisitedHistogramName:                    "{cgroup}",
+	EnvdFreezeAuditHistogramName:                      "{cgroup}",
+	EnvdFreezeCgroupsHistogramName:                    "{cgroup}",
+	EnvdUnfreezeDurationHistogramName:                 "ms",
+	UffdStartupPagesHistogramName:                     "{page}",
+	UffdStartupSourcePagesHistogramName:               "{page}",
+	UffdStartupBytesHistogramName:                     "{By}",
+	TCPFirewallConnectionDurationHistogramName:        "ms",
+	TCPFirewallConnectionsPerSandboxHistogramName:     "{connection}",
 
 	IngressProxyConnectionDurationHistogramName:    "ms",
 	IngressProxyConnectionsPerSandboxHistogramName: "{connection}",

@@ -13,7 +13,6 @@ const (
 // Storage is the persistence interface implemented by the redis backend.
 type Storage interface {
 	Add(ctx context.Context, sandbox Sandbox) error
-	AddCapacity(ctx context.Context, sandbox Sandbox) error
 	Get(ctx context.Context, teamID uuid.UUID, sandboxID string) (Sandbox, error)
 	Remove(ctx context.Context, teamID uuid.UUID, sandboxID string) error
 
@@ -25,6 +24,11 @@ type Storage interface {
 	StartRemoving(ctx context.Context, teamID uuid.UUID, sandboxID string, opts RemoveOpts) (Sandbox, bool, func(context.Context, error), error)
 	WaitForStateChange(ctx context.Context, teamID uuid.UUID, sandboxID string) error
 	Reconcile(ctx context.Context, sandboxes []NodeSandbox, nodeID string) []NodeSandbox
+}
+
+// CapacityStorage persists a sandbox together with its capacity accounting.
+type CapacityStorage interface {
+	AddCapacity(ctx context.Context, sandbox Sandbox) error
 }
 
 // ReservationStorage tracks per-team sandbox-start reservations to enforce

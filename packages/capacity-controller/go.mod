@@ -6,6 +6,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.43.3
 	github.com/aws/aws-sdk-go-v2/config v1.32.12
 	github.com/aws/aws-sdk-go-v2/service/autoscaling v1.64.2
+	github.com/aws/aws-sdk-go-v2/service/ec2 v1.296.0
 	github.com/e2b-dev/infra/packages/shared v0.0.0
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/nomad/api v0.0.0-20260324203407-b27b0c2e019a
